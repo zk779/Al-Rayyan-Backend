@@ -23,7 +23,7 @@ const prisma = new PrismaClient();
 
 // ✅ CORS must come BEFORE routes
 const allowedOrigins = [
-  "https://al-rayyan-travels.vercel.app/",
+  "https://al-rayyan-travels.vercel.app",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
 ];
@@ -31,16 +31,24 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow requests with no origin (Postman, curl)
+      // Allow server-to-server, Postman, curl
       if (!origin) return cb(null, true);
 
-      if (allowedOrigins.includes(origin)) return cb(null, true);
+      // Allow local dev
+      if (allowedOrigins.includes(origin)) {
+        return cb(null, true);
+      }
+
+      // ✅ Allow ALL Vercel preview & production URLs
+      if (origin.endsWith(".vercel.app")) {
+        return cb(null, true);
+      }
 
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
+    credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    optionsSuccessStatus: 204,
   })
 );
 
