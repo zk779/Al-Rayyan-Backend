@@ -807,7 +807,7 @@ router.post("/", authenticate, async (req, res) => {
 
 	return invoice;
 	},
-	{ timeout: 15000 }
+	{ timeout: 50000 }
 	);
 
 	return res.status(201).json({
