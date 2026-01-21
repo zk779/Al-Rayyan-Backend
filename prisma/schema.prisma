@@ -1,396 +1,397 @@
 generator client {
-  provider = "prisma-client-js"
+	provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "mongodb"
-  url      = env("DATABASE_URL")
+	provider = "mongodb"
+	url = env("DATABASE_URL")
 }
 
 /**
- * ===========================
- * ENUMS
- * ===========================
- */
+	* ===========================
+	* ENUMS
+	* ===========================
+	*/
 
 enum VendorCategory {
-  CREDIT
-  DEBIT
+	CREDIT
+	DEBIT
 }
 
 enum PaymentType {
-  CASH
-  CREDIT
-  BANK_TRANSFER
+	CASH
+	CREDIT
+	BANK_TRANSFER
 }
 
 enum SaleStatus {
-  PENDING
-  COMPLETED
-  CANCELLED
-  REFUNDED
+	PENDING
+	COMPLETED
+	CANCELLED
+	REFUNDED
 }
 
 enum CustomerType {
-  WALK_IN
-  CORPORATE
+	WALK_IN
+	CORPORATE
 }
 
 enum AccountType {
-  CUSTOMER
-  VENDOR
-  CASH
-  BANK
-  EXPENSE
-  INCOME
+	CUSTOMER
+	VENDOR
+	CASH
+	BANK
+	EXPENSE
+	INCOME
 }
 
 enum LedgerEntryType {
-  OPENING_BALANCE
-  SALE
-  PAYMENT
-  EXPENSE
-  ADJUSTMENT
+	OPENING_BALANCE
+	SALE
+	PAYMENT
+	REFUNDED
+	EXPENSE
+	ADJUSTMENT
 }
 
 enum PaymentStatus {
-  DUE
-  PARTIAL
-  PAID
+	DUE
+	PARTIAL
+	PAID
 }
 
 /**
- * ===========================
- * AUTH / RBAC
- * ===========================
- */
+	* ===========================
+	* AUTH / RBAC
+	* ===========================
+	*/
 
 model Permission {
-  id          String   @id @default(auto()) @map("_id") @db.ObjectId
-  name        String   @unique
-  description String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+	name String @unique
+	description String?
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  roleLinks RolePermission[]
+	roleLinks RolePermission[]
 }
 
 model Role {
-  id          String   @id @default(auto()) @map("_id") @db.ObjectId
-  name        String   @unique
-  description String?
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+	name String @unique
+	description String?
+	isActive Boolean @default(true)
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  users           User[]
-  permissionLinks RolePermission[]
+	users User[]
+	permissionLinks RolePermission[]
 }
 
 model RolePermission {
-  id           String @id @default(auto()) @map("_id") @db.ObjectId
-  roleId       String @db.ObjectId
-  permissionId String @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+	roleId String @db.ObjectId
+	permissionId String @db.ObjectId
 
-  role       Role       @relation(fields: [roleId], references: [id])
-  permission Permission @relation(fields: [permissionId], references: [id])
+	role Role @relation(fields: [roleId], references: [id])
+	permission Permission @relation(fields: [permissionId], references: [id])
 
-  @@unique([roleId, permissionId])
+	@@unique([roleId, permissionId])
 }
 
 /**
- * ===========================
- * BRANCHES & USERS
- * ===========================
- */
+	* ===========================
+	* BRANCHES & USERS
+	* ===========================
+	*/
 
 model Branch {
-  id        String   @id @default(auto()) @map("_id") @db.ObjectId
-  name      String
-  code      String   @unique
-  address   String?
-  city      String?
-  country   String?
-  phone     String?
-  email     String?
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+	name String
+	code String @unique
+	address String?
+	city String?
+	country String?
+	phone String?
+	email String?
+	isActive Boolean @default(true)
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  users User[]
+	users User[]
 }
 
 model User {
-  id        String   @id @default(auto()) @map("_id") @db.ObjectId
-  fullName  String
-  email     String   @unique
-  password  String
-  phone     String?
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+	fullName String
+	email String @unique
+	password String
+	phone String?
+	isActive Boolean @default(true)
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  roleId   String? @db.ObjectId
-  branchId String? @db.ObjectId
+	roleId String? @db.ObjectId
+	branchId String? @db.ObjectId
 
-  role          Role?          @relation(fields: [roleId], references: [id])
-  branch        Branch?        @relation(fields: [branchId], references: [id])
-  salesInvoices SalesInvoice[]
+	role Role? @relation(fields: [roleId], references: [id])
+	branch Branch? @relation(fields: [branchId], references: [id])
+	salesInvoices SalesInvoice[]
 }
 
 /**
- * ===========================
- * AIRLINES
- * ===========================
- */
+	* ===========================
+	* AIRLINES
+	* ===========================
+	*/
 
 model AirlineCode {
-  id          String   @id @default(auto()) @map("_id") @db.ObjectId
-  airlineName String
-  iataName    String?
-  airlineCode String?  @unique
-  status      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+	airlineName String
+	iataName String?
+	airlineCode String? @unique
+	status Boolean @default(true)
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  sales Sale[]
+	sales Sale[]
 }
 
 /**
- * ===========================
- * ACCOUNTS (🔥 CORE LEDGER)
- * ===========================
- */
+	* ===========================
+	* ACCOUNTS (🔥 CORE LEDGER)
+	* ===========================
+	*/
 
 model Account {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  name String
-  type AccountType
+	name String
+	type AccountType
 
-  referenceId String? @db.ObjectId // vendorId / customerId / bankId
+	referenceId String? @db.ObjectId // vendorId / customerId / bankId
 
-  balance Float @default(0)
+	balance Float @default(0)
 
-  isActive Boolean @default(true)
+	isActive Boolean @default(true)
 
-  entries LedgerEntry[]
+	entries LedgerEntry[]
 
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
-  vendors   Vendor[]
-  customers Customer[]
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
+	vendors Vendor[]
+	customers Customer[]
 
-  @@index([type])
-  @@index([referenceId])
+	@@index([type])
+	@@index([referenceId])
 }
 
 /**
- * ===========================
- * LEDGER ENTRIES (🔥 SINGLE LEDGER)
- * ===========================
- */
+	* ===========================
+	* LEDGER ENTRIES (🔥 SINGLE LEDGER)
+	* ===========================
+	*/
 
 model LedgerEntry {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  accountId String  @db.ObjectId
-  account   Account @relation(fields: [accountId], references: [id])
+	accountId String @db.ObjectId
+	account Account @relation(fields: [accountId], references: [id])
 
-  entryType LedgerEntryType
+	entryType LedgerEntryType
 
-  debit  Float @default(0)
-  credit Float @default(0)
+	debit Float @default(0)
+	credit Float @default(0)
 
-  balanceAfter Float
+	balanceAfter Float
 
-  // 🔗 References
-  saleId    String? @db.ObjectId
-  invoiceId String? @db.ObjectId
-  paymentId String? @db.ObjectId
-  expenseId String? @db.ObjectId
-  refundId  String? @db.ObjectId // ✅ NEW
+	// 🔗 References
+	saleId String? @db.ObjectId
+	invoiceId String? @db.ObjectId
+	paymentId String? @db.ObjectId
+	expenseId String? @db.ObjectId
+	refundId String? @db.ObjectId // ✅ NEW
 
-  remarks String?
+	remarks String?
 
-  // 📅 BUSINESS / ACCOUNTING DATE (user-controlled)
-  transactionDate DateTime
+	// 📅 BUSINESS / ACCOUNTING DATE (user-controlled)
+	transactionDate DateTime
 
-  // 🕒 SYSTEM DATE (auto, immutable)
-  createdAt DateTime @default(now())
+	// 🕒 SYSTEM DATE (auto, immutable)
+	createdAt DateTime @default(now())
 
-  @@index([accountId])
-  @@index([entryType])
-  @@index([saleId])
-  @@index([refundId])
-  @@index([transactionDate])
-  @@index([createdAt])
+	@@index([accountId])
+	@@index([entryType])
+	@@index([saleId])
+	@@index([refundId])
+	@@index([transactionDate])
+	@@index([createdAt])
 }
 
 /**
- * ===========================
- * VENDORS
- * ===========================
- */
+	* ===========================
+	* VENDORS
+	* ===========================
+	*/
 
 model Vendor {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  vendorName String
-  category   VendorCategory // CREDIT or DEBIT
+	vendorName String
+	category VendorCategory // CREDIT or DEBIT
 
-  vendorType String?
-  email      String?
-  phone      String?
-  address    String?
+	vendorType String?
+	email String?
+	phone String?
+	address String?
 
-  accountId String  @db.ObjectId
-  account   Account @relation(fields: [accountId], references: [id])
+	accountId String @db.ObjectId
+	account Account @relation(fields: [accountId], references: [id])
 
-  openingBalance Float?
-  status         Boolean @default(true)
+	openingBalance Float?
+	status Boolean @default(true)
 
-  // 🔥 NEW FIELDS
-  vendorDate DateTime // user-selected business date
-  createdAt  DateTime @default(now()) // system timestamp
-  updatedAt  DateTime @updatedAt
+	// 🔥 NEW FIELDS
+	vendorDate DateTime // user-selected business date
+	createdAt DateTime @default(now()) // system timestamp
+	updatedAt DateTime @updatedAt
 
-  sales Sale[]
+	sales Sale[]
 
-  @@index([vendorDate])
-  @@index([createdAt])
+	@@index([vendorDate])
+	@@index([createdAt])
 }
 
 /**
- * ===========================
- * CUSTOMERS
- * ===========================
- */
+	* ===========================
+	* CUSTOMERS
+	* ===========================
+	*/
 
 model Customer {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  // Core info
-  customerName String
-  customerType CustomerType
+	// Core info
+	customerName String
+	customerType CustomerType
 
-  contactPerson String
-  phone         String
+	contactPerson String
+	phone String
 
-  // Optional info
-  email   String?
-  address String?
+	// Optional info
+	email String?
+	address String?
 
-  // Accounting
-  openingBalance Float @default(0.00)
+	// Accounting
+	openingBalance Float @default(0.00)
 
-  accountId String  @db.ObjectId
-  account   Account @relation(fields: [accountId], references: [id])
+	accountId String @db.ObjectId
+	account Account @relation(fields: [accountId], references: [id])
 
-  // Status
-  isActive Boolean @default(true)
+	// Status
+	isActive Boolean @default(true)
 
-  // 🔥 NEW FIELDS (same philosophy as Vendor)
-  customerDate DateTime // user-selected business date
-  createdAt    DateTime @default(now()) // system timestamp
-  updatedAt    DateTime @updatedAt
+	// 🔥 NEW FIELDS (same philosophy as Vendor)
+	customerDate DateTime // user-selected business date
+	createdAt DateTime @default(now()) // system timestamp
+	updatedAt DateTime @updatedAt
 
-  sales Sale[]
+	sales Sale[]
 
-  @@index([customerName])
-  @@index([phone])
-  @@index([customerDate])
-  @@index([createdAt])
+	@@index([customerName])
+	@@index([phone])
+	@@index([customerDate])
+	@@index([createdAt])
 }
 
 /**
- * ===========================
- * SALES & INVOICES
- * ===========================
- */
+	* ===========================
+	* SALES & INVOICES
+	* ===========================
+	*/
 
 model SalesInvoice {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  invoiceNo String   @unique
-  saleDate  DateTime @default(now())
+	invoiceNo String @unique
+	saleDate DateTime @default(now())
 
-  userId String @db.ObjectId
-  user   User   @relation(fields: [userId], references: [id])
+	userId String @db.ObjectId
+	user User @relation(fields: [userId], references: [id])
 
-  totalNet    Float @default(0)
-  totalSell   Float @default(0)
-  totalProfit Float @default(0)
+	totalNet Float @default(0)
+	totalSell Float @default(0)
+	totalProfit Float @default(0)
 
-  sales Sale[]
+	sales Sale[]
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  @@index([saleDate])
-  @@index([createdAt])
+	@@index([saleDate])
+	@@index([createdAt])
 }
 
 model Sale {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  invoiceId  String  @db.ObjectId
-  airlineId  String  @db.ObjectId
-  vendorId   String  @db.ObjectId
-  customerId String? @db.ObjectId
+	invoiceId String @db.ObjectId
+	airlineId String @db.ObjectId
+	vendorId String @db.ObjectId
+	customerId String? @db.ObjectId
 
-  documentNo String?
+	documentNo String?
 
-  netPrice  Float
-  sellPrice Float
-  profit    Float
+	netPrice Float
+	sellPrice Float
+	profit Float
 
-  paymentType   PaymentType
-  paymentStatus PaymentStatus @default(DUE)
-  paidAmount    Float         @default(0)
+	paymentType PaymentType
+	paymentStatus PaymentStatus @default(DUE)
+	paidAmount Float @default(0)
 
-  remarks String?
-  status  SaleStatus @default(PENDING)
+	remarks String?
+	status SaleStatus @default(PENDING)
 
-  // 🔥 REFUND SUPPORT
-  isRefund Boolean @default(false)
+	// 🔥 REFUND SUPPORT
+	isRefund Boolean @default(false)
 
-  // ✅ SELF RELATION (ONE-LINE, VALID)
-  refundOfSaleId String? @db.ObjectId
-  refundOfSale   Sale?   @relation("SaleRefundRelation", fields: [refundOfSaleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  refunds        Sale[]  @relation("SaleRefundRelation")
+	// ✅ SELF RELATION (ONE-LINE, VALID)
+	refundOfSaleId String? @db.ObjectId
+	refundOfSale Sale? @relation("SaleRefundRelation", fields: [refundOfSaleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+	refunds Sale[] @relation("SaleRefundRelation")
 
-  invoice  SalesInvoice @relation(fields: [invoiceId], references: [id])
-  airline  AirlineCode  @relation(fields: [airlineId], references: [id])
-  vendor   Vendor       @relation(fields: [vendorId], references: [id])
-  customer Customer?    @relation(fields: [customerId], references: [id])
+	invoice SalesInvoice @relation(fields: [invoiceId], references: [id])
+	airline AirlineCode @relation(fields: [airlineId], references: [id])
+	vendor Vendor @relation(fields: [vendorId], references: [id])
+	customer Customer? @relation(fields: [customerId], references: [id])
 
-  refund Refund?
+	refund Refund?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  @@index([refundOfSaleId])
-  @@index([isRefund])
+	@@index([refundOfSaleId])
+	@@index([isRefund])
 }
 
 model Refund {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  saleId String @unique @db.ObjectId
-  sale   Sale   @relation(fields: [saleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+	saleId String @unique @db.ObjectId
+	sale Sale @relation(fields: [saleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
-  originalAmount     Float
-  vendorRefundAmount Float?
-  refundableAmount   Float
-  refundFee          Float @default(0)
-  serviceCharges     Float @default(0)
+	originalAmount Float
+	vendorRefundAmount Float?
+	refundableAmount Float
+	refundFee Float @default(0)
+	serviceCharges Float @default(0)
 
-  refundReason String?
-  remarks      String?
+	refundReason String?
+	remarks String?
 
-  refundDate DateTime
-  createdAt  DateTime @default(now())
+	refundDate DateTime
+	createdAt DateTime @default(now())
 
-  @@index([refundDate])
+	@@index([refundDate])
 }
