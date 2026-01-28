@@ -15,6 +15,7 @@ import saleRouets from "./routes/sales.js";
 import permissionRoutes from "./routes/permissions.js";
 import LedgerRoutes from "./routes/Ledger.js";
 import customerRoutes from "./routes/customers.js";
+import destinationsRouter from "./routes/destinations.js";
 
 dotenv.config();
 
@@ -23,33 +24,33 @@ const prisma = new PrismaClient();
 
 // ✅ CORS must come BEFORE routes
 const allowedOrigins = [
-  "https://al-rayyan-travels.vercel.app",
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
+	"https://al-rayyan-travels.vercel.app",
+	"http://localhost:5173",
+	"http://127.0.0.1:5173",
 ];
 
 app.use(
-  cors({
-    origin: (origin, cb) => {
-      // Allow server-to-server, Postman, curl
-      if (!origin) return cb(null, true);
+	cors({
+		origin: (origin, cb) => {
+			// Allow server-to-server, Postman, curl
+			if (!origin) return cb(null, true);
 
-      // Allow local dev
-      if (allowedOrigins.includes(origin)) {
-        return cb(null, true);
-      }
+			// Allow local dev
+			if (allowedOrigins.includes(origin)) {
+				return cb(null, true);
+			}
 
-      // ✅ Allow ALL Vercel preview & production URLs
-      if (origin.endsWith(".vercel.app")) {
-        return cb(null, true);
-      }
+			// ✅ Allow ALL Vercel preview & production URLs
+			if (origin.endsWith(".vercel.app")) {
+				return cb(null, true);
+			}
 
-      return cb(new Error(`CORS blocked for origin: ${origin}`));
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
+			return cb(new Error(`CORS blocked for origin: ${origin}`));
+		},
+		credentials: true,
+		methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+		allowedHeaders: ["Content-Type", "Authorization"],
+	})
 );
 
 // ✅ Preflight handler
@@ -73,43 +74,44 @@ app.use("/api/vendors", vendorsRoutes);
 app.use("/api/sales", saleRouets);
 app.use("/api/ledger", LedgerRoutes);
 app.use("/api/customers", customerRoutes);
+app.use("/api/destinations", destinationsRouter);
 
 // Root Route
 app.get("/", (req, res) => {
-  res.send(
-    "🚀 Travel Agency Repository System API (MongoDB + Prisma) is Running ✅"
-  );
+	res.send(
+		"🚀 Travel Agency Repository System API (MongoDB + Prisma) is Running ✅"
+	);
 });
 
 // Test DB Route
 app.get("/test-db", async (req, res) => {
-  try {
-    const roles = await prisma.role.findMany();
-    res.json({ success: true, roles });
-  } catch (err) {
-    console.error("DB Error:", err);
-    res.status(500).json({ success: false, error: "Database query failed" });
-  }
+	try {
+		const roles = await prisma.role.findMany();
+		res.json({ success: true, roles });
+	} catch (err) {
+		console.error("DB Error:", err);
+		res.status(500).json({ success: false, error: "Database query failed" });
+	}
 });
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-  console.error("Unhandled Error:", err);
-  res.status(500).json({ error: err.message || "Internal Server Error" });
+	console.error("Unhandled Error:", err);
+	res.status(500).json({ error: err.message || "Internal Server Error" });
 });
 
 // DB connect
 (async () => {
-  try {
-    await prisma.$connect();
-    console.log("✅ MongoDB connected successfully via Prisma");
-  } catch (err) {
-    console.error("❌ MongoDB connection failed:", err);
-  }
+	try {
+		await prisma.$connect();
+		console.log("✅ MongoDB connected successfully via Prisma");
+	} catch (err) {
+		console.error("❌ MongoDB connection failed:", err);
+	}
 })();
 
 // Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+	console.log(`🚀 Server running on http://localhost:${PORT}`);
 });

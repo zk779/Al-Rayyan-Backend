@@ -62,7 +62,7 @@ router.get("/", authenticate, async (req, res) => {
 						},
 					},
 				],
-				}
+			}
 			: {};
 
 		const invoices = await prisma.salesInvoice.findMany({
@@ -85,10 +85,14 @@ router.get("/", authenticate, async (req, res) => {
 						isRefund: true,
 						customerId: true,
 						remarks: true,
+
+						// ✅ FULL refund relation
+						refund: true,
+
 						vendor: {
 							select: {
 								vendorName: true,
-								account: { select: { balance: true } }, // ✅ unified ledger
+								account: { select: { balance: true } },
 							},
 						},
 						airline: {
@@ -98,11 +102,12 @@ router.get("/", authenticate, async (req, res) => {
 							select: {
 								customerName: true,
 								phone: true,
-								account: { select: { balance: true } }, // ✅ unified ledger
+								account: { select: { balance: true } },
 							},
 						},
 					},
 				},
+
 			},
 		});
 
@@ -122,23 +127,33 @@ router.get("/", authenticate, async (req, res) => {
 
 			sales: inv.sales.map((s) => ({
 				id: s.id,
+
 				vendorName: s.vendor?.vendorName || null,
 				vendorBalance: s.vendor?.account?.balance ?? null,
+
 				airlineCode: s.airline?.airlineCode || null,
+
 				paymentType: s.paymentType,
 				paymentStatus: s.paymentStatus,
 				isRefund: s.isRefund,
+
 				documentNo: s.documentNo,
+
 				customerId: s.customerId || null,
 				customerName: s.customer?.customerName || null,
 				customerPhone: s.customer?.phone || null,
 				customerBalance: s.customer?.account?.balance ?? null,
+
 				netPrice: s.netPrice,
 				sellPrice: s.sellPrice,
-				remarks: s.remarks,
 				profit: s.profit,
+				remarks: s.remarks,
 				status: s.status,
+
+				// ✅ FULL refund object only when refunded
+				refund: s.isRefund ? s.refund : null,
 			})),
+
 
 			createdAt: inv.createdAt,
 		}));
@@ -256,87 +271,87 @@ router.get("/search", authenticate, async (req, res) => {
 	GET INVOICE BY ID (WITH USER)
 =========================== */
 router.get("/:invoiceId", authenticate, async (req, res) => {
-  try {
-    const invoice = await prisma.salesInvoice.findUnique({
-      where: { id: req.params.invoiceId },
-      include: {
-        user: {
-          select: {
-            id: true,
-            fullName: true,
-            email: true,
-          },
-        },
-        sales: {
-          include: {
-            vendor: {
-              select: {
-                id: true,
-                vendorName: true,
-                category: true,
-                account: { select: { balance: true } }, // ledger
-              },
-            },
-            airline: {
-              select: {
-                id: true,
-                airlineName: true,
-                airlineCode: true,
-              },
-            },
-            customer: {
-              select: {
-                id: true,
-                customerName: true,
-                customerType: true,
-                phone: true,
-                contactPerson: true,
-                account: { select: { balance: true } }, // ledger
-              },
-            },
-            refund: {
-              select: {
-                id: true,
-                originalAmount: true,
-                vendorRefundAmount: true,
-                refundableAmount: true,
-                refundFee: true,
-                serviceCharges: true,
-                refundReason: true,
-                remarks: true,
-                refundDate: true,
-                createdAt: true,
-              },
-            },
-          },
-        },
-      },
-    });
+	try {
+		const invoice = await prisma.salesInvoice.findUnique({
+			where: { id: req.params.invoiceId },
+			include: {
+				user: {
+					select: {
+						id: true,
+						fullName: true,
+						email: true,
+					},
+				},
+				sales: {
+					include: {
+						vendor: {
+							select: {
+								id: true,
+								vendorName: true,
+								category: true,
+								account: { select: { balance: true } }, // ledger
+							},
+						},
+						airline: {
+							select: {
+								id: true,
+								airlineName: true,
+								airlineCode: true,
+							},
+						},
+						customer: {
+							select: {
+								id: true,
+								customerName: true,
+								customerType: true,
+								phone: true,
+								contactPerson: true,
+								account: { select: { balance: true } }, // ledger
+							},
+						},
+						refund: {
+							select: {
+								id: true,
+								originalAmount: true,
+								vendorRefundAmount: true,
+								refundableAmount: true,
+								refundFee: true,
+								serviceCharges: true,
+								refundReason: true,
+								remarks: true,
+								refundDate: true,
+								createdAt: true,
+							},
+						},
+					},
+				},
+			},
+		});
 
-    if (!invoice) {
-      return res.status(404).json({
-        success: false,
-        error: "Invoice not found",
-      });
-    }
+		if (!invoice) {
+			return res.status(404).json({
+				success: false,
+				error: "Invoice not found",
+			});
+		}
 
-    res.json({
-      success: true,
-      data: {
-        ...invoice,
-        salesCount: invoice.sales.length,
-        createdById: invoice.user?.id || null,
-        createdByName: invoice.user?.fullName || null,
-        createdByEmail: invoice.user?.email || null,
-      },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: "Failed to fetch invoice",
-    });
-  }
+		res.json({
+			success: true,
+			data: {
+				...invoice,
+				salesCount: invoice.sales.length,
+				createdById: invoice.user?.id || null,
+				createdByName: invoice.user?.fullName || null,
+				createdByEmail: invoice.user?.email || null,
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({
+			success: false,
+			error: "Failed to fetch invoice",
+		});
+	}
 });
 
 /* ===========================
@@ -421,7 +436,7 @@ router.post("/", authenticate, async (req, res) => {
 					vendor: { include: { account: true } },
 					customer: { include: { account: true } },
 				},
-				})
+			})
 			: [];
 
 		const originalSaleMap = Object.fromEntries(
@@ -437,7 +452,7 @@ router.post("/", authenticate, async (req, res) => {
 					refundOfSaleId: { in: refundSaleIds },
 				},
 				_sum: { sellPrice: true },
-				})
+			})
 			: [];
 
 		const refundSumMap = Object.fromEntries(
@@ -478,14 +493,14 @@ router.post("/", authenticate, async (req, res) => {
 			? await prisma.vendor.findMany({
 				where: { id: { in: vendorIds } },
 				include: { account: true },
-				})
+			})
 			: [];
 
 		const customers = customerIds.length
 			? await prisma.customer.findMany({
 				where: { id: { in: customerIds } },
 				include: { account: true },
-				})
+			})
 			: [];
 
 		const vendorMap = Object.fromEntries(vendors.map((v) => [v.id, v]));
@@ -577,244 +592,244 @@ router.post("/", authenticate, async (req, res) => {
 						getBal(vendor.account.id) + (isDebitVendor ? net : -net);
 
 					await tx.ledgerEntry.create({
-	data: {
-		accountId: vendor.account.id,
-		entryType: "SALE",
-		debit: net,
-		credit: 0,
-		balanceAfter: vendorBalAfter,
-		transactionDate: businessDate,
-		saleId: sale.id,
-		invoiceId: invoice.id,
-	},
-});
+						data: {
+							accountId: vendor.account.id,
+							entryType: "SALE",
+							debit: net,
+							credit: 0,
+							balanceAfter: vendorBalAfter,
+							transactionDate: businessDate,
+							saleId: sale.id,
+							invoiceId: invoice.id,
+						},
+					});
 
-	await tx.account.update({
-		where: { id: vendor.account.id },
-		data: { balance: vendorBalAfter },
-	});
+					await tx.account.update({
+						where: { id: vendor.account.id },
+						data: { balance: vendorBalAfter },
+					});
 
-	setBal(vendor.account.id, vendorBalAfter);
+					setBal(vendor.account.id, vendorBalAfter);
 
-	if (String(s.paymentType).toUpperCase() === "CREDIT") {
-		const cust = customerMap[s.customerId];
-		const custBalAfter = getBal(cust.account.id) + sell;
+					if (String(s.paymentType).toUpperCase() === "CREDIT") {
+						const cust = customerMap[s.customerId];
+						const custBalAfter = getBal(cust.account.id) + sell;
 
-		await tx.ledgerEntry.create({
-			data: {
-				accountId: cust.account.id,
-				entryType: "SALE",
-				debit: sell,
-				credit: 0,
-				balanceAfter: custBalAfter,
-				transactionDate: businessDate,
-				saleId: sale.id,
-				invoiceId: invoice.id,
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: cust.account.id,
+								entryType: "SALE",
+								debit: sell,
+								credit: 0,
+								balanceAfter: custBalAfter,
+								transactionDate: businessDate,
+								saleId: sale.id,
+								invoiceId: invoice.id,
+							},
+						});
+
+						await tx.account.update({
+							where: { id: cust.account.id },
+							data: { balance: custBalAfter },
+						});
+
+						setBal(cust.account.id, custBalAfter);
+
+						/* ---------- PAYMENT LEDGER ENTRY ---------- */
+						if (paid > 0) {
+							const custBalAfterPayment = getBal(cust.account.id) - paid;
+
+							await tx.ledgerEntry.create({
+								data: {
+									accountId: cust.account.id,
+									entryType: "PAYMENT",
+									debit: 0,
+									credit: paid,
+									balanceAfter: custBalAfterPayment,
+									transactionDate: businessDate,
+									saleId: sale.id,
+									invoiceId: invoice.id,
+								},
+							});
+
+							await tx.account.update({
+								where: { id: cust.account.id },
+								data: { balance: custBalAfterPayment },
+							});
+
+							setBal(cust.account.id, custBalAfterPayment);
+						}
+					}
+
+					totalNet += net;
+					totalSell += sell;
+					totalProfit += profit;
+				}
+
+				/* ======================
+					REFUNDS (UNCHANGED LOGIC)
+				====================== */
+				for (const r of refunds) {
+					const orig = originalSaleMap[r.saleId];
+
+					/* ======================================================
+					   🔁 REVERSE CUSTOMER PAYMENT (ON REFUND)
+					   - Delete PAYMENT ledger
+					   - Restore paidAmount back to customer balance
+					====================================================== */
+					if (
+						String(orig.paymentType).toUpperCase() === "CREDIT" &&
+						orig.customer?.account &&
+						Number(orig.paidAmount || 0) > 0
+					) {
+						const paidAmount = Number(orig.paidAmount);
+						const custAccId = orig.customer.account.id;
+
+						const prevCustBal = getBal(custAccId);
+
+						// Restore paid amount back to customer balance
+						const custBalAfterRestore = prevCustBal + paidAmount;
+
+						// Delete PAYMENT ledger entries for ORIGINAL sale
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: orig.id,
+								entryType: "PAYMENT",
+								accountId: custAccId,
+							},
+						});
+
+						// Update customer account balance
+						await tx.account.update({
+							where: { id: custAccId },
+							data: { balance: custBalAfterRestore },
+						});
+
+						setBal(custAccId, custBalAfterRestore);
+					}
+
+					// 👇 existing refund logic continues unchanged
+					const baseNet = Number(orig.netPrice);
+					const baseSell = Number(orig.sellPrice);
+					const fee = Number(r.refundFee || 0);
+					const sc = Number(r.serviceCharges || 0);
+
+					const customerRefund = baseNet - fee - sc;
+					const vendorRefund = baseNet - fee;
+
+					const refundSale = await tx.sale.create({
+						data: {
+							invoiceId: invoice.id,
+							airlineId: orig.airlineId,
+							vendorId: orig.vendorId,
+							customerId: orig.customerId,
+							documentNo: orig.documentNo,
+							netPrice: -baseNet,
+							sellPrice: -baseSell,
+							profit: 0,
+							paymentType: orig.paymentType,
+							paidAmount: 0,
+							paymentStatus: "PAID",
+							status: "REFUNDED",
+							isRefund: true,
+							refundOfSaleId: orig.id,
+						},
+					});
+
+					const refund = await tx.refund.create({
+						data: {
+							saleId: refundSale.id,
+							originalAmount: baseNet,
+							refundableAmount: customerRefund,
+							refundFee: fee,
+							serviceCharges: sc,
+							remarks: r.remarks || null,
+							refundDate: businessDate,
+						},
+					});
+
+
+					/* ---- VENDOR REFUND LEDGER (FIXED) ---- */
+					const isDebitVendor = orig.vendor.category === "DEBIT";
+					const prevVendorBal = getBal(orig.vendor.account.id);
+
+					// ✅ CREDIT entry for refund (ALWAYS)
+					const vendorBalAfter = isDebitVendor
+						? prevVendorBal - vendorRefund // DEBIT vendor → subtract
+						: prevVendorBal + vendorRefund; // CREDIT vendor → add
+
+					await tx.ledgerEntry.create({
+						data: {
+							accountId: orig.vendor.account.id,
+							entryType: "REFUNDED",
+							debit: 0,
+							credit: vendorRefund,
+							balanceAfter: vendorBalAfter,
+							transactionDate: businessDate,
+							saleId: refundSale.id,
+							refundId: refund.id,
+							invoiceId: invoice.id,
+						},
+					});
+
+					await tx.account.update({
+						where: { id: orig.vendor.account.id },
+						data: { balance: vendorBalAfter },
+					});
+
+					setBal(orig.vendor.account.id, vendorBalAfter);
+
+					/* ---- CUSTOMER REFUND LEDGER (FIXED) ---- */
+					if (
+						String(orig.paymentType).toUpperCase() === "CREDIT" &&
+						orig.customer?.account
+					) {
+						const prevCustBal = getBal(orig.customer.account.id);
+
+						// ✅ CREDIT customer, subtract balance
+						const custBalAfter = prevCustBal - customerRefund;
+
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: orig.customer.account.id,
+								entryType: "REFUNDED",
+								debit: 0,
+								credit: customerRefund,
+								balanceAfter: custBalAfter,
+								transactionDate: businessDate,
+								saleId: refundSale.id,
+								refundId: refund.id,
+								invoiceId: invoice.id,
+							},
+						});
+
+						await tx.account.update({
+							where: { id: orig.customer.account.id },
+							data: { balance: custBalAfter },
+						});
+
+						setBal(orig.customer.account.id, custBalAfter);
+					}
+
+					totalNet -= baseNet;
+					totalSell -= baseSell;
+				}
+
+				await tx.salesInvoice.update({
+					where: { id: invoice.id },
+					data: { totalNet, totalSell, totalProfit },
+				});
+
+				return invoice;
 			},
+			{ timeout: 50000 }
+		);
+
+		return res.status(201).json({
+			success: true,
+			message: "Sales & refunds processed successfully",
+			data: result,
 		});
-
-		await tx.account.update({
-			where: { id: cust.account.id },
-			data: { balance: custBalAfter },
-		});
-
-		setBal(cust.account.id, custBalAfter);
-
-		/* ---------- PAYMENT LEDGER ENTRY ---------- */
-		if (paid > 0) {
-			const custBalAfterPayment = getBal(cust.account.id) - paid;
-
-			await tx.ledgerEntry.create({
-				data: {
-					accountId: cust.account.id,
-					entryType: "PAYMENT",
-					debit: 0,
-					credit: paid,
-					balanceAfter: custBalAfterPayment,
-					transactionDate: businessDate,
-					saleId: sale.id,
-					invoiceId: invoice.id,
-				},
-			});
-
-			await tx.account.update({
-				where: { id: cust.account.id },
-				data: { balance: custBalAfterPayment },
-			});
-
-			setBal(cust.account.id, custBalAfterPayment);
-		}
-	}
-
-	totalNet += net;
-	totalSell += sell;
-	totalProfit += profit;
-	}
-
-	/* ======================
-		REFUNDS (UNCHANGED LOGIC)
-	====================== */
-	for (const r of refunds) {
-		 const orig = originalSaleMap[r.saleId];
-
-  /* ======================================================
-     🔁 REVERSE CUSTOMER PAYMENT (ON REFUND)
-     - Delete PAYMENT ledger
-     - Restore paidAmount back to customer balance
-  ====================================================== */
-  if (
-    String(orig.paymentType).toUpperCase() === "CREDIT" &&
-    orig.customer?.account &&
-    Number(orig.paidAmount || 0) > 0
-  ) {
-    const paidAmount = Number(orig.paidAmount);
-    const custAccId = orig.customer.account.id;
-
-    const prevCustBal = getBal(custAccId);
-
-    // Restore paid amount back to customer balance
-    const custBalAfterRestore = prevCustBal + paidAmount;
-
-    // Delete PAYMENT ledger entries for ORIGINAL sale
-    await tx.ledgerEntry.deleteMany({
-      where: {
-        saleId: orig.id,
-        entryType: "PAYMENT",
-        accountId: custAccId,
-      },
-    });
-
-    // Update customer account balance
-    await tx.account.update({
-      where: { id: custAccId },
-      data: { balance: custBalAfterRestore },
-    });
-
-    setBal(custAccId, custBalAfterRestore);
-  }
-
-  // 👇 existing refund logic continues unchanged
-  const baseNet = Number(orig.netPrice);
-  const baseSell = Number(orig.sellPrice);
-  const fee = Number(r.refundFee || 0);
-  const sc = Number(r.serviceCharges || 0);
-
-  const customerRefund = baseNet - fee - sc;
-  const vendorRefund = baseNet - fee;
-
-		const refundSale = await tx.sale.create({
-			data: {
-				invoiceId: invoice.id,
-				airlineId: orig.airlineId,
-				vendorId: orig.vendorId,
-				customerId: orig.customerId,
-				documentNo: orig.documentNo,
-				netPrice: -baseNet,
-				sellPrice: -baseSell,
-				profit: 0,
-				paymentType: orig.paymentType,
-				paidAmount: 0,
-				paymentStatus: "PAID",
-				status: "REFUNDED",
-				isRefund: true,
-				refundOfSaleId: orig.id,
-			},
-		});
-
-		const refund = await tx.refund.create({
-  data: {
-    saleId: refundSale.id,
-    originalAmount: baseNet,
-    refundableAmount: customerRefund,
-    refundFee: fee,
-    serviceCharges: sc,
-    remarks: r.remarks || null,
-    refundDate: businessDate,
-  },
-});
-
-
-		/* ---- VENDOR REFUND LEDGER (FIXED) ---- */
-		const isDebitVendor = orig.vendor.category === "DEBIT";
-		const prevVendorBal = getBal(orig.vendor.account.id);
-
-		// ✅ CREDIT entry for refund (ALWAYS)
-		const vendorBalAfter = isDebitVendor
-			? prevVendorBal - vendorRefund // DEBIT vendor → subtract
-			: prevVendorBal + vendorRefund; // CREDIT vendor → add
-
-		await tx.ledgerEntry.create({
-			data: {
-				accountId: orig.vendor.account.id,
-				entryType: "REFUNDED",
-				debit: 0,
-				credit: vendorRefund,
-				balanceAfter: vendorBalAfter,
-				transactionDate: businessDate,
-				saleId: refundSale.id,
-				refundId: refund.id,
-				invoiceId: invoice.id,
-			},
-		});
-
-		await tx.account.update({
-			where: { id: orig.vendor.account.id },
-			data: { balance: vendorBalAfter },
-		});
-
-		setBal(orig.vendor.account.id, vendorBalAfter);
-
-		/* ---- CUSTOMER REFUND LEDGER (FIXED) ---- */
-		if (
-			String(orig.paymentType).toUpperCase() === "CREDIT" &&
-			orig.customer?.account
-		) {
-			const prevCustBal = getBal(orig.customer.account.id);
-
-			// ✅ CREDIT customer, subtract balance
-			const custBalAfter = prevCustBal - customerRefund;
-
-			await tx.ledgerEntry.create({
-				data: {
-					accountId: orig.customer.account.id,
-					entryType: "REFUNDED",
-					debit: 0,
-					credit: customerRefund,
-					balanceAfter: custBalAfter,
-					transactionDate: businessDate,
-					saleId: refundSale.id,
-					refundId: refund.id, 
-					invoiceId: invoice.id,
-				},
-			});
-
-			await tx.account.update({
-				where: { id: orig.customer.account.id },
-				data: { balance: custBalAfter },
-			});
-
-			setBal(orig.customer.account.id, custBalAfter);
-		}
-
-		totalNet -= baseNet;
-		totalSell -= baseSell;
-	}
-
-	await tx.salesInvoice.update({
-		where: { id: invoice.id },
-		data: { totalNet, totalSell, totalProfit },
-	});
-
-	return invoice;
-	},
-	{ timeout: 50000 }
-	);
-
-	return res.status(201).json({
-		success: true,
-		message: "Sales & refunds processed successfully",
-		data: result,
-	});
 	} catch (err) {
 		console.error(err);
 		return res.status(400).json({ success: false, error: err.message });
@@ -895,7 +910,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 							},
 						},
 					},
-					})
+				})
 				: [];
 
 		for (const r of refundRows) {
@@ -926,14 +941,14 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			? await prisma.vendor.findMany({
 				where: { id: { in: [...vendorIds] } },
 				include: { account: true },
-				})
+			})
 			: [];
 
 		const customers = customerIds.size
 			? await prisma.customer.findMany({
 				where: { id: { in: [...customerIds] } },
 				include: { account: true },
-				})
+			})
 			: [];
 
 		const vendorMap = new Map(vendors.map((v) => [v.id, v]));
@@ -1012,7 +1027,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					const oldRefundFee = Number(refund.refundFee || 0);
 					const oldServiceCharges = Number(refund.serviceCharges || 0);
 					const oldOriginalAmount = Number(refund.originalAmount || 0);
-					
+
 					const oldVendorRefund = oldOriginalAmount - oldRefundFee;
 					const oldCustomerRefund = oldOriginalAmount - oldRefundFee - oldServiceCharges;
 

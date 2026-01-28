@@ -190,7 +190,10 @@ router.post("/", authenticate, async (req, res) => {
 			/* 3️⃣ Link Account */
 			await tx.account.update({
 				where: { id: account.id },
-				data: { referenceId: created.id },
+				data: {
+					name: customerName,
+					referenceId: created.id,
+				},
 			});
 
 			/* 4️⃣ Opening Balance Ledger Entry */
@@ -238,7 +241,7 @@ router.put("/:id", authenticate, async (req, res) => {
 
 		const updatedCustomer = await prisma.$transaction(async (tx) => {
 			/* ======================================================
-				1️⃣ Fetch Customer
+				1️⃣ Fetch Customer + Account
 			====================================================== */
 			const customer = await tx.customer.findUnique({
 				where: { id: req.params.id },
@@ -269,7 +272,17 @@ router.put("/:id", authenticate, async (req, res) => {
 			});
 
 			/* ======================================================
-				3️⃣ OPENING BALANCE LOGIC (ONLY IF CHANGED)
+				2.5️⃣ Sync Account Name (ONLY if name changed)
+			====================================================== */
+			if (customerName !== undefined && customerName !== customer.customerName) {
+				await tx.account.update({
+					where: { id: customer.accountId },
+					data: { name: customerName },
+				});
+			}
+
+			/* ======================================================
+				3️⃣ OPENING BALANCE LOGIC (ONLY IF PROVIDED)
 			====================================================== */
 			if (openingBalance !== undefined) {
 				const incomingOpening = Number(openingBalance || 0);
@@ -279,79 +292,75 @@ router.put("/:id", authenticate, async (req, res) => {
 					throw new Error("INVALID_OPENING");
 				}
 
-				const isOpeningChanged = incomingOpening !== currentOpening;
+				// If same opening → skip
+				if (incomingOpening !== currentOpening) {
+					const transactionDate = customerDate
+						? new Date(customerDate)
+						: customer.customerDate || new Date();
 
-				// 🔹 Not changed → skip everything
-				if (!isOpeningChanged) {
-					return tx.customer.findUnique({ where: { id: customer.id } });
-				}
-
-				const transactionDate = customerDate
-					? new Date(customerDate)
-					: customer.customerDate || new Date();
-
-				/* ======================================================
-					3A️⃣ Block if ANY sale/payment exists
-				====================================================== */
-				const hasTransactions = await tx.ledgerEntry.findFirst({
-					where: {
-						accountId: customer.accountId,
-						entryType: { not: "OPENING_BALANCE" },
-					},
-				});
-
-				if (hasTransactions) {
-					throw new Error("OPENING_LOCKED");
-				}
-
-				/* ======================================================
-					3B️⃣ Update or Create Opening Ledger Entry
-				====================================================== */
-				const openingEntry = await tx.ledgerEntry.findFirst({
-					where: {
-						accountId: customer.accountId,
-						entryType: "OPENING_BALANCE",
-					},
-					orderBy: { createdAt: "asc" },
-				});
-
-				if (openingEntry) {
-					await tx.ledgerEntry.update({
-						where: { id: openingEntry.id },
-						data: {
-							debit: incomingOpening,
-							credit: 0,
-							balanceAfter: incomingOpening,
-							transactionDate,
-							remarks: "Opening balance updated",
+					/* ------------------------------------------------------
+						3A️⃣ Block if ANY ledger exists except OPENING
+					------------------------------------------------------ */
+					const hasTransactions = await tx.ledgerEntry.findFirst({
+						where: {
+							accountId: customer.accountId,
+							entryType: { not: "OPENING_BALANCE" },
 						},
 					});
-				} else if (incomingOpening > 0) {
-					await tx.ledgerEntry.create({
-						data: {
+
+					if (hasTransactions) {
+						throw new Error("OPENING_LOCKED");
+					}
+
+					/* ------------------------------------------------------
+						3B️⃣ Update or Create Opening Ledger
+					------------------------------------------------------ */
+					const openingEntry = await tx.ledgerEntry.findFirst({
+						where: {
 							accountId: customer.accountId,
 							entryType: "OPENING_BALANCE",
-							debit: incomingOpening,
-							credit: 0,
-							balanceAfter: incomingOpening,
-							transactionDate,
-							remarks: "Opening balance",
 						},
+						orderBy: { createdAt: "asc" },
+					});
+
+					if (openingEntry) {
+						await tx.ledgerEntry.update({
+							where: { id: openingEntry.id },
+							data: {
+								debit: incomingOpening,
+								credit: 0,
+								balanceAfter: incomingOpening,
+								transactionDate,
+								remarks: "Opening balance updated",
+							},
+						});
+					} else if (incomingOpening > 0) {
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: customer.accountId,
+								entryType: "OPENING_BALANCE",
+								debit: incomingOpening,
+								credit: 0,
+								balanceAfter: incomingOpening,
+								transactionDate,
+								remarks: "Opening balance",
+							},
+						});
+					}
+
+					/* ------------------------------------------------------
+						3C️⃣ Sync Account Balance + Customer Opening
+					------------------------------------------------------ */
+					await tx.account.update({
+						where: { id: customer.accountId },
+						data: { balance: incomingOpening },
+					});
+
+					await tx.customer.update({
+						where: { id: customer.id },
+						data: { openingBalance: incomingOpening },
 					});
 				}
-
-				/* ======================================================
-					3C️⃣ Sync Account + Customer
-				====================================================== */
-				await tx.account.update({
-					where: { id: customer.accountId },
-					data: { balance: incomingOpening },
-				});
-
-				await tx.customer.update({
-					where: { id: customer.id },
-					data: { openingBalance: incomingOpening },
-				});
 			}
 
 			/* ======================================================
@@ -383,7 +392,7 @@ router.put("/:id", authenticate, async (req, res) => {
 		if (err.message === "INVALID_OPENING") {
 			return res.status(400).json({
 				success: false,
-				error: "Opening balance must be a valid positive number",
+				error: "Opening balance must be a valid non-negative number",
 			});
 		}
 
@@ -394,6 +403,7 @@ router.put("/:id", authenticate, async (req, res) => {
 		});
 	}
 });
+
 
 
 /* ======================= DELETE ======================= */
