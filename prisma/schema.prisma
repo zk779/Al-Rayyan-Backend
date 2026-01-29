@@ -352,6 +352,9 @@ model Sale {
 
 	remarks String?
 	status SaleStatus @default(PENDING)
+	paxName     String?
+	destinations Json?
+	vatAmount   Float? // or Float
 
 	// 🔥 REFUND SUPPORT
 	isRefund Boolean @default(false)

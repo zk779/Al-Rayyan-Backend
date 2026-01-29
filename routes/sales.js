@@ -354,6 +354,74 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 	}
 });
 
+
+router.get("/saleId/:saleId", authenticate, async (req, res) => {
+  try {
+    const sale = await prisma.sale.findUnique({
+      where: {
+        id: req.params.saleId,
+      },
+      include: {
+        // 🔗 Parent invoice
+        invoice: true,
+
+        // ✈ Airline
+        airline: true,
+
+        // 🏢 Vendor
+        vendor: true,
+
+        // 👤 Customer (nullable)
+        customer: true,
+
+        // 💸 Refund master record (Refund table)
+        refund: true,
+
+        // 🔁 If this sale is a refund → original sale
+        refundOfSale: {
+          include: {
+            invoice: true,
+            airline: true,
+            vendor: true,
+            customer: true,
+            refund: true,
+          },
+        },
+
+        // 🔁 If this sale has refunds → child sales
+        refunds: {
+          include: {
+            invoice: true,
+            airline: true,
+            vendor: true,
+            customer: true,
+            refund: true,
+          },
+        },
+      },
+    });
+
+    if (!sale) {
+      return res.status(404).json({
+        success: false,
+        error: "Sale not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      data: sale,
+    });
+  } catch (err) {
+    console.error("Fetch single sale error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch sale",
+    });
+  }
+});
+
+
 /* ===========================
 	CREATE SALES (INVOICE HAS userId)
 =========================== */
@@ -393,6 +461,7 @@ router.post("/", authenticate, async (req, res) => {
 			const net = Number(s.netPrice);
 			const sell = Number(s.sellPrice);
 			const paid = Number(s.paidAmount || 0);
+			const vat = Number(s.vatAmount || 0); // ✅ added
 
 			if (Number.isNaN(net) || Number.isNaN(sell)) {
 				throw new Error("netPrice and sellPrice must be numbers");
@@ -402,6 +471,9 @@ router.post("/", authenticate, async (req, res) => {
 			}
 			if (paid < 0 || paid > sell) {
 				throw new Error("Invalid paidAmount");
+			}
+			if (vat < 0) {
+				throw new Error("vatAmount cannot be negative");
 			}
 
 			if (String(s.paymentType).toUpperCase() === "CREDIT" && !s.customerId) {
@@ -431,12 +503,12 @@ router.post("/", authenticate, async (req, res) => {
 
 		const originalSales = refundSaleIds.length
 			? await prisma.sale.findMany({
-				where: { id: { in: refundSaleIds } },
-				include: {
-					vendor: { include: { account: true } },
-					customer: { include: { account: true } },
-				},
-			})
+					where: { id: { in: refundSaleIds } },
+					include: {
+						vendor: { include: { account: true } },
+						customer: { include: { account: true } },
+					},
+			  })
 			: [];
 
 		const originalSaleMap = Object.fromEntries(
@@ -446,13 +518,13 @@ router.post("/", authenticate, async (req, res) => {
 		/* ---------- PRELOAD REFUND TOTALS (FIX) ---------- */
 		const refundSums = refundSaleIds.length
 			? await prisma.sale.groupBy({
-				by: ["refundOfSaleId"],
-				where: {
-					isRefund: true,
-					refundOfSaleId: { in: refundSaleIds },
-				},
-				_sum: { sellPrice: true },
-			})
+					by: ["refundOfSaleId"],
+					where: {
+						isRefund: true,
+						refundOfSaleId: { in: refundSaleIds },
+					},
+					_sum: { sellPrice: true },
+			  })
 			: [];
 
 		const refundSumMap = Object.fromEntries(
@@ -529,13 +601,13 @@ router.post("/", authenticate, async (req, res) => {
 
 		const result = await prisma.$transaction(
 			async (tx) => {
-				const invoice = await tx.salesInvoice.create({
-					data: {
-						invoiceNo,
-						saleDate: businessDate,
-						userId: req.user.id,
-					},
-				});
+			const invoice = await tx.salesInvoice.create({
+				data: {
+					invoiceNo,
+					saleDate: businessDate,
+					userId: req.user.id,
+				},
+			});
 
 				/* ---------- IN-MEMORY BALANCES ---------- */
 				const balances = new Map();
@@ -554,38 +626,45 @@ router.post("/", authenticate, async (req, res) => {
 				const getBal = (id) => balances.get(id) || 0;
 				const setBal = (id, v) => balances.set(id, Number(v));
 
-				let totalNet = 0;
-				let totalSell = 0;
-				let totalProfit = 0;
+			let totalNet = 0;
+			let totalSell = 0;
+			let totalProfit = 0;
 
-				/* ======================
-					SALES
-				====================== */
-				for (const s of sales) {
-					const vendor = vendorMap[s.vendorId];
-					const net = Number(s.netPrice);
-					const sell = Number(s.sellPrice);
-					const paid = Number(s.paidAmount || 0);
-					const profit = sell - net;
+			/* ======================
+				SALES
+			====================== */
+			for (const s of sales) {
+				const vendor = vendorMap[s.vendorId];
+				const net = Number(s.netPrice);
+				const sell = Number(s.sellPrice);
+				const paid = Number(s.paidAmount || 0);
+				const vat = Number(s.vatAmount || 0);
+				const profit = sell - net;
 
-					const sale = await tx.sale.create({
-						data: {
-							invoiceId: invoice.id,
-							airlineId: s.airlineId,
-							vendorId: s.vendorId,
-							customerId: s.customerId || null,
-							documentNo: s.documentNo || null,
-							netPrice: net,
-							sellPrice: sell,
-							profit,
-							paidAmount: paid,
-							paymentType: s.paymentType,
-							paymentStatus:
-								paid === sell ? "PAID" : paid > 0 ? "PARTIAL" : "DUE",
-							status: "COMPLETED",
-							isRefund: false,
-						},
-					});
+				const sale = await tx.sale.create({
+					data: {
+						invoiceId: invoice.id,
+						airlineId: s.airlineId,
+						vendorId: s.vendorId,
+						customerId: s.customerId || null,
+						documentNo: s.documentNo || null,
+
+						// ✅ NEW FIELDS
+						paxName: s.paxName || null,
+						destinations: s.destinations || null,
+						vatAmount: vat,
+
+						netPrice: net,
+						sellPrice: sell,
+						profit,
+						paidAmount: paid,
+						paymentType: s.paymentType,
+						paymentStatus:
+							paid === sell ? "PAID" : paid > 0 ? "PARTIAL" : "DUE",
+						status: "COMPLETED",
+						isRefund: false,
+					},
+				});
 
 					const isDebitVendor = vendor.category === "DEBIT";
 					const vendorBalAfter =
@@ -661,10 +740,10 @@ router.post("/", authenticate, async (req, res) => {
 						}
 					}
 
-					totalNet += net;
-					totalSell += sell;
-					totalProfit += profit;
-				}
+				totalNet += net;
+				totalSell += sell;
+				totalProfit += profit;
+			}
 
 				/* ======================
 					REFUNDS (UNCHANGED LOGIC)
@@ -815,12 +894,12 @@ router.post("/", authenticate, async (req, res) => {
 					totalSell -= baseSell;
 				}
 
-				await tx.salesInvoice.update({
-					where: { id: invoice.id },
-					data: { totalNet, totalSell, totalProfit },
-				});
+			await tx.salesInvoice.update({
+				where: { id: invoice.id },
+				data: { totalNet, totalSell, totalProfit },
+			});
 
-				return invoice;
+			return invoice;
 			},
 			{ timeout: 50000 }
 		);
@@ -856,7 +935,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 	try {
 		/* ======================================================
-			1️⃣ LOAD EXISTING INVOICE (CURRENT BASELINE)
+			1️⃣ LOAD EXISTING INVOICE
 		====================================================== */
 		const existingInvoice = await prisma.salesInvoice.findUnique({
 			where: { id: invoiceId },
@@ -901,16 +980,16 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		const refundRows =
 			refundIds.length > 0
 				? await prisma.refund.findMany({
-					where: { id: { in: refundIds } },
-					include: {
-						sale: {
-							include: {
-								vendor: { include: { account: true } },
-								customer: { include: { account: true } },
+						where: { id: { in: refundIds } },
+						include: {
+							sale: {
+								include: {
+									vendor: { include: { account: true } },
+									customer: { include: { account: true } },
+								},
 							},
 						},
-					},
-				})
+				  })
 				: [];
 
 		for (const r of refundRows) {
@@ -922,7 +1001,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		);
 
 		/* ======================================================
-			3️⃣ PRELOAD ALL VENDORS & CUSTOMERS
+			3️⃣ PRELOAD VENDORS & CUSTOMERS
 		====================================================== */
 		const vendorIds = new Set();
 		const customerIds = new Set();
@@ -939,16 +1018,16 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 		const vendors = vendorIds.size
 			? await prisma.vendor.findMany({
-				where: { id: { in: [...vendorIds] } },
-				include: { account: true },
-			})
+					where: { id: { in: [...vendorIds] } },
+					include: { account: true },
+			  })
 			: [];
 
 		const customers = customerIds.size
 			? await prisma.customer.findMany({
-				where: { id: { in: [...customerIds] } },
-				include: { account: true },
-			})
+					where: { id: { in: [...customerIds] } },
+					include: { account: true },
+			  })
 			: [];
 
 		const vendorMap = new Map(vendors.map((v) => [v.id, v]));
@@ -961,23 +1040,23 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		====================================================== */
 		const result = await prisma.$transaction(
 			async (tx) => {
-				await tx.salesInvoice.update({
-					where: { id: invoiceId },
-					data: { invoiceNo, saleDate: businessDate },
-				});
+			await tx.salesInvoice.update({
+				where: { id: invoiceId },
+				data: { invoiceNo, saleDate: businessDate },
+			});
 
 				/* ======================================================
 					4.1 IN-MEMORY BALANCES (UNCHANGED)
 				====================================================== */
-				const balances = new Map();
-				const touchedAccounts = new Set();
+			const balances = new Map();
+			const touchedAccounts = new Set();
 
 				const seedAccount = (acc) => {
 					if (!acc) return;
 					if (!balances.has(acc.id)) balances.set(acc.id, Number(acc.balance || 0));
-				};
+			};
 
-				for (const s of existingInvoice.sales) {
+			for (const s of existingInvoice.sales) {
 					seedAccount(s.vendor?.account);
 					seedAccount(s.customer?.account);
 				}
@@ -989,13 +1068,13 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						const c = customerMap.get(s.customerId);
 						if (c?.account) seedAccount(c.account);
 					}
-				}
+			}
 
-				const getBal = (id) => Number(balances.get(id) || 0);
-				const setBal = (id, val) => {
-					balances.set(id, Number(val));
-					touchedAccounts.add(id);
-				};
+			const getBal = (id) => Number(balances.get(id) || 0);
+			const setBal = (id, val) => {
+				balances.set(id, Number(val));
+				touchedAccounts.add(id);
+			};
 
 				/* ======================================================
 					🔵 REFUND UPDATE (BY refundId ONLY) - FIXED
@@ -1127,37 +1206,39 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				/* ======================================================
 					4.2 HANDLE DELETED SALES
 				====================================================== */
-				for (const s of deletedSales) {
-					const refundExists = await tx.refund.findFirst({
-						where: { saleId: s.id },
-					});
+			for (const s of deletedSales) {
+				const refundExists = await tx.refund.findFirst({
+					where: { saleId: s.id },
+				});
 
-					if (refundExists) {
+				if (refundExists) {
 						throw new Error(
 							`Sale ${s.id} cannot be deleted because a refund exists`
 						);
-					}
-
-					await tx.sale.delete({ where: { id: s.id } });
 				}
+
+				await tx.sale.delete({ where: { id: s.id } });
+			}
 
 				/* ======================================================
 					4.3 PROCESS EDITED/KEPT SALES
 				====================================================== */
-				let totalNet = 0;
-				let totalSell = 0;
-				let totalProfit = 0;
+			let totalNet = 0;
+			let totalSell = 0;
+			let totalProfit = 0;
 
-				for (const payload of sales) {
-					const current = saleMap.get(payload.id);
+			for (const payload of sales) {
+				const current = saleMap.get(payload.id);
 
 					// Normalize & validate
-					const oldNet = Number(current.netPrice || 0);
-					const newNet = Number(payload.netPrice);
-					const oldSell = Number(current.sellPrice || 0);
-					const newSell = Number(payload.sellPrice);
-					const oldPaid = Number(current.paidAmount || 0);
-					const newPaid = Number(payload.paidAmount || 0);
+				const oldNet = Number(current.netPrice || 0);
+				const newNet = Number(payload.netPrice);
+				const oldSell = Number(current.sellPrice || 0);
+				const newSell = Number(payload.sellPrice);
+				const oldPaid = Number(current.paidAmount || 0);
+				const newPaid = Number(payload.paidAmount || 0);
+				const newVat = Number(payload.vatAmount || 0);
+				if (newVat < 0) throw new Error("vatAmount cannot be negative");
 
 					if (Number.isNaN(newNet) || Number.isNaN(newSell)) {
 						throw new Error("netPrice and sellPrice must be numbers");
@@ -1521,54 +1602,60 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					/* ==========================
 						UPDATE SALE ROW (new baseline)
 					========================== */
-					await tx.sale.update({
-						where: { id: current.id },
-						data: {
-							airlineId: payload.airlineId,
-							vendorId: payload.vendorId,
-							customerId: payload.customerId || null,
-							documentNo: payload.documentNo || null,
-							netPrice: newNet,
-							sellPrice: newSell,
-							profit: newSell - newNet,
-							paidAmount: newPaid,
-							paymentType: payload.paymentType || current.paymentType,
-							paymentStatus: newPaid === newSell ? "PAID" : newPaid > 0 ? "PARTIAL" : "DUE",
-							remarks: payload.remarks || null,
-						},
-					});
+				await tx.sale.update({
+					where: { id: current.id },
+					data: {
+						airlineId: payload.airlineId,
+						vendorId: payload.vendorId,
+						customerId: payload.customerId || null,
+						documentNo: payload.documentNo || null,
 
-					totalNet += newNet;
-					totalSell += newSell;
+						// ✅ ADDED FIELDS
+						paxName: payload.paxName ?? current.paxName,
+						destinations: payload.destinations ?? current.destinations,
+						vatAmount: newVat,
+
+						netPrice: newNet,
+						sellPrice: newSell,
+						profit: newSell - newNet,
+						paidAmount: newPaid,
+						paymentType: payload.paymentType || current.paymentType,
+							paymentStatus: newPaid === newSell ? "PAID" : newPaid > 0 ? "PARTIAL" : "DUE",
+						remarks: payload.remarks || null,
+					},
+				});
+
+				totalNet += newNet;
+				totalSell += newSell;
 					totalProfit += (newSell - newNet);
-				}
+			}
 
 				/* ======================================================
 					4.4 PERSIST ACCOUNT BALANCES
 				====================================================== */
-				for (const accId of touchedAccounts) {
-					await tx.account.update({
-						where: { id: accId },
-						data: { balance: getBal(accId) },
-					});
-				}
+			for (const accId of touchedAccounts) {
+				await tx.account.update({
+					where: { id: accId },
+					data: { balance: getBal(accId) },
+				});
+			}
 
 				/* ======================================================
 					4.5 UPDATE INVOICE TOTALS
 				====================================================== */
-				await tx.salesInvoice.update({
-					where: { id: invoiceId },
-					data: { totalNet, totalSell, totalProfit },
-				});
+			await tx.salesInvoice.update({
+				where: { id: invoiceId },
+				data: { totalNet, totalSell, totalProfit },
+			});
 
-				return { invoiceId, deletedSalesCount: deletedSales.length };
+			return { invoiceId, deletedSalesCount: deletedSales.length };
 			},
 			{ timeout: 20000, maxWait: 5000 }
 		);
 
 		return res.json({
 			success: true,
-			message: "Invoice updated successfully (sales + refunds)",
+			message: "Invoice updated successfully",
 			data: result,
 		});
 	} catch (err) {
@@ -1581,7 +1668,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 router.delete("/:invoiceId", authenticate, async (req, res) => {
 	const { invoiceId } = req.params;
-
+	
 	try {
 		await prisma.$transaction(async (tx) => {
 			const invoice = await tx.salesInvoice.findUnique({
