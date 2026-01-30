@@ -114,6 +114,7 @@ router.post("/", authenticate, async (req, res) => {
 		const {
 			customerName,
 			customerType,
+			customerVatId,
 			contactPerson,
 			phone,
 			email,
@@ -176,6 +177,7 @@ router.post("/", authenticate, async (req, res) => {
 				data: {
 					customerName,
 					customerType: type,
+					customerVatId,
 					contactPerson,
 					phone,
 					email: email || null,
@@ -230,6 +232,7 @@ router.put("/:id", authenticate, async (req, res) => {
 		const {
 			customerName,
 			customerType,
+			customerVatId,
 			contactPerson,
 			phone,
 			email,
@@ -260,6 +263,7 @@ router.put("/:id", authenticate, async (req, res) => {
 					...(customerType !== undefined
 						? { customerType: String(customerType).toUpperCase() }
 						: {}),
+					...(customerVatId !== undefined ? { customerVatId } : {}),
 					...(contactPerson !== undefined ? { contactPerson } : {}),
 					...(phone !== undefined ? { phone } : {}),
 					...(email !== undefined ? { email: email || null } : {}),

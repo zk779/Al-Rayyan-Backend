@@ -274,6 +274,7 @@ model Customer {
 	// Core info
 	customerName String
 	customerType CustomerType
+	customerVatId String?
 
 	contactPerson String
 	phone String
