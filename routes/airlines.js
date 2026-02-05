@@ -25,6 +25,77 @@ async function authenticate(req, res, next) {
   }
 }
 
+// ✅ Bulk Create Airlines (Skips duplicates based on iataName)
+router.post("/bulk", authenticate, async (req, res) => {
+  try {
+    const airlines = req.body;
+
+    // 1. Basic Validation to prevent empty processing
+    if (!Array.isArray(airlines) || airlines.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Request body must be a non-empty array." 
+      });
+    }
+
+    // 2. Map data directly
+    const dataToInsert = airlines.map(airline => ({
+      airlineName: airline.airlineName,
+      airlineCode: airline.airlineCode,
+      iataName: airline.iataName,
+      icao_code: airline.icao_code,
+      country_territory: airline.country_territory,
+      // Fixed logic: Use the boolean directly or default to true
+      status: typeof airline.status === 'boolean' ? airline.status : true,
+    }));
+
+    // 3. Execute Bulk Insert
+    // Note: In MongoDB, if any record violates a unique constraint, 
+    // the entire operation will fail unless you use a different pattern.
+    const result = await prisma.airlineCode.createMany({
+      data: dataToInsert,
+    });
+
+    // 4. Send response immediately to prevent timeout retries
+    return res.status(201).json({ 
+      success: true, 
+      count: result.count 
+    });
+
+  } catch (err) {
+    console.error("Bulk Insert Error:", err);
+    
+    // Handle unique constraint violations specifically for MongoDB
+    if (err.code === 'P2002') {
+      return res.status(409).json({ 
+        success: false, 
+        error: "One or more airlines already exist (Unique constraint violation)." 
+      });
+    }
+
+    return res.status(500).json({ 
+      success: false, 
+      error: "Internal Server Error during bulk upload." 
+    });
+  }
+});
+// ✅ Update all airlines to status: true
+// ✅ Update Status by Array of IDs
+router.patch("/status/set-selected", authenticate, async (req, res) => {
+  try {
+    const { ids, targetStatus } = req.body; // ids: [], targetStatus: true/false
+
+    const result = await prisma.airlineCode.updateMany({
+      where: { id: { in: ids } },
+      data: { status: targetStatus },
+    });
+
+    res.json({ success: true, count: result.count, message: `Updated ${result.count} records.` });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /* ------------------------------- 📋 ROUTES ------------------------------- */
 
 // ✅ Get all airline codes
@@ -113,6 +184,43 @@ router.delete("/:id", authenticate, async (req, res) => {
   } catch (err) {
     console.error("Error deleting airline:", err);
     res.status(500).json({ success: false, error: "Failed to delete airline" });
+  }
+});
+
+// ✅ Delete specific airlines by array of IDs OR delete all if array is empty
+router.delete("/deleteMany", authenticate, async (req, res) => {
+  try {
+    const { ids } = req.body; // Expecting { "ids": ["id1", "id2"] } or { "ids": [] }
+
+    let filter = {};
+
+    // If ids is provided and has items, target those specific IDs
+    if (Array.isArray(ids) && ids.length > 0) {
+      filter = {
+        id: {
+          in: ids,
+        },
+      };
+    } 
+    // If ids is an empty array, 'filter' remains {} which deletes everything
+
+    const result = await prisma.airlineCode.deleteMany({
+      where: filter,
+    });
+
+    res.json({
+      success: true,
+      message: ids?.length > 0 
+        ? `${result.count} selected airlines deleted.` 
+        : "All airlines have been deleted.",
+      count: result.count,
+    });
+  } catch (err) {
+    console.error("Error during deletion:", err);
+    res.status(500).json({ 
+      success: false, 
+      error: "Failed to delete airlines" 
+    });
   }
 });
 

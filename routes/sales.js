@@ -462,6 +462,8 @@ router.post("/", authenticate, async (req, res) => {
 			const sell = Number(s.sellPrice);
 			const paid = Number(s.paidAmount || 0);
 			const vat = Number(s.vatAmount || 0); // ✅ added
+			const paxVat = Number(s.paxVat || 0); // ✅ NEW
+			const miscCharges = Number(s.miscCharges || 0); // ✅ NEW
 
 			if (Number.isNaN(net) || Number.isNaN(sell)) {
 				throw new Error("netPrice and sellPrice must be numbers");
@@ -474,6 +476,13 @@ router.post("/", authenticate, async (req, res) => {
 			}
 			if (vat < 0) {
 				throw new Error("vatAmount cannot be negative");
+			}
+			// ✅ NEW VALIDATIONS
+			if (paxVat < 0) {
+				throw new Error("paxVat cannot be negative");
+			}
+			if (miscCharges < 0) {
+				throw new Error("miscCharges cannot be negative");
 			}
 
 			if (String(s.paymentType).toUpperCase() === "CREDIT" && !s.customerId) {
@@ -639,6 +648,8 @@ router.post("/", authenticate, async (req, res) => {
 				const sell = Number(s.sellPrice);
 				const paid = Number(s.paidAmount || 0);
 				const vat = Number(s.vatAmount || 0);
+				const paxVat = Number(s.paxVat || 0); // ✅ NEW
+				const miscCharges = Number(s.miscCharges || 0); // ✅ NEW
 				const profit = sell - net;
 
 				const sale = await tx.sale.create({
@@ -650,6 +661,14 @@ router.post("/", authenticate, async (req, res) => {
 						documentNo: s.documentNo || null,
 
 						// ✅ NEW FIELDS
+						pnr: s.pnr || null,
+						routeType: s.routeType || null,
+						tripType: s.tripType || "Oneway",
+						departDate: s.departDate ? new Date(s.departDate) : null,
+						arrivalDate: s.arrivalDate ? new Date(s.arrivalDate) : null,
+						paxVat: paxVat,
+						miscCharges: miscCharges,
+
 						paxName: s.paxName || null,
 						destinations: s.destinations || null,
 						vatAmount: vat,
@@ -914,6 +933,8 @@ router.post("/", authenticate, async (req, res) => {
 		return res.status(400).json({ success: false, error: err.message });
 	}
 });
+
+
 router.put("/:invoiceId", authenticate, async (req, res) => {
 	const { invoiceId } = req.params;
 	const { invoiceNo, saleDate, sales = [], refunds = [] } = req.body;
@@ -1238,7 +1259,13 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				const oldPaid = Number(current.paidAmount || 0);
 				const newPaid = Number(payload.paidAmount || 0);
 				const newVat = Number(payload.vatAmount || 0);
+				const newPaxVat = Number(payload.paxVat || 0); // ✅ NEW
+				const newMiscCharges = Number(payload.miscCharges || 0); // ✅ NEW
+
 				if (newVat < 0) throw new Error("vatAmount cannot be negative");
+				// ✅ NEW VALIDATIONS
+				if (newPaxVat < 0) throw new Error("paxVat cannot be negative");
+				if (newMiscCharges < 0) throw new Error("miscCharges cannot be negative");
 
 					if (Number.isNaN(newNet) || Number.isNaN(newSell)) {
 						throw new Error("netPrice and sellPrice must be numbers");
@@ -1610,7 +1637,15 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						customerId: payload.customerId || null,
 						documentNo: payload.documentNo || null,
 
-						// ✅ ADDED FIELDS
+						// ✅ NEW FIELDS
+						pnr: payload.pnr ?? current.pnr,
+						routeType: payload.routeType ?? current.routeType,
+						tripType: payload.tripType ?? current.tripType,
+						departDate: payload.departDate ? new Date(payload.departDate) : current.departDate,
+						arrivalDate: payload.arrivalDate ? new Date(payload.arrivalDate) : current.arrivalDate,
+						paxVat: newPaxVat,
+						miscCharges: newMiscCharges,
+
 						paxName: payload.paxName ?? current.paxName,
 						destinations: payload.destinations ?? current.destinations,
 						vatAmount: newVat,

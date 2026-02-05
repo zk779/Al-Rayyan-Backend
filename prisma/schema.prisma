@@ -148,8 +148,10 @@ model User {
 model AirlineCode {
 	id String @id @default(auto()) @map("_id") @db.ObjectId
 	airlineName String
-	iataName String?
+	iataName String? @unique
 	airlineCode String? @unique
+	icao_code String?
+	country_territory String?
 	status Boolean @default(true)
 	createdAt DateTime @default(now())
 	updatedAt DateTime @updatedAt
@@ -334,49 +336,58 @@ model SalesInvoice {
 }
 
 model Sale {
-	id String @id @default(auto()) @map("_id") @db.ObjectId
+  id String @id @default(auto()) @map("_id") @db.ObjectId
 
-	invoiceId String @db.ObjectId
-	airlineId String @db.ObjectId
-	vendorId String @db.ObjectId
-	customerId String? @db.ObjectId
+  invoiceId  String  @db.ObjectId
+  airlineId  String  @db.ObjectId
+  vendorId   String  @db.ObjectId
+  customerId String? @db.ObjectId
 
-	documentNo String?
+  // 🎫 FLIGHT DETAILS
+  pnr           String?
+  documentNo    String?
+  routeType     String?    // e.g., "Domestic" or "International"
+  tripType      String?    @default("Oneway") // e.g., "Oneway" or "RoundTrip"
+  departDate    DateTime?
+  arrivalDate   DateTime?
 
-	netPrice Float
-	sellPrice Float
-	profit Float
+  // 💰 PRICING & TAXES
+  netPrice      Float
+  sellPrice     Float
+  profit        Float
+  paxVat        Float?     @default(0)
+  vatAmount     Float?     @default(0)
+  miscCharges   Float?     @default(0)
 
-	paymentType PaymentType
-	paymentStatus PaymentStatus @default(DUE)
-	paidAmount Float @default(0)
+  // 💳 PAYMENT & STATUS
+  paymentType   PaymentType
+  paymentStatus PaymentStatus @default(DUE)
+  paidAmount    Float         @default(0)
 
-	remarks String?
-	status SaleStatus @default(PENDING)
-	paxName     String?
-	destinations Json?
-	vatAmount   Float? // or Float
+  remarks       String?
+  status        SaleStatus   @default(PENDING)
+  paxName       String?
+  destinations  Json?
 
-	// 🔥 REFUND SUPPORT
-	isRefund Boolean @default(false)
+  // 🔥 REFUND SUPPORT
+  isRefund       Boolean @default(false)
+  refundOfSaleId String? @db.ObjectId
+  refundOfSale   Sale?   @relation("SaleRefundRelation", fields: [refundOfSaleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  refunds        Sale[]  @relation("SaleRefundRelation")
 
-	// ✅ SELF RELATION (ONE-LINE, VALID)
-	refundOfSaleId String? @db.ObjectId
-	refundOfSale Sale? @relation("SaleRefundRelation", fields: [refundOfSaleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-	refunds Sale[] @relation("SaleRefundRelation")
+  // 🔗 RELATIONS
+  invoice  SalesInvoice @relation(fields: [invoiceId], references: [id])
+  airline  AirlineCode  @relation(fields: [airlineId], references: [id])
+  vendor   Vendor       @relation(fields: [vendorId], references: [id])
+  customer Customer?    @relation(fields: [customerId], references: [id])
+  refund   Refund?
 
-	invoice SalesInvoice @relation(fields: [invoiceId], references: [id])
-	airline AirlineCode @relation(fields: [airlineId], references: [id])
-	vendor Vendor @relation(fields: [vendorId], references: [id])
-	customer Customer? @relation(fields: [customerId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-	refund Refund?
-
-	createdAt DateTime @default(now())
-	updatedAt DateTime @updatedAt
-
-	@@index([refundOfSaleId])
-	@@index([isRefund])
+  @@index([refundOfSaleId])
+  @@index([isRefund])
+  @@index([pnr])
 }
 
 model Refund {

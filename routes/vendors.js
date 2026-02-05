@@ -224,238 +224,140 @@ router.post("/", authenticate, async (req, res) => {
 /* ======================= UPDATE VENDOR ======================= */
 
 router.put("/:id", authenticate, async (req, res) => {
-	try {
-		const {
-			vendorName,
-			category,
-			vendorType,
-			email,
-			phone,
-			address,
-			openingBalance,
-			vendorDate,
-			status,
-		} = req.body;
+    try {
+        const {
+            vendorName,
+            category,
+            vendorType,
+            email,
+            phone,
+            address,
+            openingBalance,
+            vendorDate,
+            status,
+        } = req.body;
 
-		const updatedVendor = await prisma.$transaction(async (tx) => {
-			/* ======================================================
-				1️⃣ Fetch Vendor + Account
-			====================================================== */
-			const vendor = await tx.vendor.findUnique({
-				where: { id: req.params.id },
-				include: { account: true },
-			});
+        const updatedVendor = await prisma.$transaction(async (tx) => {
+            // 1️⃣ Fetch current state
+            const vendor = await tx.vendor.findUnique({
+                where: { id: req.params.id },
+                include: { account: true },
+            });
 
-			if (!vendor) throw new Error("NOT_FOUND");
+            if (!vendor) throw new Error("NOT_FOUND");
 
-			/* ======================================================
-				2️⃣ Update Vendor Fields (SAFE PATCH)
-			====================================================== */
-			await tx.vendor.update({
-				where: { id: vendor.id },
-				data: {
-					...(vendorName !== undefined ? { vendorName } : {}),
-					...(category !== undefined ? { category } : {}),
-					...(vendorType !== undefined ? { vendorType } : {}),
-					...(email !== undefined ? { email: email || null } : {}),
-					...(phone !== undefined ? { phone } : {}),
-					...(address !== undefined ? { address: address || null } : {}),
-					...(vendorDate !== undefined
-						? { vendorDate: new Date(vendorDate) }
-						: {}),
-					...(status !== undefined ? { status: Boolean(status) } : {}),
-				},
-			});
+            // 2️⃣ Update Basic Vendor Info
+            await tx.vendor.update({
+                where: { id: vendor.id },
+                data: {
+                    ...(vendorName !== undefined ? { vendorName } : {}),
+                    ...(category !== undefined ? { category } : {}),
+                    ...(vendorType !== undefined ? { vendorType } : {}),
+                    ...(email !== undefined ? { email: email || null } : {}),
+                    ...(phone !== undefined ? { phone } : {}),
+                    ...(address !== undefined ? { address: address || null } : {}),
+                    ...(vendorDate !== undefined ? { vendorDate: new Date(vendorDate) } : {}),
+                    ...(status !== undefined ? { status: Boolean(status) } : {}),
+                },
+            });
 
-			/* ======================================================
-				2.5️⃣ Sync Account Name (ONLY if name changed)
-			====================================================== */
-			if (
-				vendorName !== undefined &&
-				vendor.accountId &&
-				vendorName !== vendor.vendorName
-			) {
-				await tx.account.update({
-					where: { id: vendor.accountId },
-					data: { name: vendorName },
-				});
-			}
+            // 3️⃣ Sync Account Name if changed
+            if (vendorName && vendor.accountId && vendorName !== vendor.vendorName) {
+                await tx.account.update({
+                    where: { id: vendor.accountId },
+                    data: { name: vendorName },
+                });
+            }
 
-			/* ======================================================
-				3️⃣ OPENING BALANCE LOGIC (ONLY IF PROVIDED)
-			====================================================== */
-			if (openingBalance !== undefined) {
-				const incomingOpening = Number(openingBalance || 0);
-				const currentOpening = Number(vendor.openingBalance || 0);
+            // 4️⃣ Opening Balance & Ledger Sync Logic
+            if (openingBalance !== undefined) {
+                const incomingOpening = Number(openingBalance || 0);
+                const isDebitVendor = (category ?? vendor.category) === "DEBIT";
+                const businessDate = vendorDate ? new Date(vendorDate) : (vendor.vendorDate || new Date());
+                
+                let accountId = vendor.accountId;
 
-				if (Number.isNaN(incomingOpening) || incomingOpening < 0) {
-					throw new Error("INVALID_OPENING");
-				}
+                // A: Ensure Account exists
+                if (!accountId) {
+                    const newAcc = await tx.account.create({
+                        data: {
+                            name: vendorName ?? vendor.vendorName,
+                            type: "VENDOR",
+                            balance: incomingOpening,
+                        },
+                    });
+                    accountId = newAcc.id;
+                    // Connect vendor to new account immediately
+                    await tx.vendor.update({
+                        where: { id: vendor.id },
+                        data: { accountId: accountId }
+                    });
+                }
 
-				const isOpeningChanged = incomingOpening !== currentOpening;
+                // B: Check for Transaction Lock (Ignore Opening Balance entries)
+                const otherTx = await tx.ledgerEntry.findFirst({
+                    where: {
+                        accountId,
+                        entryType: { not: "OPENING_BALANCE" },
+                    },
+                });
+                if (otherTx) throw new Error("OPENING_LOCKED");
 
-				// 🔹 If opening balance not changed → SKIP EVERYTHING
-				if (!isOpeningChanged) {
-					return tx.vendor.findUnique({ where: { id: vendor.id } });
-				}
+                // C: Sync Ledger Entry (Upsert pattern)
+                const existingOp = await tx.ledgerEntry.findFirst({
+                    where: { accountId, entryType: "OPENING_BALANCE" }
+                });
 
-					const businessDate = vendorDate
-						? new Date(vendorDate)
-						: vendor.vendorDate || new Date();
+                if (existingOp) {
+                    await tx.ledgerEntry.update({
+                        where: { id: existingOp.id },
+                        data: {
+                            debit: isDebitVendor ? incomingOpening : 0,
+                            credit: isDebitVendor ? 0 : incomingOpening,
+                            balanceAfter: incomingOpening,
+                            transactionDate: businessDate,
+                        }
+                    });
+                } else {
+                    await tx.ledgerEntry.create({
+                        data: {
+                            accountId,
+                            entryType: "OPENING_BALANCE",
+                            debit: isDebitVendor ? incomingOpening : 0,
+                            credit: isDebitVendor ? 0 : incomingOpening,
+                            balanceAfter: incomingOpening,
+                            transactionDate: businessDate,
+                            remarks: "Opening balance initialized",
+                        }
+                    });
+                }
 
-				const isDebitVendor =
-					(category ?? vendor.category) === "DEBIT";
+                // D: Final Balance Sync for Account and Vendor
+                await tx.account.update({
+                    where: { id: accountId },
+                    data: { balance: incomingOpening }
+                });
 
-					let accountId = vendor.accountId;
+                await tx.vendor.update({
+                    where: { id: vendor.id },
+                    data: { openingBalance: incomingOpening }
+                });
+            }
 
-				/* ======================================================
-					3A️⃣ Create Account if Missing
-				====================================================== */
-					if (!accountId) {
-						const account = await tx.account.create({
-							data: {
-								name: vendorName ?? vendor.vendorName,
-								type: "VENDOR",
-								balance: incomingOpening,
-							},
-						});
+            return tx.vendor.findUnique({
+                where: { id: vendor.id },
+                include: { account: true },
+            });
+        });
 
-						await tx.vendor.update({
-							where: { id: vendor.id },
-							data: {
-								accountId: account.id,
-								openingBalance: incomingOpening,
-							},
-						});
+        res.json({ success: true, data: updatedVendor });
 
-						if (incomingOpening > 0) {
-							await tx.ledgerEntry.create({
-								data: {
-									accountId: account.id,
-									entryType: "OPENING_BALANCE",
-									debit: isDebitVendor ? incomingOpening : 0,
-									credit: isDebitVendor ? 0 : incomingOpening,
-									balanceAfter: incomingOpening,
-									transactionDate: businessDate,
-									remarks: "Opening balance",
-								},
-							});
-						}
-
-						return tx.vendor.findUnique({
-							where: { id: vendor.id },
-							include: { account: true },
-						});
-					}
-
-				/* ======================================================
-					3B️⃣ Block if Transactions Exist
-				====================================================== */
-					const hasTransactions = await tx.ledgerEntry.findFirst({
-						where: {
-							accountId,
-							entryType: { not: "OPENING_BALANCE" },
-						},
-					});
-
-					if (hasTransactions) {
-						throw new Error("OPENING_LOCKED");
-					}
-
-				/* ======================================================
-					3C️⃣ Update or Create Opening Ledger Entry
-				====================================================== */
-					const openingEntry = await tx.ledgerEntry.findFirst({
-						where: {
-							accountId,
-							entryType: "OPENING_BALANCE",
-						},
-						orderBy: { createdAt: "asc" },
-					});
-
-					if (openingEntry) {
-						await tx.ledgerEntry.update({
-							where: { id: openingEntry.id },
-							data: {
-								debit: isDebitVendor ? incomingOpening : 0,
-								credit: isDebitVendor ? 0 : incomingOpening,
-								balanceAfter: incomingOpening,
-								transactionDate: businessDate,
-								remarks: "Opening balance updated",
-							},
-						});
-					} else if (incomingOpening > 0) {
-						await tx.ledgerEntry.create({
-							data: {
-								accountId,
-								entryType: "OPENING_BALANCE",
-								debit: isDebitVendor ? incomingOpening : 0,
-								credit: isDebitVendor ? 0 : incomingOpening,
-								balanceAfter: incomingOpening,
-								transactionDate: businessDate,
-								remarks: "Opening balance",
-							},
-						});
-					}
-
-				/* ======================================================
-					3D️⃣ Sync Account & Vendor
-				====================================================== */
-					await tx.account.update({
-						where: { id: accountId },
-						data: { balance: incomingOpening },
-					});
-
-					await tx.vendor.update({
-						where: { id: vendor.id },
-						data: { openingBalance: incomingOpening },
-					});
-			}
-
-			/* ======================================================
-				4️⃣ Return Updated Vendor
-			====================================================== */
-			return tx.vendor.findUnique({
-				where: { id: vendor.id },
-				include: { account: true },
-			});
-		});
-
-		res.json({
-			success: true,
-			data: updatedVendor,
-		});
-	} catch (err) {
-		if (err.message === "NOT_FOUND") {
-			return res.status(404).json({
-				success: false,
-				error: "Vendor not found",
-			});
-		}
-
-		if (err.message === "OPENING_LOCKED") {
-			return res.status(409).json({
-				success: false,
-				error:
-					"Opening balance cannot be changed once transactions exist",
-			});
-		}
-
-		if (err.message === "INVALID_OPENING") {
-			return res.status(400).json({
-				success: false,
-				error: "Invalid opening balance",
-			});
-		}
-
-		console.error(err);
-		res.status(500).json({
-			success: false,
-			error: "Failed to update vendor",
-		});
-	}
+    } catch (err) {
+        console.error("Update Error:", err.message);
+        const status = err.message === "NOT_FOUND" ? 404 : (err.message === "OPENING_LOCKED" ? 409 : 500);
+        res.status(status).json({ success: false, error: err.message });
+    }
 });
-
 
 /* ======================= DELETE ======================= */
 router.delete("/:id", authenticate, async (req, res) => {

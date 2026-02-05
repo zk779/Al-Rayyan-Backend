@@ -228,184 +228,160 @@ router.post("/", authenticate, async (req, res) => {
 
 /* ======================= UPDATE CUSTOMER ======================= */
 router.put("/:id", authenticate, async (req, res) => {
-	try {
-		const {
-			customerName,
-			customerType,
-			customerVatId,
-			contactPerson,
-			phone,
-			email,
-			address,
-			openingBalance,
-			isActive,
-			customerDate,
-		} = req.body;
+    try {
+        const {
+            customerName,
+            customerType,
+            customerVatId,
+            contactPerson,
+            phone,
+            email,
+            address,
+            openingBalance,
+            isActive,
+            customerDate,
+        } = req.body;
 
-		const updatedCustomer = await prisma.$transaction(async (tx) => {
-			/* ======================================================
-				1️⃣ Fetch Customer + Account
-			====================================================== */
-			const customer = await tx.customer.findUnique({
-				where: { id: req.params.id },
-				include: { account: true },
-			});
+        const updatedCustomer = await prisma.$transaction(async (tx) => {
+            /* 1️⃣ Fetch Customer + Account */
+            const customer = await tx.customer.findUnique({
+                where: { id: req.params.id },
+                include: { account: true },
+            });
 
-			if (!customer) throw new Error("NOT_FOUND");
+            if (!customer) throw new Error("NOT_FOUND");
 
-			/* ======================================================
-				2️⃣ Update Customer Fields (SAFE PATCH)
-			====================================================== */
-			await tx.customer.update({
-				where: { id: customer.id },
-				data: {
-					...(customerName !== undefined ? { customerName } : {}),
-					...(customerType !== undefined
-						? { customerType: String(customerType).toUpperCase() }
-						: {}),
-					...(customerVatId !== undefined ? { customerVatId } : {}),
-					...(contactPerson !== undefined ? { contactPerson } : {}),
-					...(phone !== undefined ? { phone } : {}),
-					...(email !== undefined ? { email: email || null } : {}),
-					...(address !== undefined ? { address: address || null } : {}),
-					...(customerDate !== undefined
-						? { customerDate: new Date(customerDate) }
-						: {}),
-					...(isActive !== undefined ? { isActive: Boolean(isActive) } : {}),
-				},
-			});
+            /* 2️⃣ Update Customer Basic Info */
+            await tx.customer.update({
+                where: { id: customer.id },
+                data: {
+                    ...(customerName !== undefined ? { customerName } : {}),
+                    ...(customerType !== undefined ? { customerType: String(customerType).toUpperCase() } : {}),
+                    ...(customerVatId !== undefined ? { customerVatId } : {}),
+                    ...(contactPerson !== undefined ? { contactPerson } : {}),
+                    ...(phone !== undefined ? { phone } : {}),
+                    ...(email !== undefined ? { email: email || null } : {}),
+                    ...(address !== undefined ? { address: address || null } : {}),
+                    ...(customerDate !== undefined ? { customerDate: new Date(customerDate) } : {}),
+                    ...(isActive !== undefined ? { isActive: Boolean(isActive) } : {}),
+                },
+            });
 
-			/* ======================================================
-				2.5️⃣ Sync Account Name (ONLY if name changed)
-			====================================================== */
-			if (customerName !== undefined && customerName !== customer.customerName) {
-				await tx.account.update({
-					where: { id: customer.accountId },
-					data: { name: customerName },
-				});
-			}
+            /* 2.5️⃣ Sync Account Name if changed */
+            if (customerName !== undefined && customer.accountId && customerName !== customer.customerName) {
+                await tx.account.update({
+                    where: { id: customer.accountId },
+                    data: { name: customerName },
+                });
+            }
 
-			/* ======================================================
-				3️⃣ OPENING BALANCE LOGIC (ONLY IF PROVIDED)
-			====================================================== */
-			if (openingBalance !== undefined) {
-				const incomingOpening = Number(openingBalance || 0);
-				const currentOpening = Number(customer.openingBalance || 0);
+            /* 3️⃣ OPENING BALANCE LOGIC (SYNC FIX) */
+            if (openingBalance !== undefined) {
+                const incomingOpening = Number(openingBalance || 0);
+                const currentOpening = Number(customer.openingBalance || 0);
 
-				if (Number.isNaN(incomingOpening) || incomingOpening < 0) {
-					throw new Error("INVALID_OPENING");
-				}
+                if (isNaN(incomingOpening) || incomingOpening < 0) {
+                    throw new Error("INVALID_OPENING");
+                }
 
-				// If same opening → skip
-				if (incomingOpening !== currentOpening) {
-					const transactionDate = customerDate
-						? new Date(customerDate)
-						: customer.customerDate || new Date();
+                // If balance changed OR ledger is missing
+                if (incomingOpening !== currentOpening) {
+                    const transactionDate = customerDate ? new Date(customerDate) : (customer.customerDate || new Date());
+                    let accountId = customer.accountId;
 
-					/* ------------------------------------------------------
-						3A️⃣ Block if ANY ledger exists except OPENING
-					------------------------------------------------------ */
-					const hasTransactions = await tx.ledgerEntry.findFirst({
-						where: {
-							accountId: customer.accountId,
-							entryType: { not: "OPENING_BALANCE" },
-						},
-					});
+                    /* 3A️⃣ Create Account if Missing (Safety) */
+                    if (!accountId) {
+                        const newAcc = await tx.account.create({
+                            data: {
+                                name: customerName ?? customer.customerName,
+                                type: "CUSTOMER", // Ensure your account model supports this type
+                                balance: incomingOpening,
+                            },
+                        });
+                        accountId = newAcc.id;
+                        await tx.customer.update({
+                            where: { id: customer.id },
+                            data: { accountId: accountId }
+                        });
+                    }
 
-					if (hasTransactions) {
-						throw new Error("OPENING_LOCKED");
-					}
+                    /* 3B️⃣ Block if Transactions Exist */
+                    const hasTransactions = await tx.ledgerEntry.findFirst({
+                        where: {
+                            accountId,
+                            entryType: { not: "OPENING_BALANCE" },
+                        },
+                    });
 
-					/* ------------------------------------------------------
-						3B️⃣ Update or Create Opening Ledger
-					------------------------------------------------------ */
-					const openingEntry = await tx.ledgerEntry.findFirst({
-						where: {
-							accountId: customer.accountId,
-							entryType: "OPENING_BALANCE",
-						},
-						orderBy: { createdAt: "asc" },
-					});
+                    if (hasTransactions) throw new Error("OPENING_LOCKED");
 
-					if (openingEntry) {
-						await tx.ledgerEntry.update({
-							where: { id: openingEntry.id },
-							data: {
-								debit: incomingOpening,
-								credit: 0,
-								balanceAfter: incomingOpening,
-								transactionDate,
-								remarks: "Opening balance updated",
-							},
-						});
-					} else if (incomingOpening > 0) {
-						await tx.ledgerEntry.create({
-							data: {
-								accountId: customer.accountId,
-								entryType: "OPENING_BALANCE",
-								debit: incomingOpening,
-								credit: 0,
-								balanceAfter: incomingOpening,
-								transactionDate,
-								remarks: "Opening balance",
-							},
-						});
-					}
+                    /* 3C️⃣ Update or Create Opening Ledger Entry */
+                    const openingEntry = await tx.ledgerEntry.findFirst({
+                        where: { accountId, entryType: "OPENING_BALANCE" },
+                    });
 
-					/* ------------------------------------------------------
-						3C️⃣ Sync Account Balance + Customer Opening
-					------------------------------------------------------ */
-					await tx.account.update({
-						where: { id: customer.accountId },
-						data: { balance: incomingOpening },
-					});
+                    if (openingEntry) {
+                        await tx.ledgerEntry.update({
+                            where: { id: openingEntry.id },
+                            data: {
+                                debit: incomingOpening, // Customers are usually Debit (Receivables)
+                                credit: 0,
+                                balanceAfter: incomingOpening,
+                                transactionDate: transactionDate,
+                                remarks: "Opening balance updated",
+                            },
+                        });
+                    } else {
+                        // FORCE CREATE if missing
+                        await tx.ledgerEntry.create({
+                            data: {
+                                accountId,
+                                entryType: "OPENING_BALANCE",
+                                debit: incomingOpening,
+                                credit: 0,
+                                balanceAfter: incomingOpening,
+                                transactionDate: transactionDate,
+                                remarks: "Opening balance initialized",
+                            },
+                        });
+                    }
 
-					await tx.customer.update({
-						where: { id: customer.id },
-						data: { openingBalance: incomingOpening },
-					});
-				}
-			}
+                    /* 3D️⃣ Sync Totals */
+                    await tx.account.update({
+                        where: { id: accountId },
+                        data: { balance: incomingOpening },
+                    });
 
-			/* ======================================================
-				4️⃣ Return Updated Customer
-			====================================================== */
-			return tx.customer.findUnique({
-				where: { id: customer.id },
-				include: { account: true },
-			});
-		});
+                    await tx.customer.update({
+                        where: { id: customer.id },
+                        data: { openingBalance: incomingOpening },
+                    });
+                }
+            }
 
-		res.json({ success: true, data: updatedCustomer });
-	} catch (err) {
-		if (err.message === "NOT_FOUND") {
-			return res.status(404).json({
-				success: false,
-				error: "Customer not found",
-			});
-		}
+            /* 4️⃣ Final Return */
+            return tx.customer.findUnique({
+                where: { id: customer.id },
+                include: { account: true },
+            });
+        });
 
-		if (err.message === "OPENING_LOCKED") {
-			return res.status(409).json({
-				success: false,
-				error:
-					"Opening balance cannot be changed once sales or payments exist",
-			});
-		}
+        res.json({ success: true, data: updatedCustomer });
+    } catch (err) {
+        const errorMap = {
+            "NOT_FOUND": { status: 404, msg: "Customer not found" },
+            "OPENING_LOCKED": { status: 409, msg: "Opening balance cannot be changed once transactions exist" },
+            "INVALID_OPENING": { status: 400, msg: "Invalid opening balance" }
+        };
 
-		if (err.message === "INVALID_OPENING") {
-			return res.status(400).json({
-				success: false,
-				error: "Opening balance must be a valid non-negative number",
-			});
-		}
+        const mappedError = errorMap[err.message];
+        if (mappedError) {
+            return res.status(mappedError.status).json({ success: false, error: mappedError.msg });
+        }
 
-		console.error(err);
-		res.status(500).json({
-			success: false,
-			error: "Failed to update customer",
-		});
-	}
+        console.error(err);
+        res.status(500).json({ success: false, error: "Failed to update customer" });
+    }
 });
 
 
