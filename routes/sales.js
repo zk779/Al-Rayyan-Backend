@@ -1,6 +1,7 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
+import { generateNextSalesInvoiceNo } from "../utils/invoiceNo.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -421,21 +422,36 @@ router.get("/saleId/:saleId", authenticate, async (req, res) => {
   }
 });
 
+router.get("/invoice-no", authenticate, async (req, res) => {
+  try {
+    const { saleDate } = req.query;
+    const date = saleDate ? new Date(saleDate) : new Date();
+
+    const yy = String(date.getFullYear()).slice(-2);
+    const key = `INV-ALR${yy}`;
+
+    const counter = await prisma.invoiceCounter.findUnique({
+      where: { key },
+      select: { currentNumber: true },
+    });
+
+    const next = (counter?.currentNumber || 0) + 1;
+    const invoiceNo = `${key}-${String(next).padStart(4, "0")}`;
+
+    return res.json({ success: true, invoiceNo, reserved: false });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 
 /* ===========================
 	CREATE SALES (INVOICE HAS userId)
 =========================== */
 router.post("/", authenticate, async (req, res) => {
-	const { invoiceNo, saleDate, sales = [], refunds = [] } = req.body;
-
-	/* ======================
-		BASIC VALIDATION
-	====================== */
-	if (!invoiceNo) {
-		return res
-			.status(400)
-			.json({ success: false, error: "invoiceNo is required" });
-	}
+	const { saleDate, sales = [], refunds = [] } = req.body;
 
 	if (!Array.isArray(sales) || !Array.isArray(refunds)) {
 		return res.status(400).json({
@@ -610,6 +626,7 @@ router.post("/", authenticate, async (req, res) => {
 
 		const result = await prisma.$transaction(
 			async (tx) => {
+			const invoiceNo = await generateNextSalesInvoiceNo(tx, businessDate);
 			const invoice = await tx.salesInvoice.create({
 				data: {
 					invoiceNo,
@@ -664,8 +681,8 @@ router.post("/", authenticate, async (req, res) => {
 						pnr: s.pnr || null,
 						routeType: s.routeType || null,
 						tripType: s.tripType || "Oneway",
-						departDate: s.departDate ? new Date(s.departDate) : null,
-						arrivalDate: s.arrivalDate ? new Date(s.arrivalDate) : null,
+						departureDate: s.departureDate ? new Date(s.departureDate) : null,
+						returnDate: s.returnDate ? new Date(s.returnDate) : null,
 						paxVat: paxVat,
 						miscCharges: miscCharges,
 
@@ -1641,8 +1658,8 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						pnr: payload.pnr ?? current.pnr,
 						routeType: payload.routeType ?? current.routeType,
 						tripType: payload.tripType ?? current.tripType,
-						departDate: payload.departDate ? new Date(payload.departDate) : current.departDate,
-						arrivalDate: payload.arrivalDate ? new Date(payload.arrivalDate) : current.arrivalDate,
+						departureDate: payload.departureDate ? new Date(payload.departureDate) : current.departureDate,
+						returnDate: payload.returnDate ? new Date(payload.returnDate) : current.returnDate,
 						paxVat: newPaxVat,
 						miscCharges: newMiscCharges,
 

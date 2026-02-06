@@ -312,6 +312,12 @@ model Customer {
 	* SALES & INVOICES
 	* ===========================
 	*/
+model InvoiceCounter {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  key           String   @unique
+  currentNumber Int      @default(0)
+  updatedAt     DateTime @updatedAt
+}
 
 model SalesInvoice {
 	id String @id @default(auto()) @map("_id") @db.ObjectId
@@ -348,8 +354,8 @@ model Sale {
   documentNo    String?
   routeType     String?    // e.g., "Domestic" or "International"
   tripType      String?    @default("Oneway") // e.g., "Oneway" or "RoundTrip"
-  departDate    DateTime?
-  arrivalDate   DateTime?
+  departureDate    DateTime?
+  returnDate   DateTime?
 
   // 💰 PRICING & TAXES
   netPrice      Float

@@ -16,6 +16,7 @@ import permissionRoutes from "./routes/permissions.js";
 import LedgerRoutes from "./routes/Ledger.js";
 import customerRoutes from "./routes/customers.js";
 import destinationsRouter from "./routes/destinations.js";
+import invoiceCounterRoutes from "./routes/invoiceCounter.js";
 
 dotenv.config();
 
@@ -75,6 +76,7 @@ app.use("/api/sales", saleRouets);
 app.use("/api/ledger", LedgerRoutes);
 app.use("/api/customers", customerRoutes);
 app.use("/api/destinations", destinationsRouter);
+app.use("/api/invoice", invoiceCounterRoutes);
 
 // Root Route
 app.get("/", (req, res) => {
