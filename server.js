@@ -17,6 +17,7 @@ import LedgerRoutes from "./routes/Ledger.js";
 import customerRoutes from "./routes/customers.js";
 import destinationsRouter from "./routes/destinations.js";
 import invoiceCounterRoutes from "./routes/invoiceCounter.js";
+import refundsRoutes from "./routes/refunds.js";
 
 dotenv.config();
 
@@ -77,6 +78,7 @@ app.use("/api/ledger", LedgerRoutes);
 app.use("/api/customers", customerRoutes);
 app.use("/api/destinations", destinationsRouter);
 app.use("/api/invoice", invoiceCounterRoutes);
+app.use("/api/refunds",refundsRoutes);
 
 // Root Route
 app.get("/", (req, res) => {

@@ -28,7 +28,14 @@ enum SaleStatus {
 	PENDING
 	COMPLETED
 	CANCELLED
-	REFUNDED
+	REFUNDED  // Sale that has been refunded
+}
+
+enum RefundStatus {
+	PENDING
+	APPROVED
+	REJECTED
+	COMPLETED
 }
 
 enum CustomerType {
@@ -49,7 +56,7 @@ enum LedgerEntryType {
 	OPENING_BALANCE
 	SALE
 	PAYMENT
-	REFUNDED
+	REFUND
 	EXPENSE
 	ADJUSTMENT
 }
@@ -136,7 +143,9 @@ model User {
 
 	role Role? @relation(fields: [roleId], references: [id])
 	branch Branch? @relation(fields: [branchId], references: [id])
+	
 	salesInvoices SalesInvoice[]
+	refunds Refund[]
 }
 
 /**
@@ -205,14 +214,15 @@ model LedgerEntry {
 	debit Float @default(0)
 	credit Float @default(0)
 
-	balanceAfter Float
+	// ❌ REMOVED: balanceAfter Float
+	// Balance is now stored only on Account model and updated via transactions
 
-	// 🔗 References
+	// 🔗 References - only ONE should be populated
 	saleId String? @db.ObjectId
 	invoiceId String? @db.ObjectId
 	paymentId String? @db.ObjectId
 	expenseId String? @db.ObjectId
-	refundId String? @db.ObjectId // ✅ NEW
+	refundId String? @db.ObjectId
 
 	remarks String?
 
@@ -253,7 +263,6 @@ model Vendor {
 	openingBalance Float?
 	status Boolean @default(true)
 
-	// 🔥 NEW FIELDS
 	vendorDate DateTime // user-selected business date
 	createdAt DateTime @default(now()) // system timestamp
 	updatedAt DateTime @updatedAt
@@ -294,7 +303,6 @@ model Customer {
 	// Status
 	isActive Boolean @default(true)
 
-	// 🔥 NEW FIELDS (same philosophy as Vendor)
 	customerDate DateTime // user-selected business date
 	createdAt DateTime @default(now()) // system timestamp
 	updatedAt DateTime @updatedAt
@@ -313,10 +321,10 @@ model Customer {
 	* ===========================
 	*/
 model InvoiceCounter {
-  id            String   @id @default(auto()) @map("_id") @db.ObjectId
-  key           String   @unique
-  currentNumber Int      @default(0)
-  updatedAt     DateTime @updatedAt
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+	key String @unique
+	currentNumber Int @default(0)
+	updatedAt DateTime @updatedAt
 }
 
 model SalesInvoice {
@@ -341,78 +349,105 @@ model SalesInvoice {
 	@@index([createdAt])
 }
 
+/**
+	* ===========================
+	* SALE MODEL (CLEANED UP)
+	* ===========================
+	*/
 model Sale {
-  id String @id @default(auto()) @map("_id") @db.ObjectId
+	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-  invoiceId  String  @db.ObjectId
-  airlineId  String  @db.ObjectId
-  vendorId   String  @db.ObjectId
-  customerId String? @db.ObjectId
+	invoiceId String @db.ObjectId
+	airlineId String @db.ObjectId
+	vendorId String @db.ObjectId
+	customerId String? @db.ObjectId
 
-  // 🎫 FLIGHT DETAILS
-  pnr           String?
-  documentNo    String?
-  routeType     String?    // e.g., "Domestic" or "International"
-  tripType      String?    @default("Oneway") // e.g., "Oneway" or "RoundTrip"
-  departureDate    DateTime?
-  returnDate   DateTime?
+	// 🎫 FLIGHT DETAILS
+	pnr String?
+	documentNo String?
+	routeType String? // e.g., "Domestic" or "International"
+	tripType String? @default("Oneway") // e.g., "Oneway" or "RoundTrip"
+	departureDate DateTime?
+	returnDate DateTime?
 
-  // 💰 PRICING & TAXES
-  netPrice      Float
-  sellPrice     Float
-  profit        Float
-  paxVat        Float?     @default(0)
-  vatAmount     Float?     @default(0)
-  miscCharges   Float?     @default(0)
+	// 💰 PRICING & TAXES
+	netPrice Float
+	sellPrice Float
+	profit Float
+	paxVat Float? @default(0)
+	vatAmount Float? @default(0)
+	miscCharges Float? @default(0)
 
-  // 💳 PAYMENT & STATUS
-  paymentType   PaymentType
-  paymentStatus PaymentStatus @default(DUE)
-  paidAmount    Float         @default(0)
+	// 💳 PAYMENT & STATUS
+	paymentType PaymentType
+	paymentStatus PaymentStatus @default(DUE)
+	paidAmount Float @default(0)
 
-  remarks       String?
-  status        SaleStatus   @default(PENDING)
-  paxName       String?
-  destinations  Json?
+	remarks String?
+	status SaleStatus @default(PENDING)
+	paxName String?
+	destinations Json?
 
-  // 🔥 REFUND SUPPORT
-  isRefund       Boolean @default(false)
-  refundOfSaleId String? @db.ObjectId
-  refundOfSale   Sale?   @relation("SaleRefundRelation", fields: [refundOfSaleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  refunds        Sale[]  @relation("SaleRefundRelation")
+	// 🔗 RELATIONS
+	invoice SalesInvoice @relation(fields: [invoiceId], references: [id])
+	airline AirlineCode @relation(fields: [airlineId], references: [id])
+	vendor Vendor @relation(fields: [vendorId], references: [id])
+	customer Customer? @relation(fields: [customerId], references: [id])
+	
+	// 🔙 REVERSE RELATION: Refunds made against this sale
+	refunds Refund[]
 
-  // 🔗 RELATIONS
-  invoice  SalesInvoice @relation(fields: [invoiceId], references: [id])
-  airline  AirlineCode  @relation(fields: [airlineId], references: [id])
-  vendor   Vendor       @relation(fields: [vendorId], references: [id])
-  customer Customer?    @relation(fields: [customerId], references: [id])
-  refund   Refund?
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([refundOfSaleId])
-  @@index([isRefund])
-  @@index([pnr])
+	@@index([pnr])
+	@@index([status])
+	@@index([createdAt])
 }
 
+/**
+	* ===========================
+	* REFUND MODEL (SEPARATED)
+	* ===========================
+	*/
 model Refund {
 	id String @id @default(auto()) @map("_id") @db.ObjectId
 
-	saleId String @unique @db.ObjectId
-	sale Sale @relation(fields: [saleId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+	// 🔗 ORIGINAL SALE REFERENCE
+	saleId String @db.ObjectId
+	sale Sale @relation(fields: [saleId], references: [id], onDelete: Restrict)
 
-	originalAmount Float
-	vendorRefundAmount Float?
-	refundableAmount Float
-	refundFee Float @default(0)
-	serviceCharges Float @default(0)
+	// 💰 REFUND FINANCIALS
+	originalSaleAmount Float // Original sale price
+	customerRefundAmount Float // Amount to refund to customer
+	vendorRefundAmount Float? // Amount vendor will refund to us
+	
+	refundFee Float @default(0) // Our service charge for processing refund
+	cancellationCharges Float @default(0) // Airline/vendor cancellation fee
+	
+	netRefundToCustomer Float // Final amount customer receives
+	netCostToUs Float // Our net loss/gain on this refund
 
+	// 📋 REFUND DETAILS
 	refundReason String?
 	remarks String?
-
-	refundDate DateTime
+	
+	status RefundStatus @default(PENDING)
+	
+	// 📅 DATES
+	refundDate DateTime // Business date of refund
+	approvedAt DateTime? // When refund was approved
+	completedAt DateTime? // When refund payment was made
+	
+	// 👤 WHO PROCESSED
+	processedById String? @db.ObjectId
+	processedBy User? @relation(fields: [processedById], references: [id])
+	
 	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
 
+	@@index([saleId])
+	@@index([status])
 	@@index([refundDate])
+	@@index([createdAt])
 }

@@ -8,20 +8,13 @@ const prisma = new PrismaClient();
 /* ======================= AUTH ======================= */
 async function authenticate(req, res, next) {
 	const authHeader = req.headers.authorization;
-	if (!authHeader)
-		return res.status(401).json({ error: "Missing Authorization header" });
+	if (!authHeader) return res.status(401).json({ error: "Missing Authorization header" });
 
 	try {
 		const token = authHeader.split(" ")[1];
 		const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-		const user = await prisma.user.findUnique({
-			where: { id: decoded.id },
-		});
-
-		if (!user || !user.isActive)
-			return res.status(401).json({ error: "User inactive or removed" });
-
+		const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+		if (!user || !user.isActive) return res.status(401).json({ error: "User inactive or removed" });
 		req.user = decoded;
 		next();
 	} catch {
@@ -32,61 +25,27 @@ async function authenticate(req, res, next) {
 /* ======================= GET ALL VENDORS ======================= */
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const {
-			category,
-			status,
-			orderBy = "vendorDate",
-			orderDir = "desc",
-		} = req.query;
-
-		const validOrderBy = ["createdAt", "vendorDate"];
-		const validOrderDir = ["asc", "desc"];
-
-		const finalOrderBy = validOrderBy.includes(orderBy)
-			? orderBy
-			: "vendorDate";
-
-		const finalOrderDir = validOrderDir.includes(orderDir) ? orderDir : "desc";
+		const { category, status, orderBy = "vendorDate", orderDir = "desc" } = req.query;
 
 		const vendors = await prisma.vendor.findMany({
 			where: {
-				...(category ? { category } : {}),
-				...(status !== undefined ? { status: status === "true" } : {}),
+				...(category && { category }),
+				...(status !== undefined && { status: status === "true" }),
 			},
-			include: {
-				account: { select: { balance: true } },
-			},
-			orderBy: {
-				[finalOrderBy]: finalOrderDir,
-			},
+			include: { account: { select: { balance: true } } },
+			orderBy: { [["createdAt", "vendorDate"].includes(orderBy) ? orderBy : "vendorDate"]: orderDir === "asc" ? "asc" : "desc" },
 		});
 
 		res.json({ success: true, data: vendors });
 	} catch (err) {
 		console.error(err);
-		res.status(500).json({
-			success: false,
-			error: "Failed to fetch vendors",
-		});
+		res.status(500).json({ success: false, error: "Failed to fetch vendors" });
 	}
 });
 
 /* ======================= GET VENDOR BY ID ======================= */
 router.get("/:id", authenticate, async (req, res) => {
 	try {
-		const { ledgerOrderBy = "createdAt", ledgerOrderDir = "asc" } = req.query;
-
-		const validLedgerOrderBy = ["createdAt"];
-		const validLedgerOrderDir = ["asc", "desc"];
-
-		const finalLedgerOrderBy = validLedgerOrderBy.includes(ledgerOrderBy)
-			? ledgerOrderBy
-			: "createdAt";
-
-		const finalLedgerOrderDir = validLedgerOrderDir.includes(ledgerOrderDir)
-			? ledgerOrderDir
-			: "asc";
-
 		const vendor = await prisma.vendor.findUnique({
 			where: { id: req.params.id },
 			include: {
@@ -98,75 +57,48 @@ router.get("/:id", authenticate, async (req, res) => {
 			},
 		});
 
-		if (!vendor) {
-			return res.status(404).json({
-				success: false,
-				error: "Vendor not found",
-			});
-		}
+		if (!vendor) return res.status(404).json({ success: false, error: "Vendor not found" });
 
 		res.json({ success: true, data: vendor });
 	} catch (err) {
 		console.error(err);
-		res.status(500).json({
-			success: false,
-			error: "Failed to fetch vendor",
-		});
+		res.status(500).json({ success: false, error: "Failed to fetch vendor" });
 	}
 });
 
 /* ======================= CREATE VENDOR ======================= */
 router.post("/", authenticate, async (req, res) => {
 	try {
-		const {
-			vendorName,
-			category,
-			vendorType,
-			email,
-			phone,
-			address,
-			openingBalance,
-			vendorDate,
-			status,
-		} = req.body;
+		const { vendorName, category, vendorType, email, phone, address, openingBalance, vendorDate, status } = req.body;
 
-		if (!vendorName || !category)
-			return res.status(400).json({
-				success: false,
-				error: "Vendor Name and Category are required",
-			});
-
-		if (!["CREDIT", "DEBIT"].includes(category))
-			return res.status(400).json({
-				success: false,
-				error: "Invalid vendor category",
-			});
+		// Validation
+		if (!vendorName || !category) {
+			return res.status(400).json({ success: false, error: "vendorName and category are required" });
+		}
+		if (!["CREDIT", "DEBIT"].includes(category)) {
+			return res.status(400).json({ success: false, error: "category must be CREDIT or DEBIT" });
+		}
 
 		const exists = await prisma.vendor.findFirst({ where: { vendorName } });
 		if (exists) {
-			return res
-				.status(400)
-				.json({ success: false, error: "Vendor already exists" });
+			return res.status(400).json({ success: false, error: "Vendor already exists" });
 		}
 
 		const opening = Number(openingBalance || 0);
-		if (opening < 0 || Number.isNaN(opening))
-			return res.status(400).json({
-				success: false,
-				error: "Invalid opening balance",
-			});
+		if (opening < 0 || isNaN(opening)) {
+			return res.status(400).json({ success: false, error: "Invalid opening balance" });
+		}
 
 		const businessDate = vendorDate ? new Date(vendorDate) : new Date();
+		const isDebit = category === "DEBIT";
 
 		const vendor = await prisma.$transaction(async (tx) => {
+			// 1. Create Account
 			const account = await tx.account.create({
-				data: {
-					name: vendorName,
-					type: "VENDOR",
-					balance: opening,
-				},
+				data: { name: vendorName, type: "VENDOR", balance: opening },
 			});
 
+			// 2. Create Vendor
 			const created = await tx.vendor.create({
 				data: {
 					vendorName,
@@ -182,195 +114,234 @@ router.post("/", authenticate, async (req, res) => {
 				},
 			});
 
+			// 3. Link Account referenceId
 			await tx.account.update({
-		where: { id: account.id },
-		data: {
-			name: vendorName,
-			referenceId: created.id,
-		},
-});
+				where: { id: account.id },
+				data: { referenceId: created.id },
+			});
 
+			// 4. Opening Balance Ledger Entry
+			// DEBIT vendor: we owe them (Debit increases balance, positive = payable)
+			// CREDIT vendor: they owe us (Credit increases balance, positive = receivable from vendor)
+			if (opening > 0) {
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: account.id,
+						entryType: "OPENING_BALANCE",
+						debit: isDebit ? 0 : opening,
+						credit: isDebit ? opening : 0,
+						transactionDate: businessDate,
+						remarks: "Opening balance",
+					},
+				});
+			}
 
-	if (opening > 0) {
-		const isDebitVendor = category === "DEBIT";
-
-		await tx.ledgerEntry.create({
-			data: {
-				accountId: account.id,
-				entryType: "OPENING_BALANCE",
-				debit: isDebitVendor ? opening : 0,
-				credit: isDebitVendor ? 0 : opening,
-				balanceAfter: opening,
-				transactionDate: businessDate,
-				remarks: "Opening balance",
-			},
+			return created;
 		});
-	}
 
-	return created;
-	});
-
-	res.status(201).json({ success: true, data: vendor });
+		res.status(201).json({ success: true, data: vendor });
 	} catch (err) {
 		console.error(err);
-		res.status(500).json({
-			success: false,
-			error: "Failed to create vendor",
-		});
+		res.status(500).json({ success: false, error: "Failed to create vendor" });
 	}
 });
 
 /* ======================= UPDATE VENDOR ======================= */
-/* ======================= UPDATE VENDOR ======================= */
-
 router.put("/:id", authenticate, async (req, res) => {
+	try {
+		const { vendorName, category, vendorType, email, phone, address, openingBalance, vendorDate, status } = req.body;
+
+		const updated = await prisma.$transaction(async (tx) => {
+			// 1. Fetch Vendor
+			const vendor = await tx.vendor.findUnique({
+				where: { id: req.params.id },
+				include: { account: true },
+			});
+			if (!vendor) throw new Error("NOT_FOUND");
+
+			// 2. Update Vendor fields
+			await tx.vendor.update({
+				where: { id: vendor.id },
+				data: {
+					...(vendorName && { vendorName }),
+					...(category && { category }),
+					...(vendorType !== undefined && { vendorType: vendorType || null }),
+					...(email !== undefined && { email: email || null }),
+					...(phone !== undefined && { phone: phone || null }),
+					...(address !== undefined && { address: address || null }),
+					...(vendorDate && { vendorDate: new Date(vendorDate) }),
+					...(status !== undefined && { status: Boolean(status) }),
+				},
+			});
+
+			// 3. Sync Account Name
+			if (vendorName && vendor.accountId) {
+				await tx.account.update({
+					where: { id: vendor.accountId },
+					data: { name: vendorName },
+				});
+			}
+
+			// 4. Opening Balance / Category Change Logic
+			const categoryChanged = category && category !== vendor.category;
+			const openingChanged = openingBalance !== undefined && Number(openingBalance) !== vendor.openingBalance;
+
+			if (categoryChanged || openingChanged) {
+				const accountId = vendor.accountId;
+
+				// Block if non-opening transactions exist
+				const hasOtherTx = await tx.ledgerEntry.findFirst({
+					where: { accountId, entryType: { not: "OPENING_BALANCE" } },
+				});
+				if (hasOtherTx) throw new Error("OPENING_LOCKED");
+
+				const newOpening = openingChanged ? Number(openingBalance) : vendor.openingBalance;
+				const newCategory = category || vendor.category;
+				const isDebit = newCategory === "DEBIT";
+
+				if (isNaN(newOpening) || newOpening < 0) throw new Error("INVALID_OPENING");
+
+				const txDate = vendorDate ? new Date(vendorDate) : vendor.vendorDate || new Date();
+				const oldOpening = vendor.openingBalance || 0;
+				const delta = newOpening - oldOpening;
+
+				// Find existing opening entry
+				const openingEntry = await tx.ledgerEntry.findFirst({
+					where: { accountId, entryType: "OPENING_BALANCE" },
+				});
+
+				if (openingEntry) {
+					// Update existing entry (handle category flip)
+					await tx.ledgerEntry.update({
+						where: { id: openingEntry.id },
+						data: {
+							debit: isDebit ? 0 : newOpening,
+							credit: isDebit ? newOpening : 0,
+							transactionDate: txDate,
+							remarks: categoryChanged ? "Opening balance - category updated" : "Opening balance updated",
+						},
+					});
+				} else if (newOpening > 0) {
+					// Create new entry
+					await tx.ledgerEntry.create({
+						data: {
+							accountId,
+							entryType: "OPENING_BALANCE",
+							debit: isDebit ? 0 : newOpening,
+							credit: isDebit ? newOpening : 0,
+							transactionDate: txDate,
+							remarks: "Opening balance",
+						},
+					});
+				}
+
+				// Update Account balance and Vendor openingBalance
+				if (categoryChanged && !openingChanged) {
+					// Category changed but amount same: balance stays same, just ledger debit/credit flips
+					await tx.account.update({
+						where: { id: accountId },
+						data: { balance: newOpening },
+					});
+				} else {
+					// Opening changed: adjust balance by delta
+					await tx.account.update({
+						where: { id: accountId },
+						data: { balance: { increment: delta } },
+					});
+				}
+
+				await tx.vendor.update({
+					where: { id: vendor.id },
+					data: { openingBalance: newOpening },
+				});
+			}
+
+			return tx.vendor.findUnique({
+				where: { id: vendor.id },
+				include: { account: true },
+			});
+		});
+
+		res.json({ success: true, data: updated });
+	} catch (err) {
+		if (err.message === "NOT_FOUND") {
+			return res.status(404).json({ success: false, error: "Vendor not found" });
+		}
+		if (err.message === "OPENING_LOCKED") {
+			return res.status(409).json({ success: false, error: "Cannot change opening balance or category after transactions exist" });
+		}
+		if (err.message === "INVALID_OPENING") {
+			return res.status(400).json({ success: false, error: "Invalid opening balance" });
+		}
+		console.error(err);
+		res.status(500).json({ success: false, error: "Failed to update vendor" });
+	}
+});
+
+/* ======================= DELETE VENDOR ======================= */
+router.delete("/:id", authenticate, async (req, res) => {
     try {
-        const {
-            vendorName,
-            category,
-            vendorType,
-            email,
-            phone,
-            address,
-            openingBalance,
-            vendorDate,
-            status,
-        } = req.body;
-
-        const updatedVendor = await prisma.$transaction(async (tx) => {
-            // 1️⃣ Fetch current state
-            const vendor = await tx.vendor.findUnique({
-                where: { id: req.params.id },
-                include: { account: true },
-            });
-
-            if (!vendor) throw new Error("NOT_FOUND");
-
-            // 2️⃣ Update Basic Vendor Info
-            await tx.vendor.update({
-                where: { id: vendor.id },
-                data: {
-                    ...(vendorName !== undefined ? { vendorName } : {}),
-                    ...(category !== undefined ? { category } : {}),
-                    ...(vendorType !== undefined ? { vendorType } : {}),
-                    ...(email !== undefined ? { email: email || null } : {}),
-                    ...(phone !== undefined ? { phone } : {}),
-                    ...(address !== undefined ? { address: address || null } : {}),
-                    ...(vendorDate !== undefined ? { vendorDate: new Date(vendorDate) } : {}),
-                    ...(status !== undefined ? { status: Boolean(status) } : {}),
-                },
-            });
-
-            // 3️⃣ Sync Account Name if changed
-            if (vendorName && vendor.accountId && vendorName !== vendor.vendorName) {
-                await tx.account.update({
-                    where: { id: vendor.accountId },
-                    data: { name: vendorName },
-                });
-            }
-
-            // 4️⃣ Opening Balance & Ledger Sync Logic
-            if (openingBalance !== undefined) {
-                const incomingOpening = Number(openingBalance || 0);
-                const isDebitVendor = (category ?? vendor.category) === "DEBIT";
-                const businessDate = vendorDate ? new Date(vendorDate) : (vendor.vendorDate || new Date());
-                
-                let accountId = vendor.accountId;
-
-                // A: Ensure Account exists
-                if (!accountId) {
-                    const newAcc = await tx.account.create({
-                        data: {
-                            name: vendorName ?? vendor.vendorName,
-                            type: "VENDOR",
-                            balance: incomingOpening,
-                        },
-                    });
-                    accountId = newAcc.id;
-                    // Connect vendor to new account immediately
-                    await tx.vendor.update({
-                        where: { id: vendor.id },
-                        data: { accountId: accountId }
-                    });
-                }
-
-                // B: Check for Transaction Lock (Ignore Opening Balance entries)
-                const otherTx = await tx.ledgerEntry.findFirst({
-                    where: {
-                        accountId,
-                        entryType: { not: "OPENING_BALANCE" },
-                    },
-                });
-                if (otherTx) throw new Error("OPENING_LOCKED");
-
-                // C: Sync Ledger Entry (Upsert pattern)
-                const existingOp = await tx.ledgerEntry.findFirst({
-                    where: { accountId, entryType: "OPENING_BALANCE" }
-                });
-
-                if (existingOp) {
-                    await tx.ledgerEntry.update({
-                        where: { id: existingOp.id },
-                        data: {
-                            debit: isDebitVendor ? incomingOpening : 0,
-                            credit: isDebitVendor ? 0 : incomingOpening,
-                            balanceAfter: incomingOpening,
-                            transactionDate: businessDate,
-                        }
-                    });
-                } else {
-                    await tx.ledgerEntry.create({
-                        data: {
-                            accountId,
-                            entryType: "OPENING_BALANCE",
-                            debit: isDebitVendor ? incomingOpening : 0,
-                            credit: isDebitVendor ? 0 : incomingOpening,
-                            balanceAfter: incomingOpening,
-                            transactionDate: businessDate,
-                            remarks: "Opening balance initialized",
-                        }
-                    });
-                }
-
-                // D: Final Balance Sync for Account and Vendor
-                await tx.account.update({
-                    where: { id: accountId },
-                    data: { balance: incomingOpening }
-                });
-
-                await tx.vendor.update({
-                    where: { id: vendor.id },
-                    data: { openingBalance: incomingOpening }
-                });
-            }
-
-            return tx.vendor.findUnique({
-                where: { id: vendor.id },
-                include: { account: true },
-            });
+        // 1. Fetch vendor with entries to check history
+        const vendor = await prisma.vendor.findUnique({
+            where: { id: req.params.id },
+            include: { 
+                account: { 
+                    include: { entries: true } 
+                } 
+            },
         });
 
-        res.json({ success: true, data: updatedVendor });
+        if (!vendor) {
+            return res.status(404).json({ success: false, error: "Vendor not found" });
+        }
+
+        // 2. Determine if there is "real" transaction data
+        // We look for any entry that isn't the opening balance
+        const hasActiveTransactions = vendor.account?.entries?.some(
+            (entry) => entry.entryType !== "OPENING_BALANCE"
+        );
+
+        if (hasActiveTransactions) {
+            // CONDITION A: Transactions exist -> Just Deactivate (Soft Delete)
+            const updated = await prisma.vendor.update({
+                where: { id: req.params.id },
+                data: { status: false },
+            });
+
+            return res.json({ 
+                success: true, 
+                message: "Vendor has transaction history. They have been deactivated instead of deleted.", 
+                data: updated,
+                type: "soft-delete"
+            });
+        } else {
+            // CONDITION B: No transactions (only opening balance or empty) -> Hard Delete
+            await prisma.$transaction([
+                // Remove opening balance entries first
+                prisma.ledgerEntry.deleteMany({ 
+                    where: { accountId: vendor.accountId } 
+                }),
+                // Delete vendor
+                prisma.vendor.delete({ 
+                    where: { id: req.params.id } 
+                }),
+                // Delete the financial account record
+                prisma.account.delete({ 
+                    where: { id: vendor.accountId } 
+                }),
+            ]);
+
+            return res.json({ 
+                success: true, 
+                message: "Vendor and empty account records permanently deleted.",
+                type: "hard-delete"
+            });
+        }
 
     } catch (err) {
-        console.error("Update Error:", err.message);
-        const status = err.message === "NOT_FOUND" ? 404 : (err.message === "OPENING_LOCKED" ? 409 : 500);
-        res.status(status).json({ success: false, error: err.message });
+        console.error("Delete Error:", err);
+        res.status(500).json({ success: false, error: "Failed to process vendor removal" });
     }
-});
-
-/* ======================= DELETE ======================= */
-router.delete("/:id", authenticate, async (req, res) => {
-	try {
-		await prisma.vendor.delete({ where: { id: req.params.id } });
-		res.json({ success: true, message: "Vendor deleted successfully" });
-	} catch (err) {
-		console.error(err);
-		res.status(500).json({
-			success: false,
-			error: "Failed to delete vendor",
-		});
-	}
 });
 
 export default router;
