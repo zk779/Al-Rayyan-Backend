@@ -179,6 +179,10 @@ router.post("/", authenticate, async (req, res) => {
         const businessDate = refundDate ? new Date(refundDate) : new Date();
 
         const result = await prisma.$transaction(async (tx) => {
+
+            /* ====================================================
+               1️⃣ LOAD & VALIDATE ORIGINAL SALE
+            ==================================================== */
             const originalSale = await tx.sale.findUnique({
                 where: { id: saleId },
                 include: {
@@ -190,97 +194,151 @@ router.post("/", authenticate, async (req, res) => {
 
             if (!originalSale) throw new Error("Original sale not found");
 
+            // Only check refund record — original sale status stays untouched
             const existingRefund = await tx.refund.findFirst({ where: { saleId } });
-            if (existingRefund) throw new Error("This sale has already been refunded");
+            if (existingRefund) throw new Error("A refund already exists for this sale");
 
             /* ====================================================
-               REFUND LOGIC (BASE: NET PRICE)
+               2️⃣ CALCULATE REFUND AMOUNTS
             ==================================================== */
-            const originalNet = Number(originalSale.netPrice); // Cost price
-            const originalSell = Number(originalSale.sellPrice); // Sale price
+            const originalNet  = Number(originalSale.netPrice);
+            const originalSell = Number(originalSale.sellPrice);
 
-            // 1. Vendor Refund: What the vendor gives back to us
-            const vendorRefundAmount = originalNet - fee;
-
-            // 2. Customer Refund Amount: Based on NET price as requested
-            // We are ignoring the sellPrice margin here.
+            const vendorRefundAmount   = originalNet - fee;
             const customerRefundAmount = originalNet - fee;
+            const netRefundToCustomer  = customerRefundAmount - charges;
+            const netCostToUs          = charges;
 
-            // 3. Net to Customer: What they get after your service charges
-            const netRefundToCustomer = customerRefundAmount - charges;
-
-            /* VENDOR LEDGER */
-            const vendorAccId = originalSale.vendor.account.id;
-            const vendorBalanceDelta = originalSale.vendor.category === "DEBIT" ? -vendorRefundAmount : vendorRefundAmount;
+            /* ====================================================
+               3️⃣ VENDOR LEDGER ENTRY + BALANCE UPDATE
+            ==================================================== */
+            const vendorAccId    = originalSale.vendor.account.id;
+            const vendorBalDelta  = originalSale.vendor.category === "DEBIT"
+                ? -vendorRefundAmount
+                :  vendorRefundAmount;
 
             await tx.ledgerEntry.create({
                 data: {
-                    accountId: vendorAccId,
-                    entryType: "REFUND",
-                    debit: 0,
-                    credit: vendorRefundAmount,
+                    accountId:       vendorAccId,
+                    entryType:       "REFUND",
+                    debit:           0,
+                    credit:          vendorRefundAmount,
                     transactionDate: businessDate,
-                    saleId: originalSale.id,
-                    invoiceId: originalSale.invoiceId,
-                    remarks: `Vendor refund (Net Base) - Fee: ${fee}`
+                    saleId:          originalSale.id,
+                    invoiceId:       originalSale.invoiceId,
+                    remarks:         `Vendor refund (Net Base) - Fee: ${fee}`,
                 }
             });
 
             await tx.account.update({
                 where: { id: vendorAccId },
-                data: { balance: { increment: vendorBalanceDelta } }
+                data:  { balance: { increment: vendorBalDelta } }
             });
 
-            /* CUSTOMER LEDGER */
-            if (String(originalSale.paymentType).toUpperCase() === "CREDIT" && originalSale.customer?.account) {
+            /* ====================================================
+               4️⃣ CUSTOMER LEDGER ENTRY + BALANCE UPDATE (CREDIT ONLY)
+            ==================================================== */
+            const isCredit = String(originalSale.paymentType).toUpperCase() === "CREDIT";
+
+            if (isCredit && originalSale.customer?.account) {
                 const custAccId = originalSale.customer.account.id;
+
                 await tx.ledgerEntry.create({
                     data: {
-                        accountId: custAccId,
-                        entryType: "REFUND",
-                        debit: 0,
-                        credit: netRefundToCustomer,
+                        accountId:       custAccId,
+                        entryType:       "REFUND",
+                        debit:           0,
+                        credit:          netRefundToCustomer,
                         transactionDate: businessDate,
-                        saleId: originalSale.id,
-                        invoiceId: originalSale.invoiceId,
-                        remarks: `Customer refund (Net Base) - Fee: ${fee}, Srv: ${charges}`
+                        saleId:          originalSale.id,
+                        invoiceId:       originalSale.invoiceId,
+                        remarks:         `Customer refund (Net Base) - Fee: ${fee}, Srv: ${charges}`,
                     }
                 });
+
                 await tx.account.update({
                     where: { id: custAccId },
-                    data: { balance: { decrement: netRefundToCustomer } }
+                    data:  { balance: { decrement: netRefundToCustomer } }
                 });
             }
 
-            /* CREATE REFUND RECORD */
-            const refund = await tx.refund.create({
+            /* ====================================================
+               5️⃣ CREATE NEGATIVE MIRROR SALE
+               Original sale is completely untouched.
+               Negative sale carries the REFUNDED status.
+            ==================================================== */
+            const negativeSale = await tx.sale.create({
                 data: {
-                    saleId: originalSale.id,
-                    originalSaleAmount: originalSell,
-                    customerRefundAmount: customerRefundAmount,
-                    vendorRefundAmount: vendorRefundAmount,
-                    refundFee: fee,
-                    cancellationCharges: charges,
-                    netRefundToCustomer: netRefundToCustomer,
-                    netCostToUs: charges,
-                    refundReason: refundReason || null,
-                    remarks: remarks || null,
-                    refundDate: businessDate,
-                    status: "COMPLETED",
-                    processedById: req.user.id
+                    invoiceId:     originalSale.invoiceId,
+                    airlineId:     originalSale.airlineId,
+                    vendorId:      originalSale.vendorId,
+                    customerId:    originalSale.customerId   || null,
+
+                    documentNo:    `REF-${originalSale.documentNo || originalSale.id}`,
+                    pnr:           originalSale.pnr           || null,
+                    paxName:       originalSale.paxName        || null,
+                    routeType:     originalSale.routeType      || null,
+                    tripType:      originalSale.tripType        || null,
+                    departureDate: originalSale.departureDate  || null,
+                    returnDate:    originalSale.returnDate      || null,
+                    destinations:  originalSale.destinations    || null,
+
+                    netPrice:     -originalNet,
+                    sellPrice:    -originalSell,
+                    profit:       -(Number(originalSale.profit     || 0)),
+                    vatAmount:    -(Number(originalSale.vatAmount   || 0)),
+                    paxVat:       -(Number(originalSale.paxVat      || 0)),
+                    miscCharges:  -(Number(originalSale.miscCharges || 0)),
+                    paidAmount:   -(Number(originalSale.paidAmount  || 0)),
+
+                    paymentType:   originalSale.paymentType,
+                    paymentStatus: "PAID",
+                    status:        "REFUNDED",
+
+                    remarks: `REFUND | Original Doc: ${originalSale.documentNo || originalSale.id} | Reason: ${refundReason || "-"}`,
                 }
             });
 
-            await tx.sale.update({
-                where: { id: originalSale.id },
-                data: { status: "REFUNDED", paymentStatus: "PAID" }
+            /* ====================================================
+               6️⃣ UPDATE INVOICE TOTALS
+            ==================================================== */
+            await tx.salesInvoice.update({
+                where: { id: originalSale.invoiceId },
+                data: {
+                    totalNet:    { increment: -originalNet },
+                    totalSell:   { increment: -originalSell },
+                    totalProfit: { increment: -(Number(originalSale.profit || 0)) },
+                }
             });
 
-            return refund;
+            /* ====================================================
+               7️⃣ CREATE REFUND RECORD (linked to original sale)
+            ==================================================== */
+            const refund = await tx.refund.create({
+                data: {
+                    saleId:               originalSale.id,
+                    originalSaleAmount:   originalSell,
+                    customerRefundAmount: customerRefundAmount,
+                    vendorRefundAmount:   vendorRefundAmount,
+                    refundFee:            fee,
+                    cancellationCharges:  charges,
+                    netRefundToCustomer:  netRefundToCustomer,
+                    netCostToUs:          netCostToUs,
+                    refundReason:         refundReason || null,
+                    remarks:              remarks      || null,
+                    refundDate:           businessDate,
+                    status:               "COMPLETED",
+                    processedById:        req.user.id,
+                }
+            });
+
+            return { refund, negativeSaleId: negativeSale.id };
         }, { timeout: 20000 });
 
         return res.status(201).json({ success: true, data: result });
+
     } catch (err) {
+        console.error(err);
         return res.status(400).json({ success: false, error: err.message });
     }
 });
@@ -293,98 +351,6 @@ router.put("/:refundId", authenticate, async (req, res) => {
         const result = await prisma.$transaction(async (tx) => {
             const existingRefund = await tx.refund.findUnique({
                 where: { id: refundId },
-                include: { sale: { include: { vendor: { include: { account: true } }, customer: { include: { account: true } }, invoice: true } } }
-            });
-
-            if (!existingRefund) throw new Error("Refund not found");
-
-            const originalSale = existingRefund.sale;
-            const originalNet = Number(originalSale.netPrice);
-
-            const newFee = refundFee !== undefined ? Number(refundFee) : existingRefund.refundFee;
-            const newCharges = serviceCharges !== undefined ? Number(serviceCharges) : existingRefund.cancellationCharges;
-
-            // Updated Calculation based on NET price
-            const newVendorRefund = originalNet - newFee;
-            const newCustomerRefundAmount = originalNet - newFee;
-            const newNetRefundToCustomer = newCustomerRefundAmount - newCharges;
-
-            const vendorDelta = newVendorRefund - Number(existingRefund.vendorRefundAmount);
-            const customerDelta = newNetRefundToCustomer - Number(existingRefund.netRefundToCustomer);
-
-            const businessDate = refundDate ? new Date(refundDate) : existingRefund.refundDate;
-
-            /* UPDATE VENDOR LEDGER */
-            if (vendorDelta !== 0) {
-                const vendorAccId = originalSale.vendor.account.id;
-                const vendorLedger = await tx.ledgerEntry.findFirst({
-                    where: { saleId: originalSale.id, accountId: vendorAccId, entryType: "REFUND" }
-                });
-                if (vendorLedger) {
-                    await tx.ledgerEntry.update({
-                        where: { id: vendorLedger.id },
-                        data: { credit: newVendorRefund, transactionDate: businessDate }
-                    });
-                }
-                const vendorBalanceDelta = originalSale.vendor.category === "DEBIT" ? -vendorDelta : vendorDelta;
-                await tx.account.update({
-                    where: { id: vendorAccId },
-                    data: { balance: { increment: vendorBalanceDelta } }
-                });
-            }
-
-            /* UPDATE CUSTOMER LEDGER */
-            if (customerDelta !== 0 && originalSale.customer?.account) {
-                const custAccId = originalSale.customer.account.id;
-                const customerLedger = await tx.ledgerEntry.findFirst({
-                    where: { saleId: originalSale.id, accountId: custAccId, entryType: "REFUND" }
-                });
-                if (customerLedger) {
-                    await tx.ledgerEntry.update({
-                        where: { id: customerLedger.id },
-                        data: { credit: newNetRefundToCustomer, transactionDate: businessDate }
-                    });
-                }
-                await tx.account.update({
-                    where: { id: custAccId },
-                    data: { balance: { decrement: customerDelta } }
-                });
-            }
-
-            /* UPDATE REFUND RECORD */
-            return await tx.refund.update({
-                where: { id: refundId },
-                data: {
-                    vendorRefundAmount: newVendorRefund,
-                    customerRefundAmount: newCustomerRefundAmount,
-                    netRefundToCustomer: newNetRefundToCustomer,
-                    refundFee: newFee,
-                    cancellationCharges: newCharges,
-                    netCostToUs: newCharges,
-                    refundDate: businessDate,
-                    refundReason: refundReason ?? existingRefund.refundReason,
-                    remarks: remarks ?? existingRefund.remarks
-                }
-            });
-        });
-
-        return res.json({ success: true, data: result });
-    } catch (err) {
-        return res.status(400).json({ success: false, error: err.message });
-    }
-});
-
-
-router.delete("/:refundId", authenticate, async (req, res) => {
-    const { refundId } = req.params;
-
-    try {
-        const result = await prisma.$transaction(async (tx) => {
-            /* ====================================================
-               1️⃣ LOAD REFUND WITH ALL RELATIONS
-            ==================================================== */
-            const refund = await tx.refund.findUnique({
-                where: { id: refundId },
                 include: {
                     sale: {
                         include: {
@@ -396,84 +362,200 @@ router.delete("/:refundId", authenticate, async (req, res) => {
                 }
             });
 
+            if (!existingRefund) throw new Error("Refund not found");
+
+            const originalSale = existingRefund.sale;
+            const originalNet  = Number(originalSale.netPrice);
+
+            const newFee     = refundFee        !== undefined ? Number(refundFee)        : Number(existingRefund.refundFee);
+            const newCharges = serviceCharges   !== undefined ? Number(serviceCharges)   : Number(existingRefund.cancellationCharges);
+
+            const newVendorRefund        = originalNet - newFee;
+            const newCustomerRefundAmount = originalNet - newFee;
+            const newNetRefundToCustomer  = newCustomerRefundAmount - newCharges;
+
+            const vendorDelta   = newVendorRefund        - Number(existingRefund.vendorRefundAmount);
+            const customerDelta = newNetRefundToCustomer - Number(existingRefund.netRefundToCustomer);
+
+            const businessDate = refundDate ? new Date(refundDate) : existingRefund.refundDate;
+
+            /* ====================================================
+               1️⃣ UPDATE VENDOR LEDGER + BALANCE
+            ==================================================== */
+            if (vendorDelta !== 0) {
+                const vendorAccId = originalSale.vendor.account.id;
+
+                const vendorLedger = await tx.ledgerEntry.findFirst({
+                    where: { saleId: originalSale.id, accountId: vendorAccId, entryType: "REFUND" }
+                });
+
+                if (vendorLedger) {
+                    await tx.ledgerEntry.update({
+                        where: { id: vendorLedger.id },
+                        data:  { credit: newVendorRefund, transactionDate: businessDate }
+                    });
+                }
+
+                const vendorBalanceDelta = originalSale.vendor.category === "DEBIT"
+                    ? -vendorDelta
+                    :  vendorDelta;
+
+                await tx.account.update({
+                    where: { id: vendorAccId },
+                    data:  { balance: { increment: vendorBalanceDelta } }
+                });
+            }
+
+            /* ====================================================
+               2️⃣ UPDATE CUSTOMER LEDGER + BALANCE (CREDIT ONLY)
+            ==================================================== */
+            if (customerDelta !== 0 && originalSale.customer?.account) {
+                const custAccId = originalSale.customer.account.id;
+
+                const customerLedger = await tx.ledgerEntry.findFirst({
+                    where: { saleId: originalSale.id, accountId: custAccId, entryType: "REFUND" }
+                });
+
+                if (customerLedger) {
+                    await tx.ledgerEntry.update({
+                        where: { id: customerLedger.id },
+                        data:  { credit: newNetRefundToCustomer, transactionDate: businessDate }
+                    });
+                }
+
+                await tx.account.update({
+                    where: { id: custAccId },
+                    data:  { balance: { decrement: customerDelta } }
+                });
+            }
+
+            /* ====================================================
+               3️⃣ UPDATE REFUND RECORD
+            ==================================================== */
+            return await tx.refund.update({
+                where: { id: refundId },
+                data: {
+                    vendorRefundAmount:   newVendorRefund,
+                    customerRefundAmount: newCustomerRefundAmount,
+                    netRefundToCustomer:  newNetRefundToCustomer,
+                    refundFee:            newFee,
+                    cancellationCharges:  newCharges,
+                    netCostToUs:          newCharges,
+                    refundDate:           businessDate,
+                    refundReason:         refundReason  ?? existingRefund.refundReason,
+                    remarks:              remarks        ?? existingRefund.remarks,
+                }
+            });
+        });
+
+        return res.json({ success: true, data: result });
+
+    } catch (err) {
+        console.error(err);
+        return res.status(400).json({ success: false, error: err.message });
+    }
+});
+
+
+router.delete("/:refundId", authenticate, async (req, res) => {
+    const { refundId } = req.params;
+
+    try {
+        const result = await prisma.$transaction(async (tx) => {
+
+            /* ====================================================
+               1️⃣ LOAD REFUND WITH ALL RELATIONS
+            ==================================================== */
+            const refund = await tx.refund.findUnique({
+                where: { id: refundId },
+                include: {
+                    sale: {
+                        include: {
+                            vendor:   { include: { account: true } },
+                            customer: { include: { account: true } },
+                            invoice:  true
+                        }
+                    }
+                }
+            });
+
             if (!refund) throw new Error("Refund record not found");
 
-            const sale = refund.sale;
-            const vendor = sale.vendor;
-            const customer = sale.customer;
-            const invoice = sale.invoice;
+            const originalSale = refund.sale;
+            const vendor       = originalSale.vendor;
+            const customer     = originalSale.customer;
 
             /* ====================================================
                2️⃣ REVERSE VENDOR ACCOUNT BALANCE
             ==================================================== */
             if (vendor?.account) {
-                const vendorRefundAmt = Number(refund.vendorRefundAmount);
-                // If it was a DEBIT vendor, we added balance during refund, so we subtract now.
-                // If it was CREDIT, we subtracted during refund, so we add now.
-                const vendorReverseDelta = vendor.category === "DEBIT" ? vendorRefundAmt : -vendorRefundAmt;
+                const vendorRefundAmt    = Number(refund.vendorRefundAmount);
+                const vendorReverseDelta = vendor.category === "DEBIT"
+                    ?  vendorRefundAmt
+                    : -vendorRefundAmt;
 
                 await tx.account.update({
                     where: { id: vendor.account.id },
-                    data: { balance: { increment: vendorReverseDelta } }
+                    data:  { balance: { increment: vendorReverseDelta } }
                 });
             }
 
             /* ====================================================
-               3️⃣ REVERSE CUSTOMER ACCOUNT BALANCE
+               3️⃣ REVERSE CUSTOMER ACCOUNT BALANCE (CREDIT ONLY)
             ==================================================== */
-            // Check if it was a CREDIT sale (where balance was actually affected)
-            const isCredit = String(sale.paymentType).toUpperCase() === "CREDIT";
+            const isCredit = String(originalSale.paymentType).toUpperCase() === "CREDIT";
+
             if (isCredit && customer?.account) {
                 const customerRefundAmt = Number(refund.netRefundToCustomer);
 
-                // Refund decreased their debt (credit), so deletion must increase it back (debit)
                 await tx.account.update({
                     where: { id: customer.account.id },
-                    data: { balance: { increment: customerRefundAmt } }
+                    data:  { balance: { increment: customerRefundAmt } }
                 });
             }
 
             /* ====================================================
-               4️⃣ REMOVE LEDGER ENTRIES
+               4️⃣ REMOVE REFUND LEDGER ENTRIES
             ==================================================== */
-            // Delete all ledger entries associated with this specific sale that are type "REFUND"
             await tx.ledgerEntry.deleteMany({
                 where: {
-                    saleId: sale.id,
+                    saleId:    originalSale.id,
                     entryType: "REFUND"
                 }
             });
 
             /* ====================================================
-               5️⃣ RE-CALCULATE INVOICE TOTALS
+               5️⃣ FIND & DELETE THE NEGATIVE MIRROR SALE
+               This also reverses the invoice totals automatically
+               since the negative sale is removed from the invoice.
             ==================================================== */
-            if (invoice) {
-                const originalNet = Number(sale.netPrice);
-                const originalSell = Number(sale.sellPrice);
+            const negativeSale = await tx.sale.findFirst({
+                where: {
+                    invoiceId:  originalSale.invoiceId,
+                    documentNo: `REF-${originalSale.documentNo || originalSale.id}`,
+                    status:     "REFUNDED",
+                }
+            });
 
+            if (negativeSale) {
+                await tx.sale.delete({
+                    where: { id: negativeSale.id }
+                });
+
+                // Re-add the negative sale's amounts back to invoice totals
                 await tx.salesInvoice.update({
-                    where: { id: invoice.id },
+                    where: { id: originalSale.invoiceId },
                     data: {
-                        totalNet: { increment: originalNet },
-                        totalSell: { increment: originalSell },
-                        totalProfit: { increment: (originalSell - originalNet) }
+                        totalNet:    { increment: -Number(negativeSale.netPrice)  },  // netPrice was negative, so -negative = positive
+                        totalSell:   { increment: -Number(negativeSale.sellPrice) },
+                        totalProfit: { increment: -Number(negativeSale.profit)    },
                     }
                 });
             }
 
             /* ====================================================
-               6️⃣ RESTORE SALE STATUS
-            ==================================================== */
-            await tx.sale.update({
-                where: { id: sale.id },
-                data: {
-                    status: "COMPLETED", // Reverting status from REFUNDED to COMPLETED
-                    paymentStatus: "PAID"
-                }
-            });
-
-            /* ====================================================
-               7️⃣ DELETE THE REFUND RECORD
+               6️⃣ DELETE THE REFUND RECORD
+               Original sale is left completely untouched.
             ==================================================== */
             await tx.refund.delete({
                 where: { id: refundId }
@@ -482,10 +564,7 @@ router.delete("/:refundId", authenticate, async (req, res) => {
             return { message: "Refund fully reversed and deleted" };
         }, { timeout: 20000 });
 
-        return res.json({
-            success: true,
-            message: result.message
-        });
+        return res.json({ success: true, message: result.message });
 
     } catch (err) {
         console.error(err);

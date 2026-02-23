@@ -149,7 +149,6 @@ router.post("/", authenticate, async (req, res) => {
     const airline = await prisma.airlineCode.create({
       data: { airlineName, iataName, airlineCode, status },
     });
-
     res.status(201).json({ success: true, data: airline });
   } catch (err) {
     console.error("Error creating airline:", err);
