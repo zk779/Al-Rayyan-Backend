@@ -235,6 +235,7 @@ model LedgerEntry {
 	@@index([accountId])
 	@@index([entryType])
 	@@index([saleId])
+	@@index([paymentId])
 	@@index([refundId])
 	@@index([transactionDate])
 	@@index([createdAt])

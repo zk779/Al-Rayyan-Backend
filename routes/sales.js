@@ -231,7 +231,9 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 		const invoice = await prisma.salesInvoice.findUnique({
 			where: { id: req.params.invoiceId },
 			include: {
-				user: { select: { id: true, fullName: true, email: true } },
+				user: {
+					select: { id: true, fullName: true, email: true }
+				},
 				sales: {
 					include: {
 						vendor: {
@@ -240,16 +242,16 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 								vendorName: true,
 								category: true,
 								vendorType: true,
-								account: { select: { balance: true } }
-							}
+								account: { select: { balance: true } },
+							},
 						},
 						airline: {
 							select: {
 								id: true,
 								airlineName: true,
 								airlineCode: true,
-								iataName: true
-							}
+								iataName: true,
+							},
 						},
 						customer: {
 							select: {
@@ -258,27 +260,131 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 								customerType: true,
 								phone: true,
 								contactPerson: true,
-								account: { select: { balance: true } }
-							}
-						}
-					}
-				}
-			}
+								account: { select: { balance: true } },
+							},
+						},
+						// Bank for single BANK_TRANSFER sales
+						bank: {
+							select: {
+								id: true,
+								bankName: true,
+								accountNumber: true,
+								branchName: true,
+								account: { select: { balance: true } },
+							},
+						},
+						// Payment legs for PARTIAL sales
+						payments: {
+							select: {
+								id: true,
+								method: true,
+								amount: true,
+								paymentDate: true,
+								remarks: true,
+								bank: {
+									select: {
+										id: true,
+										bankName: true,
+										accountNumber: true,
+										branchName: true,
+									},
+								},
+								customer: {
+									select: {
+										id: true,
+										customerName: true,
+										customerType: true,
+										phone: true,
+									},
+								},
+							},
+							orderBy: { paymentDate: "asc" },
+						},
+					},
+				},
+			},
 		});
 
 		if (!invoice) {
 			return res.status(404).json({ success: false, error: "Invoice not found" });
 		}
 
+		// Enrich each sale with a normalised paymentSummary so the
+		// frontend never has to branch on paymentType itself.
+		const enrichedSales = invoice.sales.map((sale) => {
+			const pt = String(sale.paymentType).toUpperCase();
+			let paymentSummary;
+
+			if (pt === "CASH") {
+				paymentSummary = {
+					type:   "CASH",
+					label:  "Cash",
+					amount: sale.paidAmount,
+				};
+			} else if (pt === "BANK_TRANSFER") {
+				paymentSummary = {
+					type:      "BANK_TRANSFER",
+					label:     "Bank Transfer",
+					amount:    sale.paidAmount,
+					bankId:    sale.bank?.id            || null,
+					bankName:  sale.bank?.bankName       || null,
+					accountNo: sale.bank?.accountNumber  || null,
+				};
+			} else if (pt === "CREDIT") {
+				paymentSummary = {
+					type:          "CREDIT",
+					label:         "Credit",
+					amount:        sale.sellPrice,
+					paidAmount:    sale.paidAmount,
+					dueAmount:     sale.sellPrice - sale.paidAmount,
+					customerId:    sale.customer?.id           || null,
+					customerName:  sale.customer?.customerName || null,
+				};
+			} else if (pt === "PARTIAL") {
+				const legs = (sale.payments || []).map((leg) => {
+					const lm = String(leg.method).toUpperCase();
+					return {
+						id:           leg.id,
+						method:       lm,
+						amount:       leg.amount,
+						paymentDate:  leg.paymentDate,
+						remarks:      leg.remarks      || null,
+						// bank fields — only populated for BANK_TRANSFER legs
+						bankId:       lm === "BANK_TRANSFER" ? (leg.bank?.id           || null) : null,
+						bankName:     lm === "BANK_TRANSFER" ? (leg.bank?.bankName      || null) : null,
+						accountNo:    lm === "BANK_TRANSFER" ? (leg.bank?.accountNumber || null) : null,
+						// customer fields — only populated for CREDIT legs
+						customerId:   lm === "CREDIT" ? (leg.customer?.id           || null) : null,
+						customerName: lm === "CREDIT" ? (leg.customer?.customerName || null) : null,
+					};
+				});
+
+				const comboKey = legs.map((l) => l.method).join("+");
+
+				paymentSummary = {
+					type:     "PARTIAL",
+					label:    `Split (${legs.length} methods)`,
+					combo:    comboKey,
+					legs,
+					total:    legs.reduce((s, l) => s + l.amount, 0),
+				};
+			} else {
+				paymentSummary = { type: pt, label: pt, amount: sale.paidAmount };
+			}
+
+			return { ...sale, paymentSummary };
+		});
+
 		res.json({
 			success: true,
 			data: {
 				...invoice,
-				salesCount: invoice.sales.length,
-				createdById: invoice.user?.id || null,
-				createdByName: invoice.user?.fullName || null,
-				createdByEmail: invoice.user?.email || null
-			}
+				sales:          enrichedSales,
+				salesCount:     enrichedSales.length,
+				createdById:    invoice.user?.id        || null,
+				createdByName:  invoice.user?.fullName  || null,
+				createdByEmail: invoice.user?.email     || null,
+			},
 		});
 	} catch (err) {
 		console.error(err);
@@ -346,6 +452,9 @@ router.get("/invoice-no", authenticate, async (req, res) => {
 /* ===========================
 	CREATE SALES (INVOICE HAS userId)
 =========================== */
+/* ===========================
+	CREATE SALES (INVOICE HAS userId)
+=========================== */
 router.post("/", authenticate, async (req, res) => {
 	const { saleDate, sales = [] } = req.body;
 
@@ -354,100 +463,220 @@ router.post("/", authenticate, async (req, res) => {
 	}
 
 	try {
-		/* ====================================================== 
-		   1️⃣ VALIDATION PHASE 
+		/* ======================================================
+		   1️⃣  VALIDATION PHASE
 		====================================================== */
-		
 		for (const s of sales) {
-			const net = Number(s.netPrice);
+			const net  = Number(s.netPrice);
 			const sell = Number(s.sellPrice);
 			const paid = Number(s.paidAmount || 0);
-			const vat = Number(s.vatAmount || 0);
-			const paxVat = Number(s.paxVat || 0);
-			const misc = Number(s.miscCharges || 0);
+			const vat    = Number(s.vatAmount   || 0);
+			const paxVat = Number(s.paxVat      || 0);
+			const misc   = Number(s.miscCharges || 0);
 
-			if (isNaN(net) || isNaN(sell)) throw new Error("netPrice and sellPrice must be numbers");
-			if (net < 0 || sell < 0) throw new Error("Prices cannot be negative");
-			if (paid < 0 || paid > sell) throw new Error("Invalid paidAmount");
+			if (isNaN(net) || isNaN(sell))         throw new Error("netPrice and sellPrice must be numbers");
+			if (net < 0 || sell < 0)               throw new Error("Prices cannot be negative");
+			if (paid < 0 || paid > sell)           throw new Error("Invalid paidAmount");
 			if (vat < 0 || paxVat < 0 || misc < 0) throw new Error("Taxes/charges cannot be negative");
-			if (String(s.paymentType).toUpperCase() === "CREDIT" && !s.customerId) {
+
+			const pt = String(s.paymentType).toUpperCase();
+
+			if (pt === "CREDIT" && !s.customerId)
 				throw new Error("customerId required for CREDIT sales");
-			}
-		}
 
-		/* Load vendors & customers */
-		const vendorIds = [...new Set(sales.map(s => s.vendorId).filter(Boolean))];
-		const customerIds = [...new Set(sales.filter(s => String(s.paymentType).toUpperCase() === "CREDIT").map(s => s.customerId))];
+			if (pt === "BANK_TRANSFER" && !s.bankId)
+				throw new Error("bankId required for BANK_TRANSFER sales");
 
-		const vendors = vendorIds.length ? await prisma.vendor.findMany({
-			where: { id: { in: vendorIds } },
-			include: { account: true }
-		}) : [];
+			if (pt === "PARTIAL") {
+				if (!Array.isArray(s.paymentLegs) || s.paymentLegs.length === 0)
+					throw new Error("paymentLegs array required for PARTIAL sales");
 
-		const customers = customerIds.length ? await prisma.customer.findMany({
-			where: { id: { in: customerIds } },
-			include: { account: true }
-		}) : [];
-
-		const vendorMap = Object.fromEntries(vendors.map(v => [v.id, v]));
-		const customerMap = Object.fromEntries(customers.map(c => [c.id, c]));
-
-		/* Validate CREDIT vendor balance */
-		for (const s of sales) {
-			const vendor = vendorMap[s.vendorId];
-			if (!vendor) throw new Error(`Vendor not found: ${s.vendorId}`);
-			
-			if (vendor.category === "CREDIT") {
-				const net = Number(s.netPrice || 0);
-				const balance = Number(vendor.account?.balance || 0);
-				if (net > balance) {
-					throw new Error(`Insufficient balance for vendor "${vendor.vendorName}". Available: ${balance}, Required: ${net}`);
+				for (const leg of s.paymentLegs) {
+					const legMethod = String(leg.method || "").toUpperCase();
+					if (!["CASH", "BANK_TRANSFER", "CREDIT"].includes(legMethod))
+						throw new Error(`Invalid payment leg method: ${leg.method}`);
+					if (!Number(leg.amount) || Number(leg.amount) <= 0)
+						throw new Error("Each payment leg must have a positive amount");
+					if (legMethod === "BANK_TRANSFER" && !leg.bankId)
+						throw new Error("bankId required for BANK_TRANSFER leg");
+					if (legMethod === "CREDIT" && !leg.customerId)
+						throw new Error("customerId required for CREDIT leg");
 				}
 			}
 		}
 
-		/* ====================================================== 
-		   2️⃣ TRANSACTION PHASE 
-		====================================================== */
+		/* ── Bulk-load related records ── */
+		const vendorIds = [...new Set(sales.map(s => s.vendorId).filter(Boolean))];
+		const vendors = vendorIds.length
+			? await prisma.vendor.findMany({
+					where: { id: { in: vendorIds } },
+					include: { account: true },
+			  })
+			: [];
+		const vendorMap = Object.fromEntries(vendors.map(v => [v.id, v]));
 
+		const customerIds = [...new Set([
+			...sales
+				.filter(s => String(s.paymentType).toUpperCase() === "CREDIT")
+				.map(s => s.customerId),
+			...sales.flatMap(s =>
+				(s.paymentLegs || [])
+					.filter(l => String(l.method).toUpperCase() === "CREDIT")
+					.map(l => l.customerId)
+			),
+		].filter(Boolean))];
+
+		const customers = customerIds.length
+			? await prisma.customer.findMany({
+					where: { id: { in: customerIds } },
+					include: { account: true },
+			  })
+			: [];
+		const customerMap = Object.fromEntries(customers.map(c => [c.id, c]));
+
+		const bankIds = [...new Set([
+			...sales
+				.filter(s => String(s.paymentType).toUpperCase() === "BANK_TRANSFER")
+				.map(s => s.bankId),
+			...sales.flatMap(s =>
+				(s.paymentLegs || [])
+					.filter(l => String(l.method).toUpperCase() === "BANK_TRANSFER")
+					.map(l => l.bankId)
+			),
+		].filter(Boolean))];
+
+		const banks = bankIds.length
+			? await prisma.bank.findMany({
+					where: { id: { in: bankIds } },
+					include: { account: true },
+			  })
+			: [];
+		const bankMap = Object.fromEntries(banks.map(b => [b.id, b]));
+
+		/* ── Validate vendor credit balance ── */
+		for (const s of sales) {
+			const vendor = vendorMap[s.vendorId];
+			if (!vendor) throw new Error(`Vendor not found: ${s.vendorId}`);
+
+			if (vendor.category === "CREDIT") {
+				const net = Number(s.netPrice || 0);
+				const balance = Number(vendor.account?.balance || 0);
+
+				if (net > balance) {
+					throw new Error(
+						`Insufficient balance for vendor "${vendor.vendorName}". Available: ${balance}, Required: ${net}`
+					);
+				}
+			}
+		}
+
+		/* ======================================================
+		   2️⃣  TRANSACTION PHASE
+		====================================================== */
 		const businessDate = saleDate ? new Date(saleDate) : new Date();
 
 		const result = await prisma.$transaction(async (tx) => {
-			/* Generate invoice */
+			/* ── Invoice ── */
 			const invoiceNo = await generateNextSalesInvoiceNo(tx, businessDate);
+
 			const invoice = await tx.salesInvoice.create({
 				data: {
 					invoiceNo,
 					saleDate: businessDate,
 					userId: req.user.id,
-				}
+				},
 			});
 
-			/* In-memory balance tracking */
-			const balances = new Map();
-			vendors.forEach(v => balances.set(v.account.id, Number(v.account.balance || 0)));
-			customers.forEach(c => balances.set(c.account.id, Number(c.account.balance || 0)));
+			/* ──────────────────────────────────────────────────────
+			   HELPER: record money received into bank account
+			   ────────────────────────────────────────────────────── */
+			const creditBank = async (bankId, amount, saleId, label) => {
+				const bank = bankMap[bankId];
+				if (!bank) throw new Error(`Bank not found: ${bankId}`);
 
-			const getBal = (id) => balances.get(id) || 0;
-			const setBal = (id, val) => balances.set(id, Number(val));
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: bank.account.id,
+						entryType: "PAYMENT",
+						debit: 0,
+						credit: amount,
+						transactionDate: businessDate,
+						saleId,
+						invoiceId: invoice.id,
+						remarks: `${label} - Invoice ${invoiceNo}`,
+					},
+				});
 
-			let totalNet = 0, totalSell = 0, totalProfit = 0;
+				await tx.account.update({
+					where: { id: bank.account.id },
+					data: { balance: { increment: amount } },
+				});
+			};
 
-			/* Process each sale */
+			/* ──────────────────────────────────────────────────────
+			   HELPER: record a credit sale against a customer
+			   ────────────────────────────────────────────────────── */
+			const creditCustomer = async (customerId, saleAmount, paidNow, saleId, label) => {
+				const cust = customerMap[customerId];
+				if (!cust) throw new Error(`Customer not found: ${customerId}`);
+
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: cust.account.id,
+						entryType: "SALE",
+						debit: 0,
+						credit: saleAmount,
+						transactionDate: businessDate,
+						saleId,
+						invoiceId: invoice.id,
+						remarks: `${label} - Invoice ${invoiceNo}`,
+					},
+				});
+
+				if (paidNow > 0) {
+					await tx.ledgerEntry.create({
+						data: {
+							accountId: cust.account.id,
+							entryType: "PAYMENT",
+							debit: 0,
+							credit: paidNow,
+							transactionDate: businessDate,
+							saleId,
+							invoiceId: invoice.id,
+							remarks: `Payment received - Invoice ${invoiceNo}`,
+						},
+					});
+				}
+
+				const netReceivable = saleAmount - paidNow;
+
+				await tx.account.update({
+					where: { id: cust.account.id },
+					data: { balance: { increment: netReceivable } },
+				});
+			};
+
+			let totalNet = 0,
+				totalSell = 0,
+				totalProfit = 0;
+
+			/* ── Process each sale ── */
 			for (const s of sales) {
 				const vendor = vendorMap[s.vendorId];
 				const net = Number(s.netPrice);
 				const sell = Number(s.sellPrice);
 				const paid = Number(s.paidAmount || 0);
 				const profit = sell - net;
+				const pt = String(s.paymentType).toUpperCase();
 
-				/* Create sale record */
+				/* ── Create sale record ── */
 				const sale = await tx.sale.create({
 					data: {
 						invoiceId: invoice.id,
 						airlineId: s.airlineId,
 						vendorId: s.vendorId,
 						customerId: s.customerId || null,
+						bankId: pt === "BANK_TRANSFER" ? (s.bankId || null) : null,
 						documentNo: s.documentNo || null,
 						pnr: s.pnr || null,
 						routeType: s.routeType || null,
@@ -463,16 +692,14 @@ router.post("/", authenticate, async (req, res) => {
 						paxVat: Number(s.paxVat || 0),
 						miscCharges: Number(s.miscCharges || 0),
 						paidAmount: paid,
-						paymentType: s.paymentType,
-						paymentStatus: paid === sell ? "PAID" : paid > 0 ? "PARTIAL" : "DUE",
+						paymentType: pt,
+						paymentStatus: paid >= sell ? "PAID" : paid > 0 ? "PARTIAL" : "DUE",
 						status: "COMPLETED",
-					}
+					},
 				});
 
-				/* Vendor ledger entry */
+				/* ── Vendor ledger entry (cost side) ── */
 				const isDebitVendor = vendor.category === "DEBIT";
-				const vendorDelta = isDebitVendor ? net : -net;
-				const vendorBalAfter = getBal(vendor.account.id) + vendorDelta;
 
 				await tx.ledgerEntry.create({
 					data: {
@@ -483,67 +710,57 @@ router.post("/", authenticate, async (req, res) => {
 						transactionDate: businessDate,
 						saleId: sale.id,
 						invoiceId: invoice.id,
-						remarks: `Sale - Invoice ${invoiceNo}`
-					}
+						remarks: `Sale cost - Invoice ${invoiceNo}`,
+					},
 				});
 
 				await tx.account.update({
 					where: { id: vendor.account.id },
-					data: { balance: { increment: vendorDelta } }
+					data: { balance: { increment: isDebitVendor ? net : -net } },
 				});
 
-				setBal(vendor.account.id, vendorBalAfter);
+				/* ── Payment-side ledger entries ── */
+				if (pt === "CASH") {
+					// No ledger entry for cash payments
+				} else if (pt === "BANK_TRANSFER") {
+					await creditBank(s.bankId, sell, sale.id, "Bank transfer payment received");
+				} else if (pt === "CREDIT") {
+					await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
+				} else if (pt === "PARTIAL") {
+					for (const leg of s.paymentLegs) {
+						const legMethod = String(leg.method).toUpperCase();
+						const legAmount = Number(leg.amount);
 
-				/* Customer ledger (if CREDIT payment) */
-				if (String(s.paymentType).toUpperCase() === "CREDIT") {
-					const cust = customerMap[s.customerId];
-					if (!cust) throw new Error(`Customer not found: ${s.customerId}`);
-
-					const custBalAfter = getBal(cust.account.id) + sell;
-
-					await tx.ledgerEntry.create({
-						data: {
-							accountId: cust.account.id,
-							entryType: "SALE",
-							debit: sell,
-							credit: 0,
-							transactionDate: businessDate,
-							saleId: sale.id,
-							invoiceId: invoice.id,
-							remarks: `Sale on credit - Invoice ${invoiceNo}`
-						}
-					});
-
-					await tx.account.update({
-						where: { id: cust.account.id },
-						data: { balance: { increment: sell } }
-					});
-
-					setBal(cust.account.id, custBalAfter);
-
-					/* Customer payment ledger (if partial/full payment made) */
-					if (paid > 0) {
-						const custBalAfterPayment = getBal(cust.account.id) - paid;
-
-						await tx.ledgerEntry.create({
+						await tx.salePayment.create({
 							data: {
-								accountId: cust.account.id,
-								entryType: "PAYMENT",
-								debit: 0,
-								credit: paid,
-								transactionDate: businessDate,
 								saleId: sale.id,
-								invoiceId: invoice.id,
-								remarks: `Payment received - Invoice ${invoiceNo}`
-							}
+								method: legMethod,
+								amount: legAmount,
+								bankId: legMethod === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+								customerId: legMethod === "CREDIT" ? (leg.customerId || null) : null,
+								remarks: leg.remarks || null,
+								paymentDate: businessDate,
+							},
 						});
 
-						await tx.account.update({
-							where: { id: cust.account.id },
-							data: { balance: { decrement: paid } }
-						});
-
-						setBal(cust.account.id, custBalAfterPayment);
+						if (legMethod === "CASH") {
+							// No ledger entry for cash payment legs
+						} else if (legMethod === "BANK_TRANSFER") {
+							await creditBank(
+								leg.bankId,
+								legAmount,
+								sale.id,
+								"Partial bank transfer received"
+							);
+						} else if (legMethod === "CREDIT") {
+							await creditCustomer(
+								leg.customerId,
+								legAmount,
+								0,
+								sale.id,
+								"Partial credit sale"
+							);
+						}
 					}
 				}
 
@@ -552,10 +769,10 @@ router.post("/", authenticate, async (req, res) => {
 				totalProfit += profit;
 			}
 
-			/* Update invoice totals */
+			/* ── Update invoice totals ── */
 			await tx.salesInvoice.update({
 				where: { id: invoice.id },
-				data: { totalNet, totalSell, totalProfit }
+				data: { totalNet, totalSell, totalProfit },
 			});
 
 			return invoice;
@@ -564,9 +781,8 @@ router.post("/", authenticate, async (req, res) => {
 		return res.status(201).json({
 			success: true,
 			message: "Sales processed successfully",
-			data: result
+			data: result,
 		});
-
 	} catch (err) {
 		console.error(err);
 		return res.status(400).json({ success: false, error: err.message });
@@ -579,25 +795,31 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 	const { invoiceId } = req.params;
 	const { invoiceNo, saleDate, sales = [] } = req.body;
 
-
 	if (!Array.isArray(sales)) {
 		return res.status(400).json({ success: false, error: "sales must be an array" });
 	}
 
 	try {
 		/* ======================================================
-		   1️⃣ LOAD EXISTING INVOICE
+		   1️⃣  LOAD EXISTING INVOICE
 		====================================================== */
 		const existingInvoice = await prisma.salesInvoice.findUnique({
 			where: { id: invoiceId },
 			include: {
 				sales: {
 					include: {
-						vendor: { include: { account: true } },
+						vendor:   { include: { account: true } },
 						customer: { include: { account: true } },
-					}
-				}
-			}
+						bank:     { include: { account: true } },
+						payments: {                              // SalePayment legs
+							include: {
+								bank:     { include: { account: true } },
+								customer: { include: { account: true } },
+							},
+						},
+					},
+				},
+			},
 		});
 
 		if (!existingInvoice) {
@@ -606,406 +828,443 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 		const saleMap = new Map(existingInvoice.sales.map(s => [s.id, s]));
 
-		// Validate all sale IDs exist in invoice
 		for (const s of sales) {
-			if (!s.id) throw new Error("Each sale must include 'id'");
+			if (!s.id)              throw new Error("Each sale must include 'id'");
 			if (!saleMap.has(s.id)) throw new Error(`Sale not found in invoice: ${s.id}`);
 		}
 
 		/* ======================================================
-		   2️⃣ FIND DELETED SALES (delete-by-omission)
+		   2️⃣  DELETED SALES (omitted from payload)
 		====================================================== */
 		const payloadSaleIds = new Set(sales.map(s => s.id));
-		const deletedSales = existingInvoice.sales.filter(s => !payloadSaleIds.has(s.id));
+		const deletedSales   = existingInvoice.sales.filter(s => !payloadSaleIds.has(s.id));
 
 		/* ======================================================
-		   3️⃣ PRELOAD VENDORS & CUSTOMERS
+		   3️⃣  PRE-LOAD ALL VENDORS / CUSTOMERS / BANKS
 		====================================================== */
-		const vendorIds = new Set();
-		const customerIds = new Set();
+		const vendorIdSet   = new Set();
+		const customerIdSet = new Set();
+		const bankIdSet     = new Set();
 
+		// Collect from existing sales (for reversal)
 		existingInvoice.sales.forEach(s => {
-			if (s.vendorId) vendorIds.add(s.vendorId);
-			if (s.customerId) customerIds.add(s.customerId);
+			if (s.vendorId)   vendorIdSet.add(s.vendorId);
+			if (s.customerId) customerIdSet.add(s.customerId);
+			if (s.bankId)     bankIdSet.add(s.bankId);
+			s.payments?.forEach(leg => {
+				if (leg.customerId) customerIdSet.add(leg.customerId);
+				if (leg.bankId)     bankIdSet.add(leg.bankId);
+			});
 		});
 
+		// Collect from incoming payload (for applying new entries)
 		sales.forEach(s => {
-			if (s.vendorId) vendorIds.add(s.vendorId);
-			if (s.customerId) customerIds.add(s.customerId);
+			if (s.vendorId)   vendorIdSet.add(s.vendorId);
+			if (s.customerId) customerIdSet.add(s.customerId);
+			if (s.bankId)     bankIdSet.add(s.bankId);
+			(s.paymentLegs || []).forEach(leg => {
+				if (leg.customerId) customerIdSet.add(leg.customerId);
+				if (leg.bankId)     bankIdSet.add(leg.bankId);
+			});
 		});
 
-		const vendors = vendorIds.size ? await prisma.vendor.findMany({
-			where: { id: { in: [...vendorIds] } },
-			include: { account: true }
-		}) : [];
+		const [vendors, customers, banks] = await Promise.all([
+			vendorIdSet.size
+				? prisma.vendor.findMany({ where: { id: { in: [...vendorIdSet] } }, include: { account: true } })
+				: [],
+			customerIdSet.size
+				? prisma.customer.findMany({ where: { id: { in: [...customerIdSet] } }, include: { account: true } })
+				: [],
+			bankIdSet.size
+				? prisma.bank.findMany({ where: { id: { in: [...bankIdSet] } }, include: { account: true } })
+				: [],
+		]);
 
-		const customers = customerIds.size ? await prisma.customer.findMany({
-			where: { id: { in: [...customerIds] } },
-			include: { account: true }
-		}) : [];
-
-		const vendorMap = new Map(vendors.map(v => [v.id, v]));
-		const customerMap = new Map(customers.map(c => [c.id, c]));
+		const vendorMap   = new Map(vendors.map(v   => [v.id, v]));
+		const customerMap = new Map(customers.map(c  => [c.id, c]));
+		const bankMap     = new Map(banks.map(b      => [b.id, b]));
 
 		const businessDate = saleDate ? new Date(saleDate) : new Date();
 
 		/* ======================================================
-		   4️⃣ TRANSACTION
+		   4️⃣  TRANSACTION
 		====================================================== */
 		const result = await prisma.$transaction(async (tx) => {
-			/* Update invoice header */
+
+			/* ── Update invoice header ── */
 			await tx.salesInvoice.update({
 				where: { id: invoiceId },
-				data: { invoiceNo, saleDate: businessDate }
+				data:  { invoiceNo, saleDate: businessDate },
 			});
 
-			/* In-memory balance tracking */
-			const balances = new Map();
+			/* ── In-memory balance tracking ── */
+			const balances        = new Map();
 			const touchedAccounts = new Set();
 
-			const seedAccount = (acc) => {
-				if (!acc || balances.has(acc.id)) return;
-				balances.set(acc.id, Number(acc.balance || 0));
+			const seedBalance = (acc) => {
+				if (acc && !balances.has(acc.id)) balances.set(acc.id, Number(acc.balance || 0));
 			};
 
+			// Seed from existing data
 			existingInvoice.sales.forEach(s => {
-				seedAccount(s.vendor?.account);
-				seedAccount(s.customer?.account);
+				seedBalance(s.vendor?.account);
+				seedBalance(s.customer?.account);
+				seedBalance(s.bank?.account);
+				s.payments?.forEach(leg => {
+					seedBalance(leg.bank?.account);
+					seedBalance(leg.customer?.account);
+				});
 			});
 
-			sales.forEach(s => {
-				const v = vendorMap.get(s.vendorId);
-				if (v?.account) seedAccount(v.account);
-				if (s.customerId) {
-					const c = customerMap.get(s.customerId);
-					if (c?.account) seedAccount(c.account);
-				}
-			});
+			// Seed from incoming (in case new entities are referenced)
+			vendors.forEach(v   => seedBalance(v.account));
+			customers.forEach(c => seedBalance(c.account));
+			banks.forEach(b     => seedBalance(b.account));
 
-			const getBal = (id) => balances.get(id) || 0;
-			const setBal = (id, val) => {
-				balances.set(id, Number(val));
-				touchedAccounts.add(id);
+			const getBal = (id)     => balances.get(id) || 0;
+			const setBal = (id, v)  => { balances.set(id, Number(v)); touchedAccounts.add(id); };
+			const adjBal = (id, d)  => setBal(id, getBal(id) + d);
+
+			/* ══════════════════════════════════════════════════════
+			   HELPERS — mirror the POST helpers exactly
+			══════════════════════════════════════════════════════ */
+
+			/** Apply a bank-received-payment ledger entry (money in) */
+			const applyBankPayment = async (bankId, amount, saleId) => {
+				const bank = bankMap.get(bankId);
+				if (!bank) throw new Error(`Bank not found: ${bankId}`);
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: bank.account.id, entryType: "PAYMENT",
+						debit: amount, credit: 0,
+						transactionDate: businessDate,
+						saleId, invoiceId,
+						remarks: `Bank transfer received - Invoice ${invoiceNo}`,
+					},
+				});
+				adjBal(bank.account.id, amount);
 			};
 
-			/* ======================================================
-			   4.1 DELETE SALES
-			====================================================== */
+			/** Reverse a previous bank-received-payment (money out) */
+			const reverseBankPayment = async (bankId, amount, saleId) => {
+				const bank = bankMap.get(bankId);
+				if (!bank) return;
+				await tx.ledgerEntry.deleteMany({
+					where: { saleId, accountId: bank.account.id, entryType: "PAYMENT" },
+				});
+				adjBal(bank.account.id, -amount);
+			};
+
+			/** Apply credit-sale + optional immediate payment entries */
+			const applyCreditSale = async (customerId, saleAmount, paidNow, saleId) => {
+				const cust = customerMap.get(customerId);
+				if (!cust) throw new Error(`Customer not found: ${customerId}`);
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: cust.account.id, entryType: "SALE",
+						debit: saleAmount, credit: 0,
+						transactionDate: businessDate,
+						saleId, invoiceId,
+						remarks: `Sale on credit - Invoice ${invoiceNo}`,
+					},
+				});
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: cust.account.id, entryType: "PAYMENT",
+						debit: 0, credit: paidNow,
+						transactionDate: businessDate,
+						saleId, invoiceId,
+						remarks: `Payment received - Invoice ${invoiceNo}`,
+					},
+				});
+				adjBal(cust.account.id, saleAmount - paidNow);
+			};
+
+			/** Reverse all credit entries for a sale on a customer account */
+			const reverseCreditSale = async (customerId, oldSell, oldPaid, saleId) => {
+				const cust = customerMap.get(customerId);
+				if (!cust) return;
+				await tx.ledgerEntry.deleteMany({
+					where: { saleId, accountId: cust.account.id, entryType: { in: ["SALE", "PAYMENT"] } },
+				});
+				adjBal(cust.account.id, -(oldSell - oldPaid));
+			};
+
+			/* ══════════════════════════════════════════════════════
+			   4.1  DELETE OMITTED SALES (full reversal)
+			══════════════════════════════════════════════════════ */
 			for (const sale of deletedSales) {
-				const vendor = sale.vendor;
-				const customer = sale.customer;
-				const net = Number(sale.netPrice);
+				const net  = Number(sale.netPrice);
 				const sell = Number(sale.sellPrice);
 				const paid = Number(sale.paidAmount || 0);
-				const wasCredit = String(sale.paymentType).toUpperCase() === "CREDIT";
+				const pt   = String(sale.paymentType).toUpperCase();
 
-				/* Reverse vendor ledger */
-				if (vendor?.account) {
-					const accId = vendor.account.id;
-					const isDebit = vendor.category === "DEBIT";
-					const delta = isDebit ? -net : net; // Reverse the original effect
-					setBal(accId, getBal(accId) + delta);
-
+				// Vendor reversal
+				if (sale.vendor?.account) {
+					const isDebit = sale.vendor.category === "DEBIT";
 					await tx.ledgerEntry.deleteMany({
-						where: { saleId: sale.id, accountId: accId, entryType: "SALE" }
+						where: { saleId: sale.id, accountId: sale.vendor.account.id, entryType: "SALE" },
 					});
+					adjBal(sale.vendor.account.id, isDebit ? -net : net);
 				}
 
-				/* Reverse customer ledger */
-				if (wasCredit && customer?.account) {
-					const accId = customer.account.id;
-					setBal(accId, getBal(accId) - sell + paid); // Remove sale, restore payment
-
-					await tx.ledgerEntry.deleteMany({
-						where: { saleId: sale.id, accountId: accId, entryType: { in: ["SALE", "PAYMENT"] } }
-					});
+				// Payment-side reversal
+				if (pt === "BANK_TRANSFER" && sale.bank?.account) {
+					await reverseBankPayment(sale.bankId, sell, sale.id);
 				}
 
-				/* Delete sale record */
+				if (pt === "CREDIT" && sale.customer?.account) {
+					await reverseCreditSale(sale.customerId, sell, paid, sale.id);
+				}
+
+				if (pt === "PARTIAL") {
+					for (const leg of (sale.payments || [])) {
+						const lm = String(leg.method).toUpperCase();
+						if (lm === "BANK_TRANSFER" && leg.bank?.account) {
+							await reverseBankPayment(leg.bankId, leg.amount, sale.id);
+						}
+						if (lm === "CREDIT" && leg.customer?.account) {
+							await reverseCreditSale(leg.customerId, leg.amount, 0, sale.id);
+						}
+					}
+					await tx.salePayment.deleteMany({ where: { saleId: sale.id } });
+				}
+
 				await tx.sale.delete({ where: { id: sale.id } });
 			}
 
-			/* ======================================================
-			   4.2 UPDATE EXISTING SALES
-			====================================================== */
+			/* ══════════════════════════════════════════════════════
+			   4.2  UPDATE EACH SALE IN PAYLOAD
+			══════════════════════════════════════════════════════ */
 			let totalNet = 0, totalSell = 0, totalProfit = 0;
 
 			for (const payload of sales) {
 				const current = saleMap.get(payload.id);
 
-				/* Parse values */
-				const oldNet = Number(current.netPrice);
-				const newNet = Number(payload.netPrice);
+				const oldNet  = Number(current.netPrice);
+				const newNet  = Number(payload.netPrice);
 				const oldSell = Number(current.sellPrice);
 				const newSell = Number(payload.sellPrice);
 				const oldPaid = Number(current.paidAmount || 0);
 				const newPaid = Number(payload.paidAmount || 0);
 
-				/* Validate */
 				if (isNaN(newNet) || isNaN(newSell)) throw new Error("Invalid prices");
-				if (newNet < 0 || newSell < 0) throw new Error("Prices cannot be negative");
+				if (newNet < 0 || newSell < 0)       throw new Error("Prices cannot be negative");
 				if (newPaid < 0 || newPaid > newSell) throw new Error("Invalid paidAmount");
 
-				const oldPaymentType = String(current.paymentType).toUpperCase();
-				const newPaymentType = String(payload.paymentType || current.paymentType).toUpperCase();
+				const oldPt = String(current.paymentType).toUpperCase();
+				const newPt = String(payload.paymentType || current.paymentType).toUpperCase();
 
-				const vendorChanged = current.vendorId !== payload.vendorId;
-				const customerChanged = (current.customerId || null) !== (payload.customerId || null);
-				const netChanged = oldNet !== newNet;
-				const sellChanged = oldSell !== newSell;
-				const paidChanged = oldPaid !== newPaid;
-				const paymentTypeChanged = oldPaymentType !== newPaymentType;
+				const vendorChanged      = current.vendorId   !== payload.vendorId;
+				const customerChanged    = (current.customerId || null) !== (payload.customerId || null);
+				const bankChanged        = (current.bankId     || null) !== (payload.bankId     || null);
+				const netChanged         = oldNet  !== newNet;
+				const sellChanged        = oldSell !== newSell;
+				const paidChanged        = oldPaid !== newPaid;
+				const paymentTypeChanged = oldPt   !== newPt;
 
-				const wasCredit = oldPaymentType === "CREDIT";
-				const isCredit = newPaymentType === "CREDIT";
+				/* ── Validation ── */
+				if (newPt === "CREDIT" && !payload.customerId)
+					throw new Error("customerId required for CREDIT sales");
+				if (newPt === "BANK_TRANSFER" && !payload.bankId)
+					throw new Error("bankId required for BANK_TRANSFER sales");
+				if (newPt === "PARTIAL") {
+					if (!Array.isArray(payload.paymentLegs) || payload.paymentLegs.length === 0)
+						throw new Error("paymentLegs required for PARTIAL sales");
+					for (const leg of payload.paymentLegs) {
+						const lm = String(leg.method || "").toUpperCase();
+						if (!["CASH", "BANK_TRANSFER", "CREDIT"].includes(lm))
+							throw new Error(`Invalid payment leg method: ${leg.method}`);
+						if (!Number(leg.amount) || Number(leg.amount) <= 0)
+							throw new Error("Each payment leg must have a positive amount");
+						if (lm === "BANK_TRANSFER" && !leg.bankId)
+							throw new Error("bankId required for BANK_TRANSFER leg");
+						if (lm === "CREDIT" && !leg.customerId)
+							throw new Error("customerId required for CREDIT leg");
+					}
+				}
 
-				if (isCredit && !payload.customerId) throw new Error("customerId required for CREDIT sales");
-
-				/* ──────────────────────────────────────────────────
-				   VENDOR HANDLING
-				────────────────────────────────────────────────── */
+				/* ── VENDOR: handle change or net price change ── */
 				if (vendorChanged) {
-					/* Remove old vendor */
+					// Reverse old vendor
 					const oldVendor = vendorMap.get(current.vendorId);
 					if (oldVendor?.account) {
-						const accId = oldVendor.account.id;
 						const isDebit = oldVendor.category === "DEBIT";
-						const delta = isDebit ? -oldNet : oldNet;
-						setBal(accId, getBal(accId) + delta);
-
 						await tx.ledgerEntry.deleteMany({
-							where: { saleId: current.id, accountId: accId, entryType: "SALE" }
+							where: { saleId: current.id, accountId: oldVendor.account.id, entryType: "SALE" },
 						});
+						adjBal(oldVendor.account.id, isDebit ? -oldNet : oldNet);
 					}
-
-					/* Add new vendor */
+					// Apply new vendor
 					const newVendor = vendorMap.get(payload.vendorId);
 					if (!newVendor?.account) throw new Error("Vendor not found");
-
-					const accId = newVendor.account.id;
-					const isDebit = newVendor.category === "DEBIT";
-
-					/* CREDIT vendor balance check */
-					if (newVendor.category === "CREDIT" && newNet > getBal(accId)) {
+					if (newVendor.category === "CREDIT" && newNet > getBal(newVendor.account.id))
 						throw new Error(`Insufficient balance for vendor "${newVendor.vendorName}"`);
-					}
-
-					const delta = isDebit ? newNet : -newNet;
-					setBal(accId, getBal(accId) + delta);
-
+					const isDebit = newVendor.category === "DEBIT";
 					await tx.ledgerEntry.create({
 						data: {
-							accountId: accId,
-							entryType: "SALE",
-							debit: isDebit ? newNet : 0,
-							credit: isDebit ? 0 : newNet,
-							transactionDate: businessDate,
-							saleId: current.id,
-							invoiceId,
-							remarks: `Sale - Invoice ${invoiceNo}`
-						}
+							accountId: newVendor.account.id, entryType: "SALE",
+							debit: isDebit ? newNet : 0, credit: isDebit ? 0 : newNet,
+							transactionDate: businessDate, saleId: current.id, invoiceId,
+							remarks: `Sale - Invoice ${invoiceNo}`,
+						},
 					});
+					adjBal(newVendor.account.id, isDebit ? newNet : -newNet);
+
 				} else if (netChanged) {
-					/* Update existing vendor ledger */
+					// Same vendor, net changed — update ledger entry amount
 					const vendor = vendorMap.get(current.vendorId);
 					if (!vendor?.account) throw new Error("Vendor not found");
-
-					const accId = vendor.account.id;
-					const isDebit = vendor.category === "DEBIT";
-					const delta = newNet - oldNet;
-
-					/* CREDIT vendor balance check */
-					if (vendor.category === "CREDIT" && delta > getBal(accId)) {
+					if (vendor.category === "CREDIT" && (newNet - oldNet) > getBal(vendor.account.id))
 						throw new Error(`Insufficient balance for vendor "${vendor.vendorName}"`);
-					}
-
-					const netDelta = isDebit ? delta : -delta;
-					setBal(accId, getBal(accId) + netDelta);
-
+					const isDebit = vendor.category === "DEBIT";
 					await tx.ledgerEntry.updateMany({
-						where: { saleId: current.id, accountId: accId, entryType: "SALE" },
-						data: {
-							debit: isDebit ? newNet : 0,
-							credit: isDebit ? 0 : newNet,
-							transactionDate: businessDate
-						}
+						where: { saleId: current.id, accountId: vendor.account.id, entryType: "SALE" },
+						data:  { debit: isDebit ? newNet : 0, credit: isDebit ? 0 : newNet, transactionDate: businessDate },
 					});
+					adjBal(vendor.account.id, isDebit ? (newNet - oldNet) : -(newNet - oldNet));
 				}
 
-				/* ──────────────────────────────────────────────────
-				   PAYMENT TYPE CHANGE HANDLING
-				────────────────────────────────────────────────── */
-				if (paymentTypeChanged || (isCredit && customerChanged)) {
-					/* Remove old customer (if was credit) */
-					if (wasCredit && current.customerId) {
-						const oldCust = customerMap.get(current.customerId);
-						if (oldCust?.account) {
-							const accId = oldCust.account.id;
-							setBal(accId, getBal(accId) - oldSell + oldPaid);
+				/* ── PAYMENT-SIDE: fully reverse old, fully apply new ──────────
+				   Trigger full reversal+reapply whenever:
+				   - payment type changed
+				   - bank changed (BANK_TRANSFER)
+				   - customer changed (CREDIT)
+				   - sell price changed (affects bank/credit amount)
+				   - paid amount changed (affects credit balance)
+				   - payment legs changed (PARTIAL)
+				   ─────────────────────────────────────────────────────────────── */
+				const paymentSideChanged =
+					paymentTypeChanged || sellChanged || paidChanged || customerChanged || bankChanged ||
+					(newPt === "PARTIAL"); // always re-sync partial legs
 
-							await tx.ledgerEntry.deleteMany({
-								where: { saleId: current.id, accountId: accId, entryType: { in: ["SALE", "PAYMENT"] } }
-							});
-						}
+				if (paymentSideChanged) {
+					/* ── REVERSE OLD payment side ── */
+					if (oldPt === "BANK_TRANSFER" && current.bankId) {
+						await reverseBankPayment(current.bankId, oldSell, current.id);
 					}
 
-					/* Add new customer (if now credit) */
-					if (isCredit && payload.customerId) {
-						const newCust = customerMap.get(payload.customerId);
-						if (!newCust?.account) throw new Error("Customer not found");
+					if (oldPt === "CREDIT" && current.customerId) {
+						await reverseCreditSale(current.customerId, oldSell, oldPaid, current.id);
+					}
 
-						const accId = newCust.account.id;
-
-						/* Create SALE ledger */
-						setBal(accId, getBal(accId) + newSell);
-
-						await tx.ledgerEntry.create({
-							data: {
-								accountId: accId,
-								entryType: "SALE",
-								debit: newSell,
-								credit: 0,
-								transactionDate: businessDate,
-								saleId: current.id,
-								invoiceId,
-								remarks: `Sale on credit - Invoice ${invoiceNo}`
+					if (oldPt === "PARTIAL") {
+						for (const leg of (current.payments || [])) {
+							const lm = String(leg.method).toUpperCase();
+							if (lm === "BANK_TRANSFER" && leg.bankId) {
+								await reverseBankPayment(leg.bankId, leg.amount, current.id);
 							}
-						});
+							if (lm === "CREDIT" && leg.customerId) {
+								await reverseCreditSale(leg.customerId, leg.amount, 0, current.id);
+							}
+						}
+						// Delete all old SalePayment legs
+						await tx.salePayment.deleteMany({ where: { saleId: current.id } });
+					}
 
-						/* Create PAYMENT ledger if paid */
-						if (newPaid > 0) {
-							setBal(accId, getBal(accId) - newPaid);
+					/* ── APPLY NEW payment side ── */
+					if (newPt === "CASH") {
+						// Cash: no payment-side account entry
+					}
 
-							await tx.ledgerEntry.create({
+					else if (newPt === "BANK_TRANSFER") {
+						await applyBankPayment(payload.bankId, newSell, current.id);
+					}
+
+					else if (newPt === "CREDIT") {
+						await applyCreditSale(payload.customerId, newSell, newPaid, current.id);
+					}
+
+					else if (newPt === "PARTIAL") {
+						for (const leg of payload.paymentLegs) {
+							const lm        = String(leg.method).toUpperCase();
+							const legAmount = Number(leg.amount);
+
+							// Persist SalePayment leg record
+							await tx.salePayment.create({
 								data: {
-									accountId: accId,
-									entryType: "PAYMENT",
-									debit: 0,
-									credit: newPaid,
-									transactionDate: businessDate,
-									saleId: current.id,
-									invoiceId,
-									remarks: `Payment received - Invoice ${invoiceNo}`
-								}
+									saleId:      current.id,
+									method:      lm,
+									amount:      legAmount,
+									bankId:      lm === "BANK_TRANSFER" ? (leg.bankId     || null) : null,
+									customerId:  lm === "CREDIT"        ? (leg.customerId || null) : null,
+									remarks:     leg.remarks || null,
+									paymentDate: businessDate,
+								},
 							});
-						}
-					}
-				} else if (isCredit && !customerChanged) {
-					/* Same customer, update sell/paid */
-					const cust = customerMap.get(payload.customerId);
-					if (!cust?.account) throw new Error("Customer not found");
 
-					const accId = cust.account.id;
-
-					/* Update sell price */
-					if (sellChanged) {
-						const delta = newSell - oldSell;
-						setBal(accId, getBal(accId) + delta);
-
-						await tx.ledgerEntry.updateMany({
-							where: { saleId: current.id, accountId: accId, entryType: "SALE" },
-							data: { debit: newSell, transactionDate: businessDate }
-						});
-					}
-
-					/* Update paid amount */
-					if (paidChanged) {
-						const existingPayment = await tx.ledgerEntry.findFirst({
-							where: { saleId: current.id, accountId: accId, entryType: "PAYMENT" }
-						});
-
-						if (newPaid > 0) {
-							const delta = newPaid - oldPaid;
-							setBal(accId, getBal(accId) - delta);
-
-							if (existingPayment) {
-								await tx.ledgerEntry.update({
-									where: { id: existingPayment.id },
-									data: { credit: newPaid, transactionDate: businessDate }
-								});
-							} else {
-								await tx.ledgerEntry.create({
-									data: {
-										accountId: accId,
-										entryType: "PAYMENT",
-										debit: 0,
-										credit: newPaid,
-										transactionDate: businessDate,
-										saleId: current.id,
-										invoiceId,
-										remarks: `Payment received - Invoice ${invoiceNo}`
-									}
-								});
+							if (lm === "BANK_TRANSFER") {
+								await applyBankPayment(leg.bankId, legAmount, current.id);
 							}
-						} else if (newPaid === 0 && existingPayment) {
-							setBal(accId, getBal(accId) + oldPaid);
-							await tx.ledgerEntry.delete({ where: { id: existingPayment.id } });
+
+							if (lm === "CREDIT") {
+								await applyCreditSale(leg.customerId, legAmount, 0, current.id);
+							}
+							// CASH leg: no account entry
 						}
 					}
 				}
 
-				/* ──────────────────────────────────────────────────
-				   UPDATE SALE RECORD
-				────────────────────────────────────────────────── */
+				/* ── UPDATE SALE RECORD ── */
 				await tx.sale.update({
 					where: { id: current.id },
 					data: {
-						airlineId: payload.airlineId,
-						vendorId: payload.vendorId,
-						customerId: payload.customerId || null,
-						documentNo: payload.documentNo || null,
-						pnr: payload.pnr ?? current.pnr,
-						routeType: payload.routeType ?? current.routeType,
-						tripType: payload.tripType ?? current.tripType,
+						airlineId:     payload.airlineId,
+						vendorId:      payload.vendorId,
+						customerId:    newPt === "CREDIT"        ? (payload.customerId || null) : null,
+						bankId:        newPt === "BANK_TRANSFER" ? (payload.bankId     || null) : null,
+						documentNo:    payload.documentNo    || null,
+						pnr:           payload.pnr           ?? current.pnr,
+						routeType:     payload.routeType     ?? current.routeType,
+						tripType:      payload.tripType      ?? current.tripType,
 						departureDate: payload.departureDate ? new Date(payload.departureDate) : current.departureDate,
-						returnDate: payload.returnDate ? new Date(payload.returnDate) : current.returnDate,
-						paxName: payload.paxName ?? current.paxName,
-						destinations: payload.destinations ?? current.destinations,
-						netPrice: newNet,
-						sellPrice: newSell,
-						profit: newSell - newNet,
-						vatAmount: Number(payload.vatAmount || 0),
-						paxVat: Number(payload.paxVat || 0),
-						miscCharges: Number(payload.miscCharges || 0),
-						paidAmount: newPaid,
-						paymentType: payload.paymentType || current.paymentType,
-						paymentStatus: newPaid === newSell ? "PAID" : newPaid > 0 ? "PARTIAL" : "DUE",
-						remarks: payload.remarks || null
-					}
+						returnDate:    payload.returnDate    ? new Date(payload.returnDate)    : current.returnDate,
+						paxName:       payload.paxName       ?? current.paxName,
+						destinations:  payload.destinations  ?? current.destinations,
+						netPrice:      newNet,
+						sellPrice:     newSell,
+						profit:        newSell - newNet,
+						vatAmount:     Number(payload.vatAmount   || 0),
+						paxVat:        Number(payload.paxVat      || 0),
+						miscCharges:   Number(payload.miscCharges || 0),
+						paidAmount:    newPaid,
+						paymentType:   newPt,
+						paymentStatus: newPaid >= newSell ? "PAID" : newPaid > 0 ? "PARTIAL" : "DUE",
+						remarks:       payload.remarks || null,
+					},
 				});
 
-				totalNet += newNet;
-				totalSell += newSell;
-				totalProfit += (newSell - newNet);
+				totalNet    += newNet;
+				totalSell   += newSell;
+				totalProfit += newSell - newNet;
 			}
 
-			/* ======================================================
-			   4.3 PERSIST ACCOUNT BALANCES
-			====================================================== */
+			/* ══════════════════════════════════════════════════════
+			   4.3  PERSIST ACCOUNT BALANCES
+			══════════════════════════════════════════════════════ */
 			for (const accId of touchedAccounts) {
 				await tx.account.update({
 					where: { id: accId },
-					data: { balance: getBal(accId) }
+					data:  { balance: getBal(accId) },
 				});
 			}
 
-			/* ======================================================
-			   4.4 UPDATE INVOICE TOTALS
-			====================================================== */
+			/* ══════════════════════════════════════════════════════
+			   4.4  UPDATE INVOICE TOTALS
+			══════════════════════════════════════════════════════ */
 			await tx.salesInvoice.update({
 				where: { id: invoiceId },
-				data: { totalNet, totalSell, totalProfit }
+				data:  { totalNet, totalSell, totalProfit },
 			});
 
 			return { invoiceId, deletedSalesCount: deletedSales.length };
-			},
-			{ timeout: 20000, maxWait: 5000 }
-		);
+
+		}, { timeout: 30000, maxWait: 10000 });
 
 		return res.json({
 			success: true,
 			message: "Invoice updated successfully",
-			data: result
+			data:    result,
 		});
 
 	} catch (err) {
@@ -1013,7 +1272,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		return res.status(400).json({ success: false, error: err.message });
 	}
 });
-
 
 
 /* ======================= DELETE INVOICE ======================= */
@@ -1133,111 +1391,243 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 	}
 });
 
-router.delete("/single-sale/:saleId", authenticate, async (req, res) => {
-    const { saleId } = req.params;
+router.delete("/sale/:saleId", authenticate, async (req, res) => {
+	const { saleId } = req.params;
 
-    try {
-        await prisma.$transaction(async (tx) => {
-            // 1. Fetch the sale with its parent invoice and account details
-            const sale = await tx.sale.findUnique({
-                where: { id: saleId },
-                include: {
-                    invoice: {
-                        include: { sales: true }
-                    },
-                    vendor: { include: { account: true } },
-                    customer: { include: { account: true } }
-                }
-            });
+	try {
+		await prisma.$transaction(async (tx) => {
+			/* ── 1. Fetch sale with everything needed for reversal ── */
+			const sale = await tx.sale.findUnique({
+				where: { id: saleId },
+				include: {
+					invoice: { include: { sales: true } },
+					vendor: { include: { account: true } },
+					customer: { include: { account: true } },
+					bank: { include: { account: true } },
+					payments: {
+						include: {
+							bank: { include: { account: true } },
+							customer: { include: { account: true } },
+						},
+					},
+				},
+			});
 
-            if (!sale) throw new Error("Sale record not found");
+			if (!sale) throw new Error("Sale record not found");
 
-            const net = Number(sale.netPrice);
-            const sell = Number(sale.sellPrice);
-            const paid = Number(sale.paidAmount || 0);
-            const isCredit = String(sale.paymentType).toUpperCase() === "CREDIT";
-            const invoiceId = sale.invoiceId;
+			const net = Number(sale.netPrice || 0);
+			const sell = Number(sale.sellPrice || 0);
+			const paid = Number(sale.paidAmount || 0);
+			const pt = String(sale.paymentType || "").toUpperCase();
+			const invoiceId = sale.invoiceId;
 
-            /* ──────────────────────────────────────────────────
-               1️⃣ VENDOR REVERSAL
-            ────────────────────────────────────────────────── */
-            if (sale.vendor?.account) {
-                const accId = sale.vendor.account.id;
-                const isDebit = sale.vendor.category === "DEBIT";
-                const delta = isDebit ? -net : net;
+			/* ══════════════════════════════════════════════════════
+			   STEP 1 — REVERSE VENDOR SIDE
+			   Undo vendor SALE ledger + restore account balance
+			══════════════════════════════════════════════════════ */
+			if (sale.vendor?.account) {
+				const vendorAccId = sale.vendor.account.id;
+				const isDebitVendor = sale.vendor.category === "DEBIT";
 
-                // Wipe SALE ledger entries for this specific sale
-                await tx.ledgerEntry.deleteMany({
-                    where: {
-                        saleId: sale.id,
-                        accountId: accId,
-                        entryType: "SALE"
-                    }
-                });
+				await tx.ledgerEntry.deleteMany({
+					where: {
+						saleId: sale.id,
+						accountId: vendorAccId,
+						entryType: "SALE",
+					},
+				});
 
-                // Update vendor balance
-                await tx.account.update({
-                    where: { id: accId },
-                    data: { balance: { increment: delta } }
-                });
-            }
+				await tx.account.update({
+					where: { id: vendorAccId },
+					data: {
+						balance: {
+							increment: isDebitVendor ? -net : net,
+						},
+					},
+				});
+			}
 
-            /* ──────────────────────────────────────────────────
-               2️⃣ CUSTOMER REVERSAL
-            ────────────────────────────────────────────────── */
-            if (isCredit && sale.customer?.account) {
-                const accId = sale.customer.account.id;
+			/* ══════════════════════════════════════════════════════
+			   STEP 2 — REVERSE PAYMENT SIDE
+			══════════════════════════════════════════════════════ */
 
-                await tx.ledgerEntry.deleteMany({
-                    where: {
-                        saleId: sale.id,
-                        accountId: accId,
-                        entryType: { in: ["SALE", "PAYMENT"] }
-                    }
-                });
+			if (pt === "CASH") {
+				/* No ledger entry for cash in create API, so nothing to reverse */
+			}
 
-                const balanceDelta = -sell + paid;
-                await tx.account.update({
-                    where: { id: accId },
-                    data: { balance: { increment: balanceDelta } }
-                });
-            }
+			else if (pt === "BANK_TRANSFER") {
+				/* Bank received full sell amount in create API */
+				if (!sale.bank?.account) {
+					throw new Error("Related bank account not found for bank transfer sale");
+				}
 
-            /* ──────────────────────────────────────────────────
-               3️⃣ DELETE THE SALE
-            ────────────────────────────────────────────────── */
-            await tx.sale.delete({ where: { id: saleId } });
+				await tx.ledgerEntry.deleteMany({
+					where: {
+						saleId: sale.id,
+						accountId: sale.bank.account.id,
+						entryType: "PAYMENT",
+					},
+				});
 
-            /* ──────────────────────────────────────────────────
-               4️⃣ UPDATE OR DELETE THE PARENT INVOICE
-            ────────────────────────────────────────────────── */
-            const remainingSales = sale.invoice.sales.filter(s => s.id !== saleId);
+				await tx.account.update({
+					where: { id: sale.bank.account.id },
+					data: {
+						balance: { decrement: sell },
+					},
+				});
+			}
 
-            if (remainingSales.length === 0) {
-                // No sales left? Delete the invoice entirely
-                await tx.salesInvoice.delete({ where: { id: invoiceId } });
-            } else {
-                // Recalculate invoice totals
-                const newTotalNet = remainingSales.reduce((sum, s) => sum + s.netPrice, 0);
-                const newTotalSell = remainingSales.reduce((sum, s) => sum + s.sellPrice, 0);
-                const newTotalProfit = newTotalSell - newTotalNet;
+			else if (pt === "CREDIT") {
+				/* creditCustomer(s.customerId, sell, paid, sale.id, ...) was used in create API
+				   => customer balance incremented by (sell - paid)
+				   => SALE ledger created for sell
+				   => PAYMENT ledger created only if paid > 0
+				*/
+				if (!sale.customer?.account) {
+					throw new Error("Related customer account not found for credit sale");
+				}
 
-                await tx.salesInvoice.update({
-                    where: { id: invoiceId },
-                    data: {
-                        totalNet: newTotalNet,
-                        totalSell: newTotalSell,
-                        totalProfit: newTotalProfit
-                    }
-                });
-            }
-        });
+				const customerAccId = sale.customer.account.id;
 
-        res.json({ success: true, message: "Sale deleted and invoice updated" });
-    } catch (err) {
-        console.error(err);
-        res.status(400).json({ success: false, error: err.message });
-    }
+				await tx.ledgerEntry.deleteMany({
+					where: {
+						saleId: sale.id,
+						accountId: customerAccId,
+						entryType: { in: ["SALE", "PAYMENT"] },
+					},
+				});
+
+				await tx.account.update({
+					where: { id: customerAccId },
+					data: {
+						balance: { decrement: sell - paid },
+					},
+				});
+			}
+
+			else if (pt === "PARTIAL") {
+				/* Reverse each salePayment leg one by one */
+				for (const leg of sale.payments) {
+					const legMethod = String(leg.method || "").toUpperCase();
+					const legAmount = Number(leg.amount || 0);
+
+					if (legMethod === "CASH") {
+						/* No ledger entry for cash leg in create API */
+						continue;
+					}
+
+					if (legMethod === "BANK_TRANSFER") {
+						if (!leg.bank?.account) {
+							throw new Error(`Related bank account not found for payment leg ${leg.id}`);
+						}
+
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: leg.bank.account.id,
+								entryType: "PAYMENT",
+							},
+						});
+
+						await tx.account.update({
+							where: { id: leg.bank.account.id },
+							data: {
+								balance: { decrement: legAmount },
+							},
+						});
+					}
+
+					else if (legMethod === "CREDIT") {
+						if (!leg.customer?.account) {
+							throw new Error(`Related customer account not found for payment leg ${leg.id}`);
+						}
+
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: leg.customer.account.id,
+								entryType: { in: ["SALE", "PAYMENT"] },
+							},
+						});
+
+						/* For partial credit leg, create API did:
+						   creditCustomer(customerId, legAmount, 0, ...)
+						   => balance incremented by legAmount
+						*/
+						await tx.account.update({
+							where: { id: leg.customer.account.id },
+							data: {
+								balance: { decrement: legAmount },
+							},
+						});
+					}
+				}
+
+				/* Delete payment legs after reversal */
+				await tx.salePayment.deleteMany({
+					where: { saleId: sale.id },
+				});
+			}
+
+			/* ══════════════════════════════════════════════════════
+			   STEP 3 — SAFETY CLEANUP
+			   Delete any remaining ledger entries attached to this sale
+			══════════════════════════════════════════════════════ */
+			await tx.ledgerEntry.deleteMany({
+				where: { saleId: sale.id },
+			});
+
+			/* ══════════════════════════════════════════════════════
+			   STEP 4 — DELETE SALE
+			══════════════════════════════════════════════════════ */
+			await tx.sale.delete({
+				where: { id: sale.id },
+			});
+
+			/* ══════════════════════════════════════════════════════
+			   STEP 5 — UPDATE OR DELETE PARENT INVOICE
+			══════════════════════════════════════════════════════ */
+			const remainingSales = sale.invoice.sales.filter((s) => s.id !== sale.id);
+
+			if (remainingSales.length === 0) {
+				await tx.salesInvoice.delete({
+					where: { id: invoiceId },
+				});
+			} else {
+				const newTotalNet = remainingSales.reduce(
+					(sum, s) => sum + Number(s.netPrice || 0),
+					0
+				);
+				const newTotalSell = remainingSales.reduce(
+					(sum, s) => sum + Number(s.sellPrice || 0),
+					0
+				);
+				const newTotalProfit = remainingSales.reduce(
+					(sum, s) => sum + Number(s.profit || 0),
+					0
+				);
+
+				await tx.salesInvoice.update({
+					where: { id: invoiceId },
+					data: {
+						totalNet: newTotalNet,
+						totalSell: newTotalSell,
+						totalProfit: newTotalProfit,
+					},
+				});
+			}
+		}, { timeout: 30000 });
+
+		return res.json({
+			success: true,
+			message: "Sale deleted and related balances reversed successfully",
+		});
+	} catch (err) {
+		console.error(err);
+		return res.status(400).json({
+			success: false,
+			error: err.message,
+		});
+	}
 });
-
 export default router;
