@@ -624,8 +624,8 @@ router.post("/", authenticate, async (req, res) => {
 					data: {
 						accountId: cust.account.id,
 						entryType: "SALE",
-						debit: 0,
-						credit: saleAmount,
+						debit: saleAmount,
+						credit: 0,
 						transactionDate: businessDate,
 						saleId,
 						invoiceId: invoice.id,
@@ -936,7 +936,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				await tx.ledgerEntry.create({
 					data: {
 						accountId: bank.account.id, entryType: "PAYMENT",
-						debit: amount, credit: 0,
+						debit: 0, credit: amount,
 						transactionDate: businessDate,
 						saleId, invoiceId,
 						remarks: `Bank transfer received - Invoice ${invoiceNo}`,
