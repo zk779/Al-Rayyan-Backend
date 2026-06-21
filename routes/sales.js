@@ -487,8 +487,8 @@ router.post("/", authenticate, async (req, res) => {
             if (pt === "BANK_TRANSFER" && !s.bankId)
                 throw new Error("bankId required for BANK_TRANSFER sales");
 
-            if (pt === "BANK_TRANSFER" && paid < sell && !s.customerId)
-                throw new Error("customerId required for BANK_TRANSFER sales when paidAmount is less than sellPrice");
+            // if (pt === "BANK_TRANSFER" && paid < sell && !s.customerId)
+            //     throw new Error("customerId required for BANK_TRANSFER sales when paidAmount is less than sellPrice");
 
 			if (pt === "PARTIAL") {
 				if (!Array.isArray(s.paymentLegs) || s.paymentLegs.length === 0)
@@ -729,9 +729,7 @@ router.post("/", authenticate, async (req, res) => {
                     await creditBank(s.bankId, paid, sale.id, "Bank transfer payment received");
 
                     const remainingBT = sell - paid;
-                    if (remainingBT > 0) {
-                        if (!s.customerId)
-                            throw new Error("customerId required when paidAmount is less than sellPrice for BANK_TRANSFER");
+                    if (remainingBT > 0 && s.customerId) {
                         await creditCustomer(s.customerId, remainingBT, 0, sale.id, "Balance due after bank transfer");
                     }
                 } else if (pt === "CREDIT") {
@@ -1020,8 +1018,12 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				}
 
 				// Payment-side reversal
+				// Payment-side reversal
 				if (pt === "BANK_TRANSFER" && sale.bank?.account) {
-					await reverseBankPayment(sale.bankId, sell, sale.id);
+					await reverseBankPayment(sale.bankId, paid, sale.id);
+					if (sell - paid > 0 && sale.customer?.account) {
+						await reverseCreditSale(sale.customerId, sell - paid, 0, sale.id);
+					}
 				}
 
 				if (pt === "CREDIT" && sale.customer?.account) {
@@ -1151,8 +1153,13 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 				if (paymentSideChanged) {
 					/* ── REVERSE OLD payment side ── */
+					/* ── REVERSE OLD payment side ── */
 					if (oldPt === "BANK_TRANSFER" && current.bankId) {
-						await reverseBankPayment(current.bankId, oldSell, current.id);
+						await reverseBankPayment(current.bankId, oldPaid, current.id);
+						const oldRemainingBT = oldSell - oldPaid;
+						if (oldRemainingBT > 0 && current.customerId) {
+							await reverseCreditSale(current.customerId, oldRemainingBT, 0, current.id);
+						}
 					}
 
 					if (oldPt === "CREDIT" && current.customerId) {
@@ -1179,7 +1186,11 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					}
 
 					else if (newPt === "BANK_TRANSFER") {
-						await applyBankPayment(payload.bankId, newSell, current.id);
+						await applyBankPayment(payload.bankId, newPaid, current.id);
+						const remainingBT = newSell - newPaid;
+						if (remainingBT > 0 && payload.customerId) {
+							await applyCreditSale(payload.customerId, remainingBT, 0, current.id);
+						}
 					}
 
 					else if (newPt === "CREDIT") {
@@ -1222,7 +1233,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					data: {
 						airlineId:     payload.airlineId,
 						vendorId:      payload.vendorId,
-						customerId:    newPt === "CREDIT"        ? (payload.customerId || null) : null,
+						customerId:    (newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null,
 						bankId:        newPt === "BANK_TRANSFER" ? (payload.bankId     || null) : null,
 						documentNo:    payload.documentNo    || null,
 						pnr:           payload.pnr           ?? current.pnr,
