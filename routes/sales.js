@@ -482,10 +482,13 @@ router.post("/", authenticate, async (req, res) => {
 			const pt = String(s.paymentType).toUpperCase();
 
 			if (pt === "CREDIT" && !s.customerId)
-				throw new Error("customerId required for CREDIT sales");
+                throw new Error("customerId required for CREDIT sales");
 
-			if (pt === "BANK_TRANSFER" && !s.bankId)
-				throw new Error("bankId required for BANK_TRANSFER sales");
+            if (pt === "BANK_TRANSFER" && !s.bankId)
+                throw new Error("bankId required for BANK_TRANSFER sales");
+
+            if (pt === "BANK_TRANSFER" && paid < sell && !s.customerId)
+                throw new Error("customerId required for BANK_TRANSFER sales when paidAmount is less than sellPrice");
 
 			if (pt === "PARTIAL") {
 				if (!Array.isArray(s.paymentLegs) || s.paymentLegs.length === 0)
@@ -721,12 +724,19 @@ router.post("/", authenticate, async (req, res) => {
 
 				/* ── Payment-side ledger entries ── */
 				if (pt === "CASH") {
-					// No ledger entry for cash payments
-				} else if (pt === "BANK_TRANSFER") {
-					await creditBank(s.bankId, sell, sale.id, "Bank transfer payment received");
-				} else if (pt === "CREDIT") {
-					await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
-				} else if (pt === "PARTIAL") {
+                    // No ledger entry for cash payments
+                } else if (pt === "BANK_TRANSFER") {
+                    await creditBank(s.bankId, paid, sale.id, "Bank transfer payment received");
+
+                    const remainingBT = sell - paid;
+                    if (remainingBT > 0) {
+                        if (!s.customerId)
+                            throw new Error("customerId required when paidAmount is less than sellPrice for BANK_TRANSFER");
+                        await creditCustomer(s.customerId, remainingBT, 0, sale.id, "Balance due after bank transfer");
+                    }
+                } else if (pt === "CREDIT") {
+                    await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
+                } else if (pt === "PARTIAL") {
 					for (const leg of s.paymentLegs) {
 						const legMethod = String(leg.method).toUpperCase();
 						const legAmount = Number(leg.amount);
@@ -788,6 +798,7 @@ router.post("/", authenticate, async (req, res) => {
 		return res.status(400).json({ success: false, error: err.message });
 	}
 });
+
 
 
 
