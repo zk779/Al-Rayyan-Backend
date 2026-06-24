@@ -24,23 +24,33 @@ async function authenticate(req, res, next) {
 
 /* ======================= GET ALL VENDORS ======================= */
 router.get("/", authenticate, async (req, res) => {
-	try {
-		const { category, status, orderBy = "vendorDate", orderDir = "desc" } = req.query;
+    try {
+        // 1. Destructure 'search' from req.query
+        const { search, category, status, orderBy = "vendorDate", orderDir = "desc" } = req.query;
 
-		const vendors = await prisma.vendor.findMany({
-			where: {
-				...(category && { category }),
-				...(status !== undefined && { status: status === "true" }),
-			},
-			include: { account: { select: { balance: true } } },
-			orderBy: { [["createdAt", "vendorDate"].includes(orderBy) ? orderBy : "vendorDate"]: orderDir === "asc" ? "asc" : "desc" },
-		});
+        const vendors = await prisma.vendor.findMany({
+            where: {
+                ...(category && { category }),
+                ...(status !== undefined && { status: status === "true" }),
+                // 2. Add partial, case-insensitive search by name
+                ...(search && {
+                    vendorName: {
+                        contains: search,
+                        mode: "insensitive",
+                    },
+                }),
+            },
+            include: { account: { select: { balance: true } } },
+            orderBy: { 
+                [["createdAt", "vendorDate"].includes(orderBy) ? orderBy : "vendorDate"]: orderDir === "asc" ? "asc" : "desc" 
+            },
+        });
 
-		res.json({ success: true, data: vendors });
-	} catch (err) {
-		console.error(err);
-		res.status(500).json({ success: false, error: "Failed to fetch vendors" });
-	}
+        res.json({ success: true, data: vendors });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, error: "Failed to fetch vendors" });
+    }
 });
 
 /* ======================= GET VENDOR BY ID ======================= */

@@ -24,23 +24,33 @@ async function authenticate(req, res, next) {
 
 /* ======================= GET ALL CUSTOMERS ======================= */
 router.get("/", authenticate, async (req, res) => {
-	try {
-		const { customerType, isActive, orderBy = "customerDate", orderDir = "desc" } = req.query;
+    try {
+        // 1. Destructure 'search' from req.query
+        const { search, customerType, isActive, orderBy = "customerDate", orderDir = "desc" } = req.query;
 
-		const customers = await prisma.customer.findMany({
-			where: {
-				...(customerType && { customerType: String(customerType) }),
-				...(isActive !== undefined && { isActive: isActive === "true" }),
-			},
-			include: { account: { select: { balance: true } } },
-			orderBy: { [["customerDate", "createdAt"].includes(orderBy) ? orderBy : "customerDate"]: orderDir === "asc" ? "asc" : "desc" },
-		});
+        const customers = await prisma.customer.findMany({
+            where: {
+                ...(customerType && { customerType: String(customerType) }),
+                ...(isActive !== undefined && { isActive: isActive === "true" }),
+                // 2. Add partial, case-insensitive search by name
+                ...(search && {
+                    customerName: {
+                        contains: search,
+                        mode: "insensitive",
+                    },
+                }),
+            },
+            include: { account: { select: { balance: true } } },
+            orderBy: { 
+                [["customerDate", "createdAt"].includes(orderBy) ? orderBy : "customerDate"]: orderDir === "asc" ? "asc" : "desc" 
+            },
+        });
 
-		res.json({ success: true, data: customers });
-	} catch (err) {
-		console.error(err);
-		res.status(500).json({ success: false, error: "Failed to fetch customers" });
-	}
+        res.json({ success: true, data: customers });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, error: "Failed to fetch customers" });
+    }
 });
 
 /* ======================= GET CUSTOMER BY ID ======================= */

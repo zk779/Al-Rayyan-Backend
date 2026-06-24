@@ -66,6 +66,11 @@ enum PaymentStatus {
 	PAID
 }
 
+enum PartyType {
+	VENDOR
+	CUSTOMER
+}
+
 // ===========================
 // AUTH / RBAC
 // ===========================
@@ -199,11 +204,14 @@ model LedgerEntry {
 	credit Float @default(0)
 
 	// References — only ONE should be populated per entry
-	saleId        String? @db.ObjectId
-	invoiceId     String? @db.ObjectId
-	paymentId     String? @db.ObjectId  // links to SalePayment.id for partial legs
-	expenseId     String? @db.ObjectId
-	refundId      String? @db.ObjectId
+	saleId                  String? @db.ObjectId
+	invoiceId               String? @db.ObjectId
+	paymentId               String? @db.ObjectId  // links to SalePayment.id for partial legs
+	expenseId               String? @db.ObjectId
+	refundId                String? @db.ObjectId
+	vendorCustomerPaymentId String? @db.ObjectId   // links to VendorCustomerPayment.id
+
+	vendorCustomerPayment VendorCustomerPayment? @relation(fields: [vendorCustomerPaymentId], references: [id])
 
 	remarks String?
 
@@ -218,6 +226,7 @@ model LedgerEntry {
 	@@index([saleId])
 	@@index([paymentId])
 	@@index([refundId])
+	@@index([vendorCustomerPaymentId])
 	@@index([transactionDate])
 	@@index([createdAt])
 }
@@ -242,7 +251,8 @@ model Vendor {
 	createdAt      DateTime        @default(now())
 	updatedAt      DateTime        @updatedAt
 
-	sales Sale[]
+	sales    Sale[]
+	payments VendorCustomerPayment[]
 
 	@@index([vendorDate])
 	@@index([createdAt])
@@ -271,6 +281,7 @@ model Customer {
 
 	sales        Sale[]
 	salePayments SalePayment[]
+	payments     VendorCustomerPayment[]
 
 	@@index([customerName])
 	@@index([phone])
@@ -296,8 +307,9 @@ model Bank {
 	createdAt      DateTime @default(now())
 	updatedAt      DateTime @updatedAt
 
-	sales        Sale[]
-	salePayments SalePayment[]
+	sales                  Sale[]
+	salePayments           SalePayment[]
+	vendorCustomerPayments VendorCustomerPayment[]
 
 	@@index([bankDate])
 	@@index([createdAt])
@@ -462,5 +474,55 @@ model Refund {
 	@@index([saleId])
 	@@index([status])
 	@@index([refundDate])
+	@@index([createdAt])
+}
+
+// ===========================
+// VENDOR / CUSTOMER PAYMENT
+// One row per payment transaction (NOT per leg, unlike SalePayment).
+// - method = CASH          -> only the vendor/customer account leg posts (1 LedgerEntry)
+// - method = BANK_TRANSFER -> vendor/customer leg AND bank leg both post (2 LedgerEntry rows)
+// Exactly one of vendorId / customerId must be populated (driven by partyType).
+// ===========================
+
+model VendorCustomerPayment {
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+
+	partyType PartyType // VENDOR | CUSTOMER — tells you which relation below is populated
+
+	// Populated when partyType = VENDOR
+	vendorId String? @db.ObjectId
+	vendor   Vendor? @relation(fields: [vendorId], references: [id])
+
+	// Populated when partyType = CUSTOMER
+	customerId String?   @db.ObjectId
+	customer   Customer? @relation(fields: [customerId], references: [id])
+
+	method PaymentType // CASH | BANK_TRANSFER only (never CREDIT / PARTIAL here)
+	amount Float
+
+	// Populated only when method = BANK_TRANSFER
+	bankId String? @db.ObjectId
+	bank   Bank?   @relation(fields: [bankId], references: [id])
+
+	// Cloudinary URL only — actual file lives on Cloudinary, not in Mongo
+	attachmentUrl String?
+
+	remarks String?
+
+	// Business / accounting date — user-selected on the payment form
+	transactionDate DateTime
+
+	// System date — auto, immutable
+	createdAt DateTime @default(now())
+
+	// Resulting ledger rows (1 for CASH, 2 for BANK_TRANSFER) — handy for audits/reversals
+	ledgerEntries LedgerEntry[]
+
+	@@index([partyType])
+	@@index([vendorId])
+	@@index([customerId])
+	@@index([bankId])
+	@@index([transactionDate])
 	@@index([createdAt])
 }
