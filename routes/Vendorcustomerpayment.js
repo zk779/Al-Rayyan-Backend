@@ -195,10 +195,10 @@ router.post("/", async (req, res) => {
 
         if (method === "BANK_TRANSFER") {
             if (partyType === "VENDOR") {
-                bankLegCredit = amount;
+                bankLegDebit = amount;    // Money leaves bank → Debit
                 bankBalanceDelta = -amount;
             } else {
-                bankLegDebit = amount;
+                bankLegCredit = amount;   // Money enters bank → Credit
                 bankBalanceDelta = amount;
             }
         }
