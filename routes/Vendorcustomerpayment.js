@@ -139,6 +139,7 @@ router.post("/", async (req, res) => {
         }
 
         // ---- Load the bank if relevant ----
+        // ---- Load the bank if relevant ----
         let bank = null;
         if (method === "BANK_TRANSFER") {
             bank = await prisma.bank.findUnique({
@@ -151,6 +152,13 @@ router.post("/", async (req, res) => {
 
             if (!bank.isActive)
                 return res.status(400).json({ success: false, error: "Bank account is inactive" });
+
+            // ✅ Add this block
+            if (partyType === "VENDOR" && amount > bank.account.balance)
+                return res.status(400).json({
+                    success: false,
+                    error: `Insufficient bank balance. Trying to pay ${amount} but bank only has ${bank.account.balance} available.`,
+                });
         }
 
         // ---- Determine ledger direction + enforce balance cap rules ----
