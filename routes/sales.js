@@ -708,8 +708,8 @@ router.post("/", authenticate, async (req, res) => {
 					data: {
 						accountId: vendor.account.id,
 						entryType: "SALE",
-						debit: isDebitVendor ? net : 0,
-						credit: isDebitVendor ? 0 : net,
+						debit: 0,
+						credit: isDebitVendor ? net : 0,
 						transactionDate: businessDate,
 						saleId: sale.id,
 						invoiceId: invoice.id,
@@ -798,8 +798,6 @@ router.post("/", authenticate, async (req, res) => {
 });
 
 
-
-
 router.put("/:invoiceId", authenticate, async (req, res) => {
 	const { invoiceId } = req.params;
 	const { invoiceNo, saleDate, sales = [] } = req.body;
@@ -817,12 +815,12 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			include: {
 				sales: {
 					include: {
-						vendor:   { include: { account: true } },
+						vendor: { include: { account: true } },
 						customer: { include: { account: true } },
-						bank:     { include: { account: true } },
+						bank: { include: { account: true } },
 						payments: {                              // SalePayment legs
 							include: {
-								bank:     { include: { account: true } },
+								bank: { include: { account: true } },
 								customer: { include: { account: true } },
 							},
 						},
@@ -838,7 +836,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		const saleMap = new Map(existingInvoice.sales.map(s => [s.id, s]));
 
 		for (const s of sales) {
-			if (!s.id)              throw new Error("Each sale must include 'id'");
+			if (!s.id) throw new Error("Each sale must include 'id'");
 			if (!saleMap.has(s.id)) throw new Error(`Sale not found in invoice: ${s.id}`);
 		}
 
@@ -846,34 +844,34 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		   2️⃣  DELETED SALES (omitted from payload)
 		====================================================== */
 		const payloadSaleIds = new Set(sales.map(s => s.id));
-		const deletedSales   = existingInvoice.sales.filter(s => !payloadSaleIds.has(s.id));
+		const deletedSales = existingInvoice.sales.filter(s => !payloadSaleIds.has(s.id));
 
 		/* ======================================================
 		   3️⃣  PRE-LOAD ALL VENDORS / CUSTOMERS / BANKS
 		====================================================== */
-		const vendorIdSet   = new Set();
+		const vendorIdSet = new Set();
 		const customerIdSet = new Set();
-		const bankIdSet     = new Set();
+		const bankIdSet = new Set();
 
 		// Collect from existing sales (for reversal)
 		existingInvoice.sales.forEach(s => {
-			if (s.vendorId)   vendorIdSet.add(s.vendorId);
+			if (s.vendorId) vendorIdSet.add(s.vendorId);
 			if (s.customerId) customerIdSet.add(s.customerId);
-			if (s.bankId)     bankIdSet.add(s.bankId);
+			if (s.bankId) bankIdSet.add(s.bankId);
 			s.payments?.forEach(leg => {
 				if (leg.customerId) customerIdSet.add(leg.customerId);
-				if (leg.bankId)     bankIdSet.add(leg.bankId);
+				if (leg.bankId) bankIdSet.add(leg.bankId);
 			});
 		});
 
 		// Collect from incoming payload (for applying new entries)
 		sales.forEach(s => {
-			if (s.vendorId)   vendorIdSet.add(s.vendorId);
+			if (s.vendorId) vendorIdSet.add(s.vendorId);
 			if (s.customerId) customerIdSet.add(s.customerId);
-			if (s.bankId)     bankIdSet.add(s.bankId);
+			if (s.bankId) bankIdSet.add(s.bankId);
 			(s.paymentLegs || []).forEach(leg => {
 				if (leg.customerId) customerIdSet.add(leg.customerId);
-				if (leg.bankId)     bankIdSet.add(leg.bankId);
+				if (leg.bankId) bankIdSet.add(leg.bankId);
 			});
 		});
 
@@ -889,9 +887,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				: [],
 		]);
 
-		const vendorMap   = new Map(vendors.map(v   => [v.id, v]));
-		const customerMap = new Map(customers.map(c  => [c.id, c]));
-		const bankMap     = new Map(banks.map(b      => [b.id, b]));
+		const vendorMap = new Map(vendors.map(v => [v.id, v]));
+		const customerMap = new Map(customers.map(c => [c.id, c]));
+		const bankMap = new Map(banks.map(b => [b.id, b]));
 
 		const businessDate = saleDate ? new Date(saleDate) : new Date();
 
@@ -903,11 +901,11 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			/* ── Update invoice header ── */
 			await tx.salesInvoice.update({
 				where: { id: invoiceId },
-				data:  { invoiceNo, saleDate: businessDate },
+				data: { invoiceNo, saleDate: businessDate },
 			});
 
 			/* ── In-memory balance tracking ── */
-			const balances        = new Map();
+			const balances = new Map();
 			const touchedAccounts = new Set();
 
 			const seedBalance = (acc) => {
@@ -926,13 +924,13 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			});
 
 			// Seed from incoming (in case new entities are referenced)
-			vendors.forEach(v   => seedBalance(v.account));
+			vendors.forEach(v => seedBalance(v.account));
 			customers.forEach(c => seedBalance(c.account));
-			banks.forEach(b     => seedBalance(b.account));
+			banks.forEach(b => seedBalance(b.account));
 
-			const getBal = (id)     => balances.get(id) || 0;
-			const setBal = (id, v)  => { balances.set(id, Number(v)); touchedAccounts.add(id); };
-			const adjBal = (id, d)  => setBal(id, getBal(id) + d);
+			const getBal = (id) => balances.get(id) || 0;
+			const setBal = (id, v) => { balances.set(id, Number(v)); touchedAccounts.add(id); };
+			const adjBal = (id, d) => setBal(id, getBal(id) + d);
 
 			/* ══════════════════════════════════════════════════════
 			   HELPERS — mirror the POST helpers exactly
@@ -1003,10 +1001,10 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			   4.1  DELETE OMITTED SALES (full reversal)
 			══════════════════════════════════════════════════════ */
 			for (const sale of deletedSales) {
-				const net  = Number(sale.netPrice);
+				const net = Number(sale.netPrice);
 				const sell = Number(sale.sellPrice);
 				const paid = Number(sale.paidAmount || 0);
-				const pt   = String(sale.paymentType).toUpperCase();
+				const pt = String(sale.paymentType).toUpperCase();
 
 				// Vendor reversal
 				if (sale.vendor?.account) {
@@ -1054,27 +1052,27 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			for (const payload of sales) {
 				const current = saleMap.get(payload.id);
 
-				const oldNet  = Number(current.netPrice);
-				const newNet  = Number(payload.netPrice);
+				const oldNet = Number(current.netPrice);
+				const newNet = Number(payload.netPrice);
 				const oldSell = Number(current.sellPrice);
 				const newSell = Number(payload.sellPrice);
 				const oldPaid = Number(current.paidAmount || 0);
 				const newPaid = Number(payload.paidAmount || 0);
 
 				if (isNaN(newNet) || isNaN(newSell)) throw new Error("Invalid prices");
-				if (newNet < 0 || newSell < 0)       throw new Error("Prices cannot be negative");
+				if (newNet < 0 || newSell < 0) throw new Error("Prices cannot be negative");
 				if (newPaid < 0 || newPaid > newSell) throw new Error("Invalid paidAmount");
 
 				const oldPt = String(current.paymentType).toUpperCase();
 				const newPt = String(payload.paymentType || current.paymentType).toUpperCase();
 
-				const vendorChanged      = current.vendorId   !== payload.vendorId;
-				const customerChanged    = (current.customerId || null) !== (payload.customerId || null);
-				const bankChanged        = (current.bankId     || null) !== (payload.bankId     || null);
-				const netChanged         = oldNet  !== newNet;
-				const sellChanged        = oldSell !== newSell;
-				const paidChanged        = oldPaid !== newPaid;
-				const paymentTypeChanged = oldPt   !== newPt;
+				const vendorChanged = current.vendorId !== payload.vendorId;
+				const customerChanged = (current.customerId || null) !== (payload.customerId || null);
+				const bankChanged = (current.bankId || null) !== (payload.bankId || null);
+				const netChanged = oldNet !== newNet;
+				const sellChanged = oldSell !== newSell;
+				const paidChanged = oldPaid !== newPaid;
+				const paymentTypeChanged = oldPt !== newPt;
 
 				/* ── Validation ── */
 				if (newPt === "CREDIT" && !payload.customerId)
@@ -1117,7 +1115,8 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					await tx.ledgerEntry.create({
 						data: {
 							accountId: newVendor.account.id, entryType: "SALE",
-							debit: isDebit ? newNet : 0, credit: isDebit ? 0 : newNet,
+							debit: 0,
+							credit: newNet,
 							transactionDate: businessDate, saleId: current.id, invoiceId,
 							remarks: `Sale - Invoice ${invoiceNo}`,
 						},
@@ -1133,7 +1132,11 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					const isDebit = vendor.category === "DEBIT";
 					await tx.ledgerEntry.updateMany({
 						where: { saleId: current.id, accountId: vendor.account.id, entryType: "SALE" },
-						data:  { debit: isDebit ? newNet : 0, credit: isDebit ? 0 : newNet, transactionDate: businessDate },
+						data: {
+							debit: 0,
+							credit: newNet,
+							transactionDate: businessDate
+						},
 					});
 					adjBal(vendor.account.id, isDebit ? (newNet - oldNet) : -(newNet - oldNet));
 				}
@@ -1199,18 +1202,18 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 					else if (newPt === "PARTIAL") {
 						for (const leg of payload.paymentLegs) {
-							const lm        = String(leg.method).toUpperCase();
+							const lm = String(leg.method).toUpperCase();
 							const legAmount = Number(leg.amount);
 
 							// Persist SalePayment leg record
 							await tx.salePayment.create({
 								data: {
-									saleId:      current.id,
-									method:      lm,
-									amount:      legAmount,
-									bankId:      lm === "BANK_TRANSFER" ? (leg.bankId     || null) : null,
-									customerId:  lm === "CREDIT"        ? (leg.customerId || null) : null,
-									remarks:     leg.remarks || null,
+									saleId: current.id,
+									method: lm,
+									amount: legAmount,
+									bankId: lm === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+									customerId: lm === "CREDIT" ? (leg.customerId || null) : null,
+									remarks: leg.remarks || null,
 									paymentDate: businessDate,
 								},
 							});
@@ -1231,33 +1234,33 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				await tx.sale.update({
 					where: { id: current.id },
 					data: {
-						airlineId:     payload.airlineId,
-						vendorId:      payload.vendorId,
-						customerId:    (newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null,
-						bankId:        newPt === "BANK_TRANSFER" ? (payload.bankId     || null) : null,
-						documentNo:    payload.documentNo    || null,
-						pnr:           payload.pnr           ?? current.pnr,
-						routeType:     payload.routeType     ?? current.routeType,
-						tripType:      payload.tripType      ?? current.tripType,
+						airlineId: payload.airlineId,
+						vendorId: payload.vendorId,
+						customerId: (newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null,
+						bankId: newPt === "BANK_TRANSFER" ? (payload.bankId || null) : null,
+						documentNo: payload.documentNo || null,
+						pnr: payload.pnr ?? current.pnr,
+						routeType: payload.routeType ?? current.routeType,
+						tripType: payload.tripType ?? current.tripType,
 						departureDate: payload.departureDate ? new Date(payload.departureDate) : current.departureDate,
-						returnDate:    payload.returnDate    ? new Date(payload.returnDate)    : current.returnDate,
-						paxName:       payload.paxName       ?? current.paxName,
-						destinations:  payload.destinations  ?? current.destinations,
-						netPrice:      newNet,
-						sellPrice:     newSell,
-						profit:        newSell - newNet,
-						vatAmount:     Number(payload.vatAmount   || 0),
-						paxVat:        Number(payload.paxVat      || 0),
-						miscCharges:   Number(payload.miscCharges || 0),
-						paidAmount:    newPaid,
-						paymentType:   newPt,
+						returnDate: payload.returnDate ? new Date(payload.returnDate) : current.returnDate,
+						paxName: payload.paxName ?? current.paxName,
+						destinations: payload.destinations ?? current.destinations,
+						netPrice: newNet,
+						sellPrice: newSell,
+						profit: newSell - newNet,
+						vatAmount: Number(payload.vatAmount || 0),
+						paxVat: Number(payload.paxVat || 0),
+						miscCharges: Number(payload.miscCharges || 0),
+						paidAmount: newPaid,
+						paymentType: newPt,
 						paymentStatus: newPaid >= newSell ? "PAID" : newPaid > 0 ? "PARTIAL" : "DUE",
-						remarks:       payload.remarks || null,
+						remarks: payload.remarks || null,
 					},
 				});
 
-				totalNet    += newNet;
-				totalSell   += newSell;
+				totalNet += newNet;
+				totalSell += newSell;
 				totalProfit += newSell - newNet;
 			}
 
@@ -1267,7 +1270,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			for (const accId of touchedAccounts) {
 				await tx.account.update({
 					where: { id: accId },
-					data:  { balance: getBal(accId) },
+					data: { balance: getBal(accId) },
 				});
 			}
 
@@ -1276,7 +1279,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			══════════════════════════════════════════════════════ */
 			await tx.salesInvoice.update({
 				where: { id: invoiceId },
-				data:  { totalNet, totalSell, totalProfit },
+				data: { totalNet, totalSell, totalProfit },
 			});
 
 			return { invoiceId, deletedSalesCount: deletedSales.length };
@@ -1286,7 +1289,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		return res.json({
 			success: true,
 			message: "Invoice updated successfully",
-			data:    result,
+			data: result,
 		});
 
 	} catch (err) {
@@ -1294,7 +1297,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		return res.status(400).json({ success: false, error: err.message });
 	}
 });
-
 
 /* ======================= DELETE INVOICE ======================= */
 router.delete("/:invoiceId", authenticate, async (req, res) => {
