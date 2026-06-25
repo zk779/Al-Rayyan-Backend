@@ -709,7 +709,7 @@ router.post("/", authenticate, async (req, res) => {
 						accountId: vendor.account.id,
 						entryType: "SALE",
 						debit: 0,
-						credit: isDebitVendor ? net : 0,
+						credit: net,
 						transactionDate: businessDate,
 						saleId: sale.id,
 						invoiceId: invoice.id,
@@ -1402,7 +1402,7 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 			});
 		});
 
-		res.json({
+		res.json({ 
 			success: true,
 			message: "Invoice deleted successfully"
 		});

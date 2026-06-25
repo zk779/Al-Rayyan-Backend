@@ -138,8 +138,8 @@ router.post("/", authenticate, async (req, res) => {
 					data: {
 						accountId: account.id,
 						entryType: "OPENING_BALANCE",
-						debit: isDebit ? 0 : opening,
-						credit: isDebit ? opening : 0,
+						debit: isDebit ? opening : 0,
+						credit: isDebit ? 0 : opening,
 						transactionDate: businessDate,
 						remarks: "Opening balance",
 					},
@@ -225,8 +225,8 @@ router.put("/:id", authenticate, async (req, res) => {
 					await tx.ledgerEntry.update({
 						where: { id: openingEntry.id },
 						data: {
-							debit: isDebit ? 0 : newOpening,
-							credit: isDebit ? newOpening : 0,
+							debit: isDebit ? newOpening : 0,
+							credit: isDebit ? 0 : newOpening,
 							transactionDate: txDate,
 							remarks: categoryChanged ? "Opening balance - category updated" : "Opening balance updated",
 						},
@@ -237,8 +237,8 @@ router.put("/:id", authenticate, async (req, res) => {
 						data: {
 							accountId,
 							entryType: "OPENING_BALANCE",
-							debit: isDebit ? 0 : newOpening,
-							credit: isDebit ? newOpening : 0,
+							debit: isDebit ? newOpening : 0,
+							credit: isDebit ? 0 : newOpening,
 							transactionDate: txDate,
 							remarks: "Opening balance",
 						},
@@ -287,7 +287,6 @@ router.put("/:id", authenticate, async (req, res) => {
 		res.status(500).json({ success: false, error: "Failed to update vendor" });
 	}
 });
-
 /* ======================= DELETE VENDOR ======================= */
 router.delete("/:id", authenticate, async (req, res) => {
     try {
