@@ -122,8 +122,8 @@ router.post("/", authenticate, async (req, res) => {
 					data: {
 						accountId: account.id,
 						entryType: "OPENING_BALANCE",
-						debit: opening,
-						credit: 0,
+						debit: 0,
+						credit: opening,
 						transactionDate: businessDate,
 						remarks: "Opening balance",
 					},
@@ -205,8 +205,8 @@ router.put("/:id", authenticate, async (req, res) => {
 					await tx.ledgerEntry.update({
 						where: { id: existingEntry.id },
 						data: {
-							debit: newOpening,
-							credit: 0,
+							debit: 0,
+							credit: newOpening,
 							transactionDate: txDate,
 							remarks: "Opening balance updated",
 						},
@@ -216,8 +216,8 @@ router.put("/:id", authenticate, async (req, res) => {
 						data: {
 							accountId: bank.accountId,
 							entryType: "OPENING_BALANCE",
-							debit: newOpening,
-							credit: 0,
+							debit: 0,
+							credit: newOpening,
 							transactionDate: txDate,
 							remarks: "Opening balance",
 						},
@@ -256,7 +256,6 @@ router.put("/:id", authenticate, async (req, res) => {
 		res.status(500).json({ success: false, error: "Failed to update bank" });
 	}
 });
-
 /* ======================= DELETE BANK ======================= */
 router.delete("/:id", authenticate, async (req, res) => {
 	try {

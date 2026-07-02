@@ -407,12 +407,11 @@ router.put("/:id", async (req, res) => {
         return res.status(400).json({ success: false, error: "Bank account is inactive" });
     }
 
-    // ---- Reverse old ledger entries on the accounts ----
-    // We reverse the effect of the old payment, then re-apply with new values.
-    const oldPartyEntry = existing.ledgerEntries.find((e) => e.accountId === partyAccount.id);
-    const oldPartyDelta = (oldPartyEntry?.debit ?? 0) - (oldPartyEntry?.credit ?? 0); // net effect to reverse
-
-    // For bank: find old bank account ledger entry if old method was BANK_TRANSFER
+    // ---- Find old bank account/entry (needed only to reverse the BANK leg) ----
+    // NOTE: We do NOT reverse the party leg this way — partyBalanceDelta below is
+    // already the net shift from old amount -> new amount, computed directly from
+    // the party's category rules (same convention as the POST route). Reversing
+    // via old ledger debit/credit AND applying the delta would double-count.
     let oldBankAccount = null;
     let oldBankEntry = null;
     if (existing.method === "BANK_TRANSFER" && existing.bankId) {
@@ -424,13 +423,13 @@ router.put("/:id", async (req, res) => {
       oldBankEntry = existing.ledgerEntries.find((e) => e.accountId === oldBankAccount?.id);
     }
 
-    // ---- Recompute new ledger directions ----
+    // ---- Recompute new ledger directions (delta between old amount and new amount) ----
     let partyLegDebit = 0;
     let partyLegCredit = 0;
     let partyBalanceDelta = 0;
 
     if (partyType === "VENDOR" && vendor.category === "DEBIT") {
-      // Reverse old, check cap against restored balance
+      // Debit vendor: balance = amount still owed to vendor. Paying reduces it.
       const restoredBalance = partyAccount.balance + existing.amount; // balance before old payment
       if (newAmount > restoredBalance)
         return res.status(400).json({
@@ -439,12 +438,13 @@ router.put("/:id", async (req, res) => {
         });
 
       partyLegDebit = newAmount;
-      partyBalanceDelta = -(newAmount - existing.amount); // net shift from old to new
+      partyBalanceDelta = -(newAmount - existing.amount); // shift balance down by the change in payment
     } else if (partyType === "VENDOR" && vendor.category === "CREDIT") {
+      // Credit vendor: paying increases balance (amount we've advanced/credited them)
       partyLegDebit = newAmount;
       partyBalanceDelta = newAmount - existing.amount;
     } else if (partyType === "CUSTOMER") {
-      const restoredBalance = partyAccount.balance + existing.amount;
+      const restoredBalance = partyAccount.balance + existing.amount; // balance before old payment
       if (newAmount > restoredBalance)
         return res.status(400).json({
           success: false,
@@ -464,7 +464,7 @@ router.put("/:id", async (req, res) => {
         // Check bank has enough after reversing old bank debit
         const restoredBankBalance =
           oldBankAccount?.id === newBank.account.id
-            ? newBank.account.balance + existing.amount  // same bank: restore old debit first
+            ? newBank.account.balance + existing.amount // same bank: restore old debit first
             : newBank.account.balance;
 
         if (newAmount > restoredBankBalance)
@@ -481,13 +481,9 @@ router.put("/:id", async (req, res) => {
 
     // ---- Persist atomically ----
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Reverse old party account balance
-      await tx.account.update({
-        where: { id: partyAccount.id },
-        data: { balance: { increment: oldPartyDelta } }, // undo old net effect
-      });
-
-      // 2. Reverse old bank balance if old method was BANK_TRANSFER
+      // 1. Reverse old bank balance if old method was BANK_TRANSFER
+      //    (Bank leg uses full reverse + full reapply, unlike the party leg,
+      //    because it may move to a *different* bank account entirely.)
       if (existing.method === "BANK_TRANSFER" && oldBankAccount) {
         const oldBankDelta = (oldBankEntry?.debit ?? 0) - (oldBankEntry?.credit ?? 0);
         await tx.account.update({
@@ -496,10 +492,10 @@ router.put("/:id", async (req, res) => {
         });
       }
 
-      // 3. Delete old ledger entries
+      // 2. Delete old ledger entries
       await tx.ledgerEntry.deleteMany({ where: { vendorCustomerPaymentId: id } });
 
-      // 4. Update the payment record
+      // 3. Update the payment record
       const updated = await tx.vendorCustomerPayment.update({
         where: { id },
         data: {
@@ -512,7 +508,7 @@ router.put("/:id", async (req, res) => {
         },
       });
 
-      // 5. Apply new party balance + ledger entry
+      // 4. Apply party balance delta (net shift from old amount -> new amount) + ledger entry
       await tx.account.update({
         where: { id: partyAccount.id },
         data: { balance: { increment: partyBalanceDelta } },
@@ -530,11 +526,9 @@ router.put("/:id", async (req, res) => {
         },
       });
 
-      // 6. Apply new bank balance + ledger entry
+      // 5. Apply new bank balance + ledger entry
       if (newMethod === "BANK_TRANSFER") {
         const bankBalanceDelta = partyType === "VENDOR" ? -newAmount : newAmount;
-        // If old bank is different from new bank, new bank balance is untouched yet
-        // If same bank, we already reversed it above so apply fresh
         await tx.account.update({
           where: { id: newBank.account.id },
           data: { balance: { increment: bankBalanceDelta } },
@@ -573,7 +567,6 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-
 // ---- DELETE ----
 router.delete("/:id", async (req, res) => {
   try {
@@ -587,14 +580,17 @@ router.delete("/:id", async (req, res) => {
     if (!existing)
       return res.status(404).json({ success: false, error: "Payment not found" });
 
-    // ---- Load accounts to reverse balances ----
+    // ---- Load party account (+ vendor category, needed to know reversal direction) ----
     let partyAccount = null;
+    let vendorCategory = null;
+
     if (existing.partyType === "VENDOR") {
       const vendor = await prisma.vendor.findUnique({
         where: { id: existing.vendorId },
         include: { account: true },
       });
       partyAccount = vendor.account;
+      vendorCategory = vendor.category; // "DEBIT" | "CREDIT"
     } else {
       const customer = await prisma.customer.findUnique({
         where: { id: existing.customerId },
@@ -612,16 +608,33 @@ router.delete("/:id", async (req, res) => {
       bankAccount = bank?.account ?? null;
     }
 
+    // ---- Compute the correct reversal for the party leg ----
+    // This must mirror the ORIGINAL balance effect (from the POST route), negated.
+    // We can't safely derive this from (debit - credit) on the ledger entry, because
+    // that convention only lines up as the true negative of the balance effect for
+    // the bank leg — not for the party leg (CUSTOMER / VENDOR-CREDIT have the same
+    // sign as debit-credit, so using it directly would double the change instead of
+    // undoing it).
+    let partyReverseDelta = 0;
+    if (existing.partyType === "VENDOR" && vendorCategory === "DEBIT") {
+      // Original effect was -amount (payment reduced balance owed). Reverse = +amount.
+      partyReverseDelta = existing.amount;
+    } else if (existing.partyType === "VENDOR" && vendorCategory === "CREDIT") {
+      // Original effect was +amount. Reverse = -amount.
+      partyReverseDelta = -existing.amount;
+    } else if (existing.partyType === "CUSTOMER") {
+      // Original effect was -amount. Reverse = +amount.
+      partyReverseDelta = existing.amount;
+    }
+
     await prisma.$transaction(async (tx) => {
       // Reverse party account balance
-      const partyEntry = existing.ledgerEntries.find((e) => e.accountId === partyAccount.id);
-      const partyReverseDelta = (partyEntry?.debit ?? 0) - (partyEntry?.credit ?? 0);
       await tx.account.update({
         where: { id: partyAccount.id },
         data: { balance: { increment: partyReverseDelta } },
       });
 
-      // Reverse bank account balance
+      // Reverse bank account balance (debit - credit is the correct reversal here)
       if (bankAccount) {
         const bankEntry = existing.ledgerEntries.find((e) => e.accountId === bankAccount.id);
         const bankReverseDelta = (bankEntry?.debit ?? 0) - (bankEntry?.credit ?? 0);
