@@ -71,6 +71,20 @@ enum PartyType {
 	CUSTOMER
 }
 
+enum ExpenseCategory {
+	OFFICE_SUPPLIES
+	SALARY
+	TRAVEL
+	MARKETING
+	MEALS
+	TRAINING
+}
+
+enum ExpenseStatus {
+	APPROVED
+	REJECTED
+}
+
 // ===========================
 // AUTH / RBAC
 // ===========================
@@ -124,7 +138,7 @@ model Branch {
 	isActive  Boolean  @default(true)
 	createdAt DateTime @default(now())
 	updatedAt DateTime @updatedAt
-
+	expenses Expense[]
 	users User[]
 }
 
@@ -208,6 +222,7 @@ model LedgerEntry {
 	invoiceId               String? @db.ObjectId
 	paymentId               String? @db.ObjectId  // links to SalePayment.id for partial legs
 	expenseId               String? @db.ObjectId
+	expense                 Expense? @relation(fields: [expenseId], references: [id])
 	refundId                String? @db.ObjectId
 	vendorCustomerPaymentId String? @db.ObjectId   // links to VendorCustomerPayment.id
 
@@ -227,6 +242,7 @@ model LedgerEntry {
 	@@index([paymentId])
 	@@index([refundId])
 	@@index([vendorCustomerPaymentId])
+	@@index([expenseId])
 	@@index([transactionDate])
 	@@index([createdAt])
 }
@@ -310,6 +326,7 @@ model Bank {
 	sales                  Sale[]
 	salePayments           SalePayment[]
 	vendorCustomerPayments VendorCustomerPayment[]
+	expenses               Expense[]
 
 	@@index([bankDate])
 	@@index([createdAt])
@@ -524,5 +541,64 @@ model VendorCustomerPayment {
 	@@index([customerId])
 	@@index([bankId])
 	@@index([transactionDate])
+	@@index([createdAt])
+}
+
+// ===========================
+// EXPENSE
+// One row per expense transaction.
+//
+// - branchId is a PLAIN REFERENCE ONLY — it does NOT correspond to any Account
+//   record. Per-branch totals are computed on demand (e.g. groupBy branchId
+//   and sum amount), not tracked as a running balance.
+// - paymentMode = CASH          -> nothing posts to any account/ledger at all.
+//                                   The expense is just recorded.
+// - paymentMode = BANK_TRANSFER -> the bank account is debited (balance
+//                                   decreases) and exactly ONE LedgerEntry is
+//                                   created against the bank's Account.
+// - Only status = APPROVED expenses ever touch the bank balance / ledger.
+// ===========================
+
+model Expense {
+	id String @id @default(auto()) @map("_id") @db.ObjectId
+
+	// When the expense record itself was logged/created
+	date DateTime @default(now())
+
+	// Business/accounting date — this is what drives LedgerEntry.transactionDate
+	expenseDate DateTime
+
+	category ExpenseCategory
+
+	// Plain reference for reporting/aggregation only — no Account is tied to this.
+	branchId String @db.ObjectId
+	branch   Branch @relation(fields: [branchId], references: [id])
+
+	amount Float
+
+	// Default APPROVED — REJECTED expenses are recorded but never post to the ledger
+	status ExpenseStatus @default(APPROVED)
+
+	// CASH | BANK_TRANSFER only
+	paymentMode PaymentType
+
+	// Populated only when paymentMode = BANK_TRANSFER — this is the ONLY
+	// account ever affected by an expense.
+	bankId String? @db.ObjectId
+	bank   Bank?   @relation(fields: [bankId], references: [id])
+
+	description String?
+
+	ledgerEntries LedgerEntry[]
+
+	createdAt DateTime @default(now())
+	updatedAt DateTime @updatedAt
+
+	@@index([branchId])
+	@@index([category])
+	@@index([status])
+	@@index([paymentMode])
+	@@index([bankId])
+	@@index([expenseDate])
 	@@index([createdAt])
 }

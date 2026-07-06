@@ -140,6 +140,7 @@ router.post("/", authenticate, async (req, res) => {
 	}
 });
 
+
 /* ======================= UPDATE BANK ======================= */
 router.put("/:id", authenticate, async (req, res) => {
 	try {

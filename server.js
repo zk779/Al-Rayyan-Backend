@@ -20,6 +20,7 @@ import invoiceCounterRoutes from "./routes/invoiceCounter.js";
 import refundsRoutes from "./routes/refunds.js";
 import bankRoutes from "./routes/bankRoutes.js";
 import vendorCustomerPaymentRoutes from "./routes/Vendorcustomerpayment.js";
+import expenseRoutes from "./routes/expenseRoutes.js";
 
 dotenv.config();
 
@@ -83,6 +84,7 @@ app.use("/api/invoice", invoiceCounterRoutes);
 app.use("/api/refunds",refundsRoutes);
 app.use("/api/banks", bankRoutes);
 app.use("/api/payments/vendor-customer", vendorCustomerPaymentRoutes);
+app.use("/api/expenses", expenseRoutes);
 
 // Root Route
 app.get("/", (req, res) => {
