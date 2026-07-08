@@ -89,7 +89,7 @@ router.post("/", authenticate, async (req, res) => {
 		}
 
 		const type = String(customerType).toUpperCase();
-		if (!["WALK_IN", "CORPORATE"].includes(type)) {
+		if (!["WALK_IN", "CORPORATE" , "TABBY_OR_TAMARA"].includes(type)) {
 			return res.status(400).json({ success: false, error: "Invalid customer type" });
 		}
 

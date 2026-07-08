@@ -40,6 +40,7 @@ enum RefundStatus {
 enum CustomerType {
 	WALK_IN
 	CORPORATE
+	TABBY_OR_TAMARA
 }
 
 enum AccountType {
