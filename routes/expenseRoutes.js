@@ -28,6 +28,7 @@ router.post("/", async (req, res) => {
       status,
       paymentMode,
       bankId,
+      userId,
       description,
     } = req.body;
 
@@ -75,6 +76,19 @@ router.post("/", async (req, res) => {
         error: "bankId must not be set when paymentMode is CASH",
       });
 
+    // ---- category / userId consistency (SALARY requires an employee) ----
+    if (category === "SALARY" && !userId)
+      return res.status(400).json({
+        success: false,
+        error: "userId is required when category is SALARY",
+      });
+
+    if (category !== "SALARY" && userId)
+      return res.status(400).json({
+        success: false,
+        error: "userId must not be set when category is not SALARY",
+      });
+
     const parsedExpenseDate = new Date(expenseDate);
     if (isNaN(parsedExpenseDate.getTime()))
       return res
@@ -92,7 +106,16 @@ router.post("/", async (req, res) => {
     if (!branch.isActive)
       return res.status(400).json({ success: false, error: "Branch is inactive" });
 
-    // ---- Load + validate bank (only matters if it will actually post) ----
+    // ---- Validate user (only required/relevant when category is SALARY) ----
+    if (category === "SALARY") {
+      const user = await prisma.user.findUnique({ where: { id: userId } });
+      if (!user)
+        return res.status(404).json({ success: false, error: "User not found" });
+      if (!user.isActive)
+        return res.status(400).json({ success: false, error: "User is inactive" });
+    }
+
+    // ---- Load + validate bank (BANK_TRANSFER only — CASH attaches no account at all) ----
     let bank = null;
     if (paymentMode === "BANK_TRANSFER") {
       bank = await prisma.bank.findUnique({
@@ -124,28 +147,43 @@ router.post("/", async (req, res) => {
           status: newStatus,
           paymentMode,
           bankId: paymentMode === "BANK_TRANSFER" ? bankId : null,
+          userId: category === "SALARY" ? userId : null,
           description: description ?? null,
         },
       });
 
-      // Only APPROVED + BANK_TRANSFER expenses ever touch an account/ledger.
-      if (newStatus === "APPROVED" && paymentMode === "BANK_TRANSFER") {
-        await tx.account.update({
-          where: { id: bank.account.id },
-          data: { balance: { increment: -amount } },
-        });
+      if (newStatus === "APPROVED") {
+        if (paymentMode === "BANK_TRANSFER") {
+          // Only BANK_TRANSFER actually moves money out of an account.
+          await tx.account.update({
+            where: { id: bank.account.id },
+            data: { balance: { increment: -amount } },
+          });
 
-        await tx.ledgerEntry.create({
-          data: {
-            accountId: bank.account.id,
-            entryType: "EXPENSE",
-            debit: 0,
-            credit: amount,
-            expenseId: expense.id,
-            transactionDate: parsedExpenseDate,
-            remarks: description ?? null,
-          },
-        });
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: bank.account.id,
+              entryType: "EXPENSE",
+              debit: amount,
+              credit: 0,
+              expenseId: expense.id,
+              transactionDate: parsedExpenseDate,
+              remarks: description ?? null,
+            },
+          });
+        } else {
+          // CASH — record-only ledger entry, no account attached, no balance touched.
+          await tx.ledgerEntry.create({
+            data: {
+              entryType: "EXPENSE",
+              debit: amount,
+              credit: 0,
+              expenseId: expense.id,
+              transactionDate: parsedExpenseDate,
+              remarks: description ?? null,
+            },
+          });
+        }
       }
 
       return expense;
@@ -156,6 +194,7 @@ router.post("/", async (req, res) => {
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
     });
@@ -168,22 +207,24 @@ router.post("/", async (req, res) => {
 });
 
 // ---- GET ALL ----
-// Optional query filters: ?branchId=&category=&status=&paymentMode=
+// Optional query filters: ?branchId=&category=&status=&paymentMode=&userId=
 router.get("/", async (req, res) => {
   try {
-    const { branchId, category, status, paymentMode } = req.query;
+    const { branchId, category, status, paymentMode, userId } = req.query;
 
     const where = {};
     if (branchId) where.branchId = branchId;
     if (category) where.category = category;
     if (status) where.status = status;
     if (paymentMode) where.paymentMode = paymentMode;
+    if (userId) where.userId = userId;
 
     const expenses = await prisma.expense.findMany({
       where,
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
       orderBy: { expenseDate: "desc" },
@@ -206,6 +247,7 @@ router.get("/:id", async (req, res) => {
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
     });
@@ -261,9 +303,11 @@ router.get("/reports/by-branch", async (req, res) => {
 
 // ---- PUT (UPDATE) ----
 // Every transition (amount change, category/branch change, status flip,
-// CASH<->BANK_TRANSFER switch, bank switch) is handled by fully reversing
-// whatever the OLD state posted to the bank (if anything) and fully
-// re-applying whatever the NEW state should post (if anything).
+// CASH<->BANK_TRANSFER switch, bank switch, userId switch) fully reverses
+// whatever the OLD state posted and fully re-applies whatever the NEW state
+// should post. Ledger entries get recreated for both CASH and BANK_TRANSFER;
+// account BALANCE and accountId are only ever touched for BANK_TRANSFER —
+// CASH's ledger entry always has accountId: null.
 router.put("/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -276,6 +320,7 @@ router.put("/:id", async (req, res) => {
       status,
       paymentMode,
       bankId,
+      userId,
       description,
     } = req.body;
 
@@ -334,6 +379,7 @@ router.put("/:id", async (req, res) => {
     const newStatus = status ?? existing.status;
     const newPaymentMode = paymentMode ?? existing.paymentMode;
     const newBankId = bankId !== undefined ? bankId : existing.bankId;
+    const newUserId = userId !== undefined ? userId : existing.userId;
     const newDescription = description !== undefined ? description : existing.description;
     const newExpenseDate = expenseDate ? new Date(expenseDate) : existing.expenseDate;
     const newDate = date ? new Date(date) : existing.date;
@@ -351,6 +397,19 @@ router.put("/:id", async (req, res) => {
         error: "bankId must not be set when paymentMode is CASH",
       });
 
+    // ---- category / userId consistency (SALARY requires an employee) ----
+    if (newCategory === "SALARY" && !newUserId)
+      return res.status(400).json({
+        success: false,
+        error: "userId is required when category is SALARY",
+      });
+
+    if (newCategory !== "SALARY" && newUserId)
+      return res.status(400).json({
+        success: false,
+        error: "userId must not be set when category is not SALARY",
+      });
+
     const wasApproved = existing.status === "APPROVED";
     const willBeApproved = newStatus === "APPROVED";
 
@@ -363,7 +422,16 @@ router.put("/:id", async (req, res) => {
         return res.status(400).json({ success: false, error: "Branch is inactive" });
     }
 
-    // ---- Load OLD bank (needed to reverse its leg, if any) ----
+    // ---- Validate user if it changed (only relevant when category is SALARY) ----
+    if (newCategory === "SALARY" && newUserId !== existing.userId) {
+      const user = await prisma.user.findUnique({ where: { id: newUserId } });
+      if (!user)
+        return res.status(404).json({ success: false, error: "User not found" });
+      if (!user.isActive)
+        return res.status(400).json({ success: false, error: "User is inactive" });
+    }
+
+    // ---- Load OLD bank (only needed to reverse a BANK_TRANSFER balance leg) ----
     let oldBank = null;
     if (wasApproved && existing.paymentMode === "BANK_TRANSFER" && existing.bankId) {
       oldBank = await prisma.bank.findUnique({
@@ -372,7 +440,7 @@ router.put("/:id", async (req, res) => {
       });
     }
 
-    // ---- Load + validate NEW bank (needed if the new state posts a bank leg) ----
+    // ---- Load + validate NEW bank (needed if the new state posts a BANK_TRANSFER leg) ----
     let newBank = null;
     if (willBeApproved && newPaymentMode === "BANK_TRANSFER") {
       newBank = await prisma.bank.findUnique({
@@ -386,8 +454,9 @@ router.put("/:id", async (req, res) => {
       if (!newBank.isActive)
         return res.status(400).json({ success: false, error: "Bank account is inactive" });
 
-      // Sufficiency check — if it's the same bank as before (and it was already
-      // posting), restore its old debit first before comparing.
+      // Sufficiency check — only meaningful for BANK_TRANSFER since CASH never
+      // touches a balance. If it's the same bank as before (and it was already
+      // posting), restore its old debit first.
       const restoredBankBalance =
         oldBank?.id === newBank.id
           ? newBank.account.balance + existing.amount
@@ -401,17 +470,16 @@ router.put("/:id", async (req, res) => {
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      // ---- 1. Reverse the OLD bank leg, if any ----
-      if (oldBank) {
+      // ---- 1. Reverse the OLD balance leg — BANK_TRANSFER only ----
+      if (wasApproved && existing.paymentMode === "BANK_TRANSFER" && oldBank) {
         await tx.account.update({
           where: { id: oldBank.account.id },
           data: { balance: { increment: existing.amount } }, // undo the old -amount debit
         });
       }
 
-      // Old ledger entries are always cleared (there's at most one, and only
-      // if the old state was APPROVED + BANK_TRANSFER); recreated below only
-      // if the new state needs one.
+      // Old ledger entries are always cleared; recreated below if the new
+      // state needs one (CASH or BANK_TRANSFER).
       await tx.ledgerEntry.deleteMany({ where: { expenseId: id } });
 
       // ---- 2. Update the expense record ----
@@ -426,28 +494,43 @@ router.put("/:id", async (req, res) => {
           status: newStatus,
           paymentMode: newPaymentMode,
           bankId: newPaymentMode === "BANK_TRANSFER" ? newBankId : null,
+          userId: newCategory === "SALARY" ? newUserId : null,
           description: newDescription,
         },
       });
 
-      // ---- 3. Apply the NEW bank leg, if needed ----
-      if (willBeApproved && newPaymentMode === "BANK_TRANSFER" && newBank) {
-        await tx.account.update({
-          where: { id: newBank.account.id },
-          data: { balance: { increment: -newAmount } },
-        });
+      // ---- 3. Apply the NEW leg ----
+      if (willBeApproved) {
+        if (newPaymentMode === "BANK_TRANSFER") {
+          await tx.account.update({
+            where: { id: newBank.account.id },
+            data: { balance: { increment: -newAmount } },
+          });
 
-        await tx.ledgerEntry.create({
-          data: {
-            accountId: newBank.account.id,
-            entryType: "EXPENSE",
-            debit: 0,
-            credit: newAmount,
-            expenseId: id,
-            transactionDate: newExpenseDate,
-            remarks: newDescription ?? null,
-          },
-        });
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: newBank.account.id,
+              entryType: "EXPENSE",
+              debit: newAmount,
+              credit: 0,
+              expenseId: id,
+              transactionDate: newExpenseDate,
+              remarks: newDescription ?? null,
+            },
+          });
+        } else {
+          // CASH — record-only ledger entry, no account attached, no balance touched.
+          await tx.ledgerEntry.create({
+            data: {
+              entryType: "EXPENSE",
+              debit: newAmount,
+              credit: 0,
+              expenseId: id,
+              transactionDate: newExpenseDate,
+              remarks: newDescription ?? null,
+            },
+          });
+        }
       }
 
       return updated;
@@ -458,6 +541,7 @@ router.put("/:id", async (req, res) => {
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
     });
@@ -482,6 +566,8 @@ router.delete("/:id", async (req, res) => {
     if (!existing)
       return res.status(404).json({ success: false, error: "Expense not found" });
 
+    // Only a BANK_TRANSFER leg ever needs its balance reversed — CASH never
+    // touched any balance in the first place.
     let bank = null;
     if (existing.status === "APPROVED" && existing.paymentMode === "BANK_TRANSFER" && existing.bankId) {
       bank = await prisma.bank.findUnique({
@@ -491,7 +577,6 @@ router.delete("/:id", async (req, res) => {
     }
 
     await prisma.$transaction(async (tx) => {
-      // Reverse the bank leg, if any (this is the ONLY balance ever affected)
       if (bank) {
         await tx.account.update({
           where: { id: bank.account.id },

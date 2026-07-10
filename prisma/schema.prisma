@@ -1,10 +1,10 @@
 generator client {
-	provider = "prisma-client-js"
+    provider = "prisma-client-js"
 }
 
 datasource db {
-	provider = "mongodb"
-	url      = env("DATABASE_URL")
+    provider = "mongodb"
+    url      = env("DATABASE_URL")
 }
 
 // ===========================
@@ -12,78 +12,78 @@ datasource db {
 // ===========================
 
 enum VendorCategory {
-	CREDIT
-	DEBIT
+    CREDIT
+    DEBIT
 }
 
 enum PaymentType {
-	CASH
-	CREDIT
-	BANK_TRANSFER
-	PARTIAL
+    CASH
+    CREDIT
+    BANK_TRANSFER
+    PARTIAL
 }
 
 enum SaleStatus {
-	PENDING
-	COMPLETED
-	CANCELLED
-	REFUNDED
+    PENDING
+    COMPLETED
+    CANCELLED
+    REFUNDED
 }
 
 enum RefundStatus {
-	PENDING
-	APPROVED
-	REJECTED
-	COMPLETED
+    PENDING
+    APPROVED
+    REJECTED
+    COMPLETED
 }
 
 enum CustomerType {
-	WALK_IN
-	CORPORATE
-	TABBY_OR_TAMARA
+    WALK_IN
+    CORPORATE
+    TABBY_OR_TAMARA
 }
 
 enum AccountType {
-	CUSTOMER
-	VENDOR
-	CASH
-	BANK
-	EXPENSE
-	INCOME
+    CUSTOMER
+    VENDOR
+    CASH
+    BANK
+    EXPENSE
+    INCOME
 }
 
 enum LedgerEntryType {
-	OPENING_BALANCE
-	SALE
-	PAYMENT
-	REFUND
-	EXPENSE
-	ADJUSTMENT
+    OPENING_BALANCE
+    SALE
+    PAYMENT
+    REFUND
+    EXPENSE
+    ADJUSTMENT
 }
 
 enum PaymentStatus {
-	DUE
-	PARTIAL
-	PAID
+    DUE
+    PARTIAL
+    PAID
 }
 
 enum PartyType {
-	VENDOR
-	CUSTOMER
+    VENDOR
+    CUSTOMER
 }
 
 enum ExpenseCategory {
-	OFFICE_SUPPLIES
-	SALARY
-	TRAVEL
-	MARKETING
-	MEALS
-	TRAINING
+    OFFICE_SUPPLIES
+    SALARY
+    TRAVEL
+    MARKETING
+    MEALS
+    TRAINING
 }
 
 enum ExpenseStatus {
-	APPROVED
-	REJECTED
+    APPROVED
+    REJECTED
 }
 
 // ===========================
@@ -91,36 +91,36 @@ enum ExpenseStatus {
 // ===========================
 
 model Permission {
-	id          String   @id @default(auto()) @map("_id") @db.ObjectId
-	name        String   @unique
-	description String?
-	createdAt   DateTime @default(now())
-	updatedAt   DateTime @updatedAt
+    id          String   @id @default(auto()) @map("_id") @db.ObjectId
+    name        String   @unique
+    description String?
+    createdAt   DateTime @default(now())
+    updatedAt   DateTime @updatedAt
 
-	roleLinks RolePermission[]
+    roleLinks RolePermission[]
 }
 
 model Role {
-	id          String   @id @default(auto()) @map("_id") @db.ObjectId
-	name        String   @unique
-	description String?
-	isActive    Boolean  @default(true)
-	createdAt   DateTime @default(now())
-	updatedAt   DateTime @updatedAt
+    id          String   @id @default(auto()) @map("_id") @db.ObjectId
+    name        String   @unique
+    description String?
+    isActive    Boolean  @default(true)
+    createdAt   DateTime @default(now())
+    updatedAt   DateTime @updatedAt
 
-	users           User[]
-	permissionLinks RolePermission[]
+    users           User[]
+    permissionLinks RolePermission[]
 }
 
 model RolePermission {
-	id           String @id @default(auto()) @map("_id") @db.ObjectId
-	roleId       String @db.ObjectId
-	permissionId String @db.ObjectId
+    id           String @id @default(auto()) @map("_id") @db.ObjectId
+    roleId       String @db.ObjectId
+    permissionId String @db.ObjectId
 
-	role       Role       @relation(fields: [roleId], references: [id])
-	permission Permission @relation(fields: [permissionId], references: [id])
+    role       Role       @relation(fields: [roleId], references: [id])
+    permission Permission @relation(fields: [permissionId], references: [id])
 
-	@@unique([roleId, permissionId])
+    @@unique([roleId, permissionId])
 }
 
 // ===========================
@@ -128,39 +128,40 @@ model RolePermission {
 // ===========================
 
 model Branch {
-	id        String   @id @default(auto()) @map("_id") @db.ObjectId
-	name      String
-	code      String   @unique
-	address   String?
-	city      String?
-	country   String?
-	phone     String?
-	email     String?
-	isActive  Boolean  @default(true)
-	createdAt DateTime @default(now())
-	updatedAt DateTime @updatedAt
-	expenses Expense[]
-	users User[]
+    id        String    @id @default(auto()) @map("_id") @db.ObjectId
+    name      String
+    code      String    @unique
+    address   String?
+    city      String?
+    country   String?
+    phone     String?
+    email     String?
+    isActive  Boolean   @default(true)
+    createdAt DateTime  @default(now())
+    updatedAt DateTime  @updatedAt
+    expenses  Expense[]
+    users     User[]
 }
 
 model User {
-	id        String   @id @default(auto()) @map("_id") @db.ObjectId
-	fullName  String
-	email     String   @unique
-	password  String
-	phone     String?
-	isActive  Boolean  @default(true)
-	createdAt DateTime @default(now())
-	updatedAt DateTime @updatedAt
+    id        String   @id @default(auto()) @map("_id") @db.ObjectId
+    fullName  String
+    email     String   @unique
+    password  String
+    phone     String?
+    isActive  Boolean  @default(true)
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-	roleId   String? @db.ObjectId
-	branchId String? @db.ObjectId
+    roleId   String? @db.ObjectId
+    branchId String? @db.ObjectId
 
-	role   Role?   @relation(fields: [roleId], references: [id])
-	branch Branch? @relation(fields: [branchId], references: [id])
+    role   Role?   @relation(fields: [roleId], references: [id])
+    branch Branch? @relation(fields: [branchId], references: [id])
 
-	salesInvoices SalesInvoice[]
-	refunds       Refund[]
+    salesInvoices SalesInvoice[]
+    refunds       Refund[]
+    expenses      Expense[]
 }
 
 // ===========================
@@ -168,17 +169,17 @@ model User {
 // ===========================
 
 model AirlineCode {
-	id                String   @id @default(auto()) @map("_id") @db.ObjectId
-	airlineName       String
-	iataName          String?  @unique
-	airlineCode       String?  @unique
-	icao_code         String?
-	country_territory String?
-	status            Boolean  @default(true)
-	createdAt         DateTime @default(now())
-	updatedAt         DateTime @updatedAt
+    id                String   @id @default(auto()) @map("_id") @db.ObjectId
+    airlineName       String
+    iataName          String?  @unique
+    airlineCode       String?  @unique
+    icao_code         String?
+    country_territory String?
+    status            Boolean  @default(true)
+    createdAt         DateTime @default(now())
+    updatedAt         DateTime @updatedAt
 
-	sales Sale[]
+    sales Sale[]
 }
 
 // ===========================
@@ -186,22 +187,22 @@ model AirlineCode {
 // ===========================
 
 model Account {
-	id          String      @id @default(auto()) @map("_id") @db.ObjectId
-	name        String
-	type        AccountType
-	referenceId String?     @db.ObjectId // vendorId / customerId / bankId
-	balance     Float       @default(0)
-	isActive    Boolean     @default(true)
-	createdAt   DateTime    @default(now())
-	updatedAt   DateTime    @updatedAt
+    id          String      @id @default(auto()) @map("_id") @db.ObjectId
+    name        String
+    type        AccountType
+    referenceId String?     @db.ObjectId // vendorId / customerId / bankId
+    balance     Float       @default(0)
+    isActive    Boolean     @default(true)
+    createdAt   DateTime    @default(now())
+    updatedAt   DateTime    @updatedAt
 
-	entries   LedgerEntry[]
-	vendors   Vendor[]
-	customers Customer[]
-	banks     Bank[]
+    entries   LedgerEntry[]
+    vendors   Vendor[]
+    customers Customer[]
+    banks     Bank[]
 
-	@@index([type])
-	@@index([referenceId])
+    @@index([type])
+    @@index([referenceId])
 }
 
 // ===========================
@@ -209,43 +210,43 @@ model Account {
 // ===========================
 
 model LedgerEntry {
-	id        String          @id @default(auto()) @map("_id") @db.ObjectId
-	accountId String          @db.ObjectId
-	account   Account         @relation(fields: [accountId], references: [id])
+    id        String  @id @default(auto()) @map("_id") @db.ObjectId
+    accountId String?  @db.ObjectId
+    account   Account? @relation(fields: [accountId], references: [id])
 
-	entryType LedgerEntryType
+    entryType LedgerEntryType
 
-	debit  Float @default(0)
-	credit Float @default(0)
+    debit  Float @default(0)
+    credit Float @default(0)
 
-	// References — only ONE should be populated per entry
-	saleId                  String? @db.ObjectId
-	invoiceId               String? @db.ObjectId
-	paymentId               String? @db.ObjectId  // links to SalePayment.id for partial legs
-	expenseId               String? @db.ObjectId
-	expense                 Expense? @relation(fields: [expenseId], references: [id])
-	refundId                String? @db.ObjectId
-	vendorCustomerPaymentId String? @db.ObjectId   // links to VendorCustomerPayment.id
+    // References — only ONE should be populated per entry
+    saleId                  String?  @db.ObjectId
+    invoiceId               String?  @db.ObjectId
+    paymentId               String?  @db.ObjectId // links to SalePayment.id for partial legs
+    expenseId               String?  @db.ObjectId
+    expense                 Expense? @relation(fields: [expenseId], references: [id])
+    refundId                String?  @db.ObjectId
+    vendorCustomerPaymentId String?  @db.ObjectId // links to VendorCustomerPayment.id
 
-	vendorCustomerPayment VendorCustomerPayment? @relation(fields: [vendorCustomerPaymentId], references: [id])
+    vendorCustomerPayment VendorCustomerPayment? @relation(fields: [vendorCustomerPaymentId], references: [id])
 
-	remarks String?
+    remarks String?
 
-	// Business / accounting date (user-controlled)
-	transactionDate DateTime
+    // Business / accounting date (user-controlled)
+    transactionDate DateTime
 
-	// System date (auto, immutable)
-	createdAt DateTime @default(now())
+    // System date (auto, immutable)
+    createdAt DateTime @default(now())
 
-	@@index([accountId])
-	@@index([entryType])
-	@@index([saleId])
-	@@index([paymentId])
-	@@index([refundId])
-	@@index([vendorCustomerPaymentId])
-	@@index([expenseId])
-	@@index([transactionDate])
-	@@index([createdAt])
+    @@index([accountId])
+    @@index([entryType])
+    @@index([saleId])
+    @@index([paymentId])
+    @@index([refundId])
+    @@index([vendorCustomerPaymentId])
+    @@index([expenseId])
+    @@index([transactionDate])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -253,26 +254,26 @@ model LedgerEntry {
 // ===========================
 
 model Vendor {
-	id             String          @id @default(auto()) @map("_id") @db.ObjectId
-	vendorName     String
-	category       VendorCategory
-	vendorType     String?
-	email          String?
-	phone          String?
-	address        String?
-	accountId      String          @db.ObjectId
-	account        Account         @relation(fields: [accountId], references: [id])
-	openingBalance Float?
-	status         Boolean         @default(true)
-	vendorDate     DateTime
-	createdAt      DateTime        @default(now())
-	updatedAt      DateTime        @updatedAt
+    id             String         @id @default(auto()) @map("_id") @db.ObjectId
+    vendorName     String
+    category       VendorCategory
+    vendorType     String?
+    email          String?
+    phone          String?
+    address        String?
+    accountId      String         @db.ObjectId
+    account        Account        @relation(fields: [accountId], references: [id])
+    openingBalance Float?
+    status         Boolean        @default(true)
+    vendorDate     DateTime
+    createdAt      DateTime       @default(now())
+    updatedAt      DateTime       @updatedAt
 
-	sales    Sale[]
-	payments VendorCustomerPayment[]
+    sales    Sale[]
+    payments VendorCustomerPayment[]
 
-	@@index([vendorDate])
-	@@index([createdAt])
+    @@index([vendorDate])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -280,30 +281,30 @@ model Vendor {
 // ===========================
 
 model Customer {
-	id             String       @id @default(auto()) @map("_id") @db.ObjectId
-	customerName   String
-	customerType   CustomerType
-	customerVatId  String?
-	contactPerson  String
-	phone          String
-	email          String?
-	address        String?
-	openingBalance Float        @default(0.00)
-	accountId      String       @db.ObjectId
-	account        Account      @relation(fields: [accountId], references: [id])
-	isActive       Boolean      @default(true)
-	customerDate   DateTime
-	createdAt      DateTime     @default(now())
-	updatedAt      DateTime     @updatedAt
+    id             String       @id @default(auto()) @map("_id") @db.ObjectId
+    customerName   String
+    customerType   CustomerType
+    customerVatId  String?
+    contactPerson  String
+    phone          String
+    email          String?
+    address        String?
+    openingBalance Float        @default(0.00)
+    accountId      String       @db.ObjectId
+    account        Account      @relation(fields: [accountId], references: [id])
+    isActive       Boolean      @default(true)
+    customerDate   DateTime
+    createdAt      DateTime     @default(now())
+    updatedAt      DateTime     @updatedAt
 
-	sales        Sale[]
-	salePayments SalePayment[]
-	payments     VendorCustomerPayment[]
+    sales        Sale[]
+    salePayments SalePayment[]
+    payments     VendorCustomerPayment[]
 
-	@@index([customerName])
-	@@index([phone])
-	@@index([customerDate])
-	@@index([createdAt])
+    @@index([customerName])
+    @@index([phone])
+    @@index([customerDate])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -311,26 +312,26 @@ model Customer {
 // ===========================
 
 model Bank {
-	id             String   @id @default(auto()) @map("_id") @db.ObjectId
-	bankName       String
-	accountNumber  String   @unique
-	branchName     String?
-	swiftCode      String?
-	openingBalance Float    @default(0)
-	accountId      String   @db.ObjectId
-	account        Account  @relation(fields: [accountId], references: [id])
-	isActive       Boolean  @default(true)
-	bankDate       DateTime
-	createdAt      DateTime @default(now())
-	updatedAt      DateTime @updatedAt
+    id             String   @id @default(auto()) @map("_id") @db.ObjectId
+    bankName       String
+    accountNumber  String   @unique
+    branchName     String?
+    swiftCode      String?
+    openingBalance Float    @default(0)
+    accountId      String   @db.ObjectId
+    account        Account  @relation(fields: [accountId], references: [id])
+    isActive       Boolean  @default(true)
+    bankDate       DateTime
+    createdAt      DateTime @default(now())
+    updatedAt      DateTime @updatedAt
 
-	sales                  Sale[]
-	salePayments           SalePayment[]
-	vendorCustomerPayments VendorCustomerPayment[]
-	expenses               Expense[]
+    sales                  Sale[]
+    salePayments           SalePayment[]
+    vendorCustomerPayments VendorCustomerPayment[]
+    expenses               Expense[]
 
-	@@index([bankDate])
-	@@index([createdAt])
+    @@index([bankDate])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -338,28 +339,28 @@ model Bank {
 // ===========================
 
 model InvoiceCounter {
-	id            String   @id @default(auto()) @map("_id") @db.ObjectId
-	key           String   @unique
-	currentNumber Int      @default(0)
-	updatedAt     DateTime @updatedAt
+    id            String   @id @default(auto()) @map("_id") @db.ObjectId
+    key           String   @unique
+    currentNumber Int      @default(0)
+    updatedAt     DateTime @updatedAt
 }
 
 model SalesInvoice {
-	id          String   @id @default(auto()) @map("_id") @db.ObjectId
-	invoiceNo   String   @unique
-	saleDate    DateTime @default(now())
-	userId      String   @db.ObjectId
-	user        User     @relation(fields: [userId], references: [id])
-	totalNet    Float    @default(0)
-	totalSell   Float    @default(0)
-	totalProfit Float    @default(0)
-	createdAt   DateTime @default(now())
-	updatedAt   DateTime @updatedAt
+    id          String   @id @default(auto()) @map("_id") @db.ObjectId
+    invoiceNo   String   @unique
+    saleDate    DateTime @default(now())
+    userId      String   @db.ObjectId
+    user        User     @relation(fields: [userId], references: [id])
+    totalNet    Float    @default(0)
+    totalSell   Float    @default(0)
+    totalProfit Float    @default(0)
+    createdAt   DateTime @default(now())
+    updatedAt   DateTime @updatedAt
 
-	sales Sale[]
+    sales Sale[]
 
-	@@index([saleDate])
-	@@index([createdAt])
+    @@index([saleDate])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -367,58 +368,58 @@ model SalesInvoice {
 // ===========================
 
 model Sale {
-	id        String @id @default(auto()) @map("_id") @db.ObjectId
-	invoiceId String @db.ObjectId
-	airlineId String @db.ObjectId
-	vendorId  String @db.ObjectId
-	customerId String? @db.ObjectId
+    id         String  @id @default(auto()) @map("_id") @db.ObjectId
+    invoiceId  String  @db.ObjectId
+    airlineId  String  @db.ObjectId
+    vendorId   String  @db.ObjectId
+    customerId String? @db.ObjectId
 
-	// Flight details
-	pnr           String?
-	documentNo    String?
-	routeType     String?
-	tripType      String?   @default("Oneway")
-	departureDate DateTime?
-	returnDate    DateTime?
+    // Flight details
+    pnr           String?
+    documentNo    String?
+    routeType     String?
+    tripType      String?   @default("Oneway")
+    departureDate DateTime?
+    returnDate    DateTime?
 
-	// Bank — populated when paymentType is BANK_TRANSFER (single payment)
-	// For PARTIAL payments the legs live in SalePayment; leave this null
-	bankId String? @db.ObjectId
-	bank   Bank?   @relation(fields: [bankId], references: [id])
+    // Bank — populated when paymentType is BANK_TRANSFER (single payment)
+    // For PARTIAL payments the legs live in SalePayment; leave this null
+    bankId String? @db.ObjectId
+    bank   Bank?   @relation(fields: [bankId], references: [id])
 
-	// Pricing & taxes
-	netPrice     Float
-	sellPrice    Float
-	profit       Float
-	paxVat       Float? @default(0)
-	vatAmount    Float? @default(0)
-	miscCharges  Float? @default(0)
+    // Pricing & taxes
+    netPrice    Float
+    sellPrice   Float
+    profit      Float
+    paxVat      Float? @default(0)
+    vatAmount   Float? @default(0)
+    miscCharges Float? @default(0)
 
-	// Payment & status
-	paymentType   PaymentType
-	paymentStatus PaymentStatus @default(DUE)
-	paidAmount    Float         @default(0)
+    // Payment & status
+    paymentType   PaymentType
+    paymentStatus PaymentStatus @default(DUE)
+    paidAmount    Float         @default(0)
 
-	remarks      String?
-	status       SaleStatus @default(PENDING)
-	paxName      String?
-	destinations Json?
+    remarks      String?
+    status       SaleStatus @default(PENDING)
+    paxName      String?
+    destinations Json?
 
-	// Relations
-	invoice  SalesInvoice @relation(fields: [invoiceId], references: [id])
-	airline  AirlineCode  @relation(fields: [airlineId], references: [id])
-	vendor   Vendor       @relation(fields: [vendorId], references: [id])
-	customer Customer?    @relation(fields: [customerId], references: [id])
+    // Relations
+    invoice  SalesInvoice @relation(fields: [invoiceId], references: [id])
+    airline  AirlineCode  @relation(fields: [airlineId], references: [id])
+    vendor   Vendor       @relation(fields: [vendorId], references: [id])
+    customer Customer?    @relation(fields: [customerId], references: [id])
 
-	refunds     Refund[]
-	payments    SalePayment[]
+    refunds  Refund[]
+    payments SalePayment[]
 
-	createdAt DateTime @default(now())
-	updatedAt DateTime @updatedAt
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-	@@index([pnr])
-	@@index([status])
-	@@index([createdAt])
+    @@index([pnr])
+    @@index([status])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -429,29 +430,29 @@ model Sale {
 // ===========================
 
 model SalePayment {
-	id     String      @id @default(auto()) @map("_id") @db.ObjectId
-	saleId String      @db.ObjectId
-	sale   Sale        @relation(fields: [saleId], references: [id])
+    id     String @id @default(auto()) @map("_id") @db.ObjectId
+    saleId String @db.ObjectId
+    sale   Sale   @relation(fields: [saleId], references: [id])
 
-	method PaymentType // CASH | BANK_TRANSFER | CREDIT (never PARTIAL here)
-	amount Float
+    method PaymentType // CASH | BANK_TRANSFER | CREDIT (never PARTIAL here)
+    amount Float
 
-	// Populated only when method = BANK_TRANSFER
-	bankId String? @db.ObjectId
-	bank   Bank?   @relation(fields: [bankId], references: [id])
+    // Populated only when method = BANK_TRANSFER
+    bankId String? @db.ObjectId
+    bank   Bank?   @relation(fields: [bankId], references: [id])
 
-	// Populated only when method = CREDIT
-	customerId String?   @db.ObjectId
-	customer   Customer? @relation(fields: [customerId], references: [id])
+    // Populated only when method = CREDIT
+    customerId String?   @db.ObjectId
+    customer   Customer? @relation(fields: [customerId], references: [id])
 
-	remarks     String?
-	paymentDate DateTime
-	createdAt   DateTime @default(now())
+    remarks     String?
+    paymentDate DateTime
+    createdAt   DateTime @default(now())
 
-	@@index([saleId])
-	@@index([bankId])
-	@@index([customerId])
-	@@index([paymentDate])
+    @@index([saleId])
+    @@index([bankId])
+    @@index([customerId])
+    @@index([paymentDate])
 }
 
 // ===========================
@@ -459,40 +460,40 @@ model SalePayment {
 // ===========================
 
 model Refund {
-	id     String @id @default(auto()) @map("_id") @db.ObjectId
-	saleId String @db.ObjectId
-	sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Restrict)
+    id     String @id @default(auto()) @map("_id") @db.ObjectId
+    saleId String @db.ObjectId
+    sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Restrict)
 
-	// Financials
-	originalSaleAmount   Float
-	customerRefundAmount Float
-	vendorRefundAmount   Float?
-	refundFee            Float  @default(0)
-	cancellationCharges  Float  @default(0)
-	netRefundToCustomer  Float
-	netCostToUs          Float
+    // Financials
+    originalSaleAmount   Float
+    customerRefundAmount Float
+    vendorRefundAmount   Float?
+    refundFee            Float  @default(0)
+    cancellationCharges  Float  @default(0)
+    netRefundToCustomer  Float
+    netCostToUs          Float
 
-	// Details
-	refundReason String?
-	remarks      String?
-	status       RefundStatus @default(PENDING)
+    // Details
+    refundReason String?
+    remarks      String?
+    status       RefundStatus @default(PENDING)
 
-	// Dates
-	refundDate  DateTime
-	approvedAt  DateTime?
-	completedAt DateTime?
+    // Dates
+    refundDate  DateTime
+    approvedAt  DateTime?
+    completedAt DateTime?
 
-	// Who processed
-	processedById String? @db.ObjectId
-	processedBy   User?   @relation(fields: [processedById], references: [id])
+    // Who processed
+    processedById String? @db.ObjectId
+    processedBy   User?   @relation(fields: [processedById], references: [id])
 
-	createdAt DateTime @default(now())
-	updatedAt DateTime @updatedAt
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-	@@index([saleId])
-	@@index([status])
-	@@index([refundDate])
-	@@index([createdAt])
+    @@index([saleId])
+    @@index([status])
+    @@index([refundDate])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -504,45 +505,45 @@ model Refund {
 // ===========================
 
 model VendorCustomerPayment {
-	id String @id @default(auto()) @map("_id") @db.ObjectId
+    id String @id @default(auto()) @map("_id") @db.ObjectId
 
-	partyType PartyType // VENDOR | CUSTOMER — tells you which relation below is populated
+    partyType PartyType // VENDOR | CUSTOMER — tells you which relation below is populated
 
-	// Populated when partyType = VENDOR
-	vendorId String? @db.ObjectId
-	vendor   Vendor? @relation(fields: [vendorId], references: [id])
+    // Populated when partyType = VENDOR
+    vendorId String? @db.ObjectId
+    vendor   Vendor? @relation(fields: [vendorId], references: [id])
 
-	// Populated when partyType = CUSTOMER
-	customerId String?   @db.ObjectId
-	customer   Customer? @relation(fields: [customerId], references: [id])
+    // Populated when partyType = CUSTOMER
+    customerId String?   @db.ObjectId
+    customer   Customer? @relation(fields: [customerId], references: [id])
 
-	method PaymentType // CASH | BANK_TRANSFER only (never CREDIT / PARTIAL here)
-	amount Float
+    method PaymentType // CASH | BANK_TRANSFER only (never CREDIT / PARTIAL here)
+    amount Float
 
-	// Populated only when method = BANK_TRANSFER
-	bankId String? @db.ObjectId
-	bank   Bank?   @relation(fields: [bankId], references: [id])
+    // Populated only when method = BANK_TRANSFER
+    bankId String? @db.ObjectId
+    bank   Bank?   @relation(fields: [bankId], references: [id])
 
-	// Cloudinary URL only — actual file lives on Cloudinary, not in Mongo
-	attachmentUrl String?
+    // Cloudinary URL only — actual file lives on Cloudinary, not in Mongo
+    attachmentUrl String?
 
-	remarks String?
+    remarks String?
 
-	// Business / accounting date — user-selected on the payment form
-	transactionDate DateTime
+    // Business / accounting date — user-selected on the payment form
+    transactionDate DateTime
 
-	// System date — auto, immutable
-	createdAt DateTime @default(now())
+    // System date — auto, immutable
+    createdAt DateTime @default(now())
 
-	// Resulting ledger rows (1 for CASH, 2 for BANK_TRANSFER) — handy for audits/reversals
-	ledgerEntries LedgerEntry[]
+    // Resulting ledger rows (1 for CASH, 2 for BANK_TRANSFER) — handy for audits/reversals
+    ledgerEntries LedgerEntry[]
 
-	@@index([partyType])
-	@@index([vendorId])
-	@@index([customerId])
-	@@index([bankId])
-	@@index([transactionDate])
-	@@index([createdAt])
+    @@index([partyType])
+    @@index([vendorId])
+    @@index([customerId])
+    @@index([bankId])
+    @@index([transactionDate])
+    @@index([createdAt])
 }
 
 // ===========================
@@ -561,45 +562,47 @@ model VendorCustomerPayment {
 // ===========================
 
 model Expense {
-	id String @id @default(auto()) @map("_id") @db.ObjectId
+    id String @id @default(auto()) @map("_id") @db.ObjectId
 
-	// When the expense record itself was logged/created
-	date DateTime @default(now())
+    // When the expense record itself was logged/created
+    date DateTime @default(now())
 
-	// Business/accounting date — this is what drives LedgerEntry.transactionDate
-	expenseDate DateTime
+    // Business/accounting date — this is what drives LedgerEntry.transactionDate
+    expenseDate DateTime
 
-	category ExpenseCategory
+    category ExpenseCategory
 
-	// Plain reference for reporting/aggregation only — no Account is tied to this.
-	branchId String @db.ObjectId
-	branch   Branch @relation(fields: [branchId], references: [id])
+    // Plain reference for reporting/aggregation only — no Account is tied to this.
+    branchId String @db.ObjectId
+    branch   Branch @relation(fields: [branchId], references: [id])
 
-	amount Float
+    amount Float
 
-	// Default APPROVED — REJECTED expenses are recorded but never post to the ledger
-	status ExpenseStatus @default(APPROVED)
+    // Default APPROVED — REJECTED expenses are recorded but never post to the ledger
+    status ExpenseStatus @default(APPROVED)
 
-	// CASH | BANK_TRANSFER only
-	paymentMode PaymentType
+    // CASH | BANK_TRANSFER only
+    paymentMode PaymentType
 
-	// Populated only when paymentMode = BANK_TRANSFER — this is the ONLY
-	// account ever affected by an expense.
-	bankId String? @db.ObjectId
-	bank   Bank?   @relation(fields: [bankId], references: [id])
+    // Populated only when paymentMode = BANK_TRANSFER — this is the ONLY
+    // account ever affected by an expense.
+    bankId String? @db.ObjectId
+    bank   Bank?   @relation(fields: [bankId], references: [id])
+    userId String? @db.ObjectId
+    user   User?   @relation(fields: [userId], references: [id])
 
-	description String?
+    description String?
 
-	ledgerEntries LedgerEntry[]
+    ledgerEntries LedgerEntry[]
 
-	createdAt DateTime @default(now())
-	updatedAt DateTime @updatedAt
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-	@@index([branchId])
-	@@index([category])
-	@@index([status])
-	@@index([paymentMode])
-	@@index([bankId])
-	@@index([expenseDate])
-	@@index([createdAt])
+    @@index([branchId])
+    @@index([category])
+    @@index([status])
+    @@index([paymentMode])
+    @@index([bankId])
+    @@index([expenseDate])
+    @@index([createdAt])
 }

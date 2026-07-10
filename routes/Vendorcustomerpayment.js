@@ -38,21 +38,19 @@ router.post("/", upload.single("attachment"), async (req, res) => {
             amount,
             remarks,
             transactionDate,
+            saleAllocations, // NEW: only used for CUSTOMER payments. JSON string or array:
+                             // [{ saleId: "...", amount: 500 }, { saleId: "...", amount: 200 }]
         } = req.body;
 
         // 1. Capture the Cloudinary URL if a file was uploaded
-        // If an attachment is uploaded, req.file.path contains the secure Cloudinary URL
         const attachmentUrl = req.file ? req.file.path : null;
 
         // ---- Basic required-field checks ----
-        if (!partyType || !method || amount === undefined || !transactionDate)
+        if (!partyType || !method || !transactionDate)
             return res.status(400).json({
                 success: false,
-                error: "partyType, method, amount and transactionDate are required",
+                error: "partyType, method and transactionDate are required",
             });
-
-        // 2. Convert amount to a number (multipart/form-data passes numbers as strings)
-        amount = Number(amount);
 
         if (!["VENDOR", "CUSTOMER"].includes(partyType))
             return res.status(400).json({
@@ -64,12 +62,6 @@ router.post("/", upload.single("attachment"), async (req, res) => {
             return res.status(400).json({
                 success: false,
                 error: "method must be either CASH or BANK_TRANSFER",
-            });
-
-        if (isNaN(amount) || amount <= 0)
-            return res.status(400).json({
-                success: false,
-                error: "amount must be a number greater than 0",
             });
 
         // ---- partyType / id consistency checks ----
@@ -118,6 +110,79 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                 error: "transactionDate must be a valid date",
             });
 
+        // ---- Parse & validate saleAllocations (CUSTOMER only) ----
+        let allocations = [];
+        if (partyType === "CUSTOMER") {
+            if (typeof saleAllocations === "string") {
+                try {
+                    allocations = JSON.parse(saleAllocations);
+                } catch {
+                    return res.status(400).json({
+                        success: false,
+                        error: "saleAllocations must be valid JSON",
+                    });
+                }
+            } else if (Array.isArray(saleAllocations)) {
+                allocations = saleAllocations;
+            }
+
+            if (!Array.isArray(allocations) || allocations.length === 0)
+                return res.status(400).json({
+                    success: false,
+                    error: "saleAllocations must be a non-empty array of { saleId, amount } for customer payments",
+                });
+
+            const seen = new Set();
+            for (const a of allocations) {
+                if (!a.saleId || a.amount === undefined)
+                    return res.status(400).json({
+                        success: false,
+                        error: "Each saleAllocations entry requires saleId and amount",
+                    });
+
+                a.amount = Number(a.amount);
+                if (isNaN(a.amount) || a.amount <= 0)
+                    return res.status(400).json({
+                        success: false,
+                        error: `Invalid amount for sale ${a.saleId}`,
+                    });
+
+                if (seen.has(a.saleId))
+                    return res.status(400).json({
+                        success: false,
+                        error: `Duplicate saleId ${a.saleId} in saleAllocations`,
+                    });
+                seen.add(a.saleId);
+            }
+
+            // amount is derived from allocations for CUSTOMER payments
+            const allocationTotal = allocations.reduce((sum, a) => sum + a.amount, 0);
+
+            if (amount !== undefined && amount !== null && amount !== "") {
+                if (Number(amount) !== allocationTotal)
+                    return res.status(400).json({
+                        success: false,
+                        error: `amount (${Number(amount)}) must equal the sum of saleAllocations (${allocationTotal})`,
+                    });
+            }
+
+            amount = allocationTotal;
+        } else {
+            // VENDOR flow — amount is required as before
+            if (amount === undefined)
+                return res.status(400).json({
+                    success: false,
+                    error: "amount is required",
+                });
+            amount = Number(amount);
+        }
+
+        if (isNaN(amount) || amount <= 0)
+            return res.status(400).json({
+                success: false,
+                error: "amount must be a number greater than 0",
+            });
+
         // ---- Load the party + its account ----
         let vendor = null;
         let customer = null;
@@ -144,6 +209,47 @@ router.post("/", upload.single("attachment"), async (req, res) => {
 
             if (!customer.isActive)
                 return res.status(400).json({ success: false, error: "Customer is inactive" });
+        }
+
+        // ---- Load & validate the sales referenced in saleAllocations (CUSTOMER only) ----
+        let salesById = new Map();
+        if (partyType === "CUSTOMER") {
+            const saleIds = allocations.map((a) => a.saleId);
+            const sales = await prisma.sale.findMany({
+                where: { id: { in: saleIds } },
+                include: { invoice: { select: { invoiceNo: true } } },
+            });
+
+            salesById = new Map(sales.map((s) => [s.id, s]));
+
+            for (const a of allocations) {
+                const sale = salesById.get(a.saleId);
+
+                if (!sale)
+                    return res.status(404).json({
+                        success: false,
+                        error: `Sale ${a.saleId} not found`,
+                    });
+
+                if (sale.customerId !== customerId)
+                    return res.status(400).json({
+                        success: false,
+                        error: `Sale ${a.saleId} does not belong to customer ${customerId}`,
+                    });
+
+                if (!["DUE", "PARTIAL"].includes(sale.paymentStatus))
+                    return res.status(400).json({
+                        success: false,
+                        error: `Sale ${a.saleId} is already ${sale.paymentStatus} and cannot accept further payment`,
+                    });
+
+                const remainingDue = sale.sellPrice - sale.paidAmount;
+                if (a.amount > remainingDue)
+                    return res.status(400).json({
+                        success: false,
+                        error: `Payment amount (${a.amount}) for sale ${a.saleId} exceeds its remaining due (${remainingDue})`,
+                    });
+            }
         }
 
         // ---- Load the bank if relevant ----
@@ -222,31 +328,69 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                     method,
                     amount,
                     bankId: method === "BANK_TRANSFER" ? bankId : null,
-                    attachmentUrl: attachmentUrl, // 3. The verified URL string drops straight into DB
+                    attachmentUrl: attachmentUrl,
                     remarks: remarks ?? null,
                     transactionDate: parsedDate,
                 },
             });
 
-            // Party leg
+            // ---- Party leg(s) ----
+            if (partyType === "CUSTOMER") {
+                // One LedgerEntry per sale allocation, referencing the sale + its invoice number
+                for (const a of allocations) {
+                    const sale = salesById.get(a.saleId);
+                    const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
+                    const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${a.saleId})${
+                        remarks ? ` — ${remarks}` : ""
+                    }`;
+
+                    await tx.ledgerEntry.create({
+                        data: {
+                            accountId: partyAccount.id,
+                            entryType: "PAYMENT",
+                            debit: 0,
+                            credit: a.amount,
+                            saleId: a.saleId,
+                            vendorCustomerPaymentId: payment.id,
+                            transactionDate: parsedDate,
+                            remarks: entryRemarks,
+                        },
+                    });
+
+                    // Update the sale's paid amount + status
+                    const newPaidAmount = sale.paidAmount + a.amount;
+                    const newStatus =
+                        newPaidAmount >= sale.sellPrice ? "PAID" : "PARTIAL";
+
+                    await tx.sale.update({
+                        where: { id: a.saleId },
+                        data: {
+                            paidAmount: newPaidAmount,
+                            paymentStatus: newStatus,
+                        },
+                    });
+                }
+            } else {
+                // VENDOR — single combined leg, same as before
+                await tx.ledgerEntry.create({
+                    data: {
+                        accountId: partyAccount.id,
+                        entryType: "PAYMENT",
+                        debit: partyLegDebit,
+                        credit: partyLegCredit,
+                        vendorCustomerPaymentId: payment.id,
+                        transactionDate: parsedDate,
+                        remarks: remarks ?? null,
+                    },
+                });
+            }
+
             await tx.account.update({
                 where: { id: partyAccount.id },
                 data: { balance: { increment: partyBalanceDelta } },
             });
 
-            await tx.ledgerEntry.create({
-                data: {
-                    accountId: partyAccount.id,
-                    entryType: "PAYMENT",
-                    debit: partyLegDebit,
-                    credit: partyLegCredit,
-                    vendorCustomerPaymentId: payment.id,
-                    transactionDate: parsedDate,
-                    remarks: remarks ?? null,
-                },
-            });
-
-            // Bank leg (only for BANK_TRANSFER)
+            // ---- Bank leg (only for BANK_TRANSFER) — single combined entry ----
             if (method === "BANK_TRANSFER") {
                 await tx.account.update({
                     where: { id: bank.account.id },
@@ -335,10 +479,23 @@ router.get("/:id", async (req, res) => {
 
 
 // ---- PUT (UPDATE) ----
+// ---- PUT (UPDATE) ----
 router.put("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { amount, attachmentUrl, remarks, transactionDate, method, bankId } = req.body;
+    let {
+      amount,
+      attachmentUrl,
+      remarks,
+      transactionDate,
+      method,
+      bankId,
+      saleAllocations, // NEW: CUSTOMER only. JSON string or array:
+                        // [{ saleId, amount }] — the FULL new distribution
+                        // across invoices. Omit entirely to leave the
+                        // existing per-invoice allocation untouched (e.g.
+                        // when only editing remarks/date/method/bank).
+    } = req.body;
 
     // ---- Load existing payment ----
     const existing = await prisma.vendorCustomerPayment.findUnique({
@@ -349,9 +506,89 @@ router.put("/:id", async (req, res) => {
     if (!existing)
       return res.status(404).json({ success: false, error: "Payment not found" });
 
-    // ---- Validate editable fields ----
-    if (amount !== undefined && (typeof amount !== "number" || amount <= 0))
-      return res.status(400).json({ success: false, error: "amount must be a number greater than 0" });
+    const partyType = existing.partyType;
+
+    // ---- Parse saleAllocations (CUSTOMER only) ----
+    // `allocations === null` means "not provided in this request" — keep the
+    // existing per-invoice split untouched. `allocations` being a (possibly
+    // validated) array means the caller wants to replace the split entirely.
+    let allocations = null;
+    if (partyType === "CUSTOMER" && saleAllocations !== undefined && saleAllocations !== null) {
+      if (typeof saleAllocations === "string") {
+        try {
+          allocations = JSON.parse(saleAllocations);
+        } catch {
+          return res.status(400).json({
+            success: false,
+            error: "saleAllocations must be valid JSON",
+          });
+        }
+      } else if (Array.isArray(saleAllocations)) {
+        allocations = saleAllocations;
+      }
+
+      if (!Array.isArray(allocations) || allocations.length === 0)
+        return res.status(400).json({
+          success: false,
+          error: "saleAllocations must be a non-empty array of { saleId, amount }",
+        });
+
+      const seen = new Set();
+      for (const a of allocations) {
+        if (!a.saleId || a.amount === undefined)
+          return res.status(400).json({
+            success: false,
+            error: "Each saleAllocations entry requires saleId and amount",
+          });
+
+        a.amount = Number(a.amount);
+        if (isNaN(a.amount) || a.amount <= 0)
+          return res.status(400).json({
+            success: false,
+            error: `Invalid amount for sale ${a.saleId}`,
+          });
+
+        if (seen.has(a.saleId))
+          return res.status(400).json({
+            success: false,
+            error: `Duplicate saleId ${a.saleId} in saleAllocations`,
+          });
+        seen.add(a.saleId);
+      }
+    }
+
+    // ---- Determine newAmount ----
+    let newAmount;
+
+    if (partyType === "CUSTOMER" && allocations) {
+      const allocationTotal = allocations.reduce((sum, a) => sum + a.amount, 0);
+
+      if (amount !== undefined && amount !== null && Number(amount) !== allocationTotal)
+        return res.status(400).json({
+          success: false,
+          error: `amount (${Number(amount)}) must equal the sum of saleAllocations (${allocationTotal})`,
+        });
+
+      newAmount = allocationTotal;
+    } else if (partyType === "CUSTOMER" && !allocations) {
+      // No new allocation supplied — amount cannot be changed in isolation,
+      // since we wouldn't know which invoice(s) the delta applies to.
+      if (amount !== undefined && amount !== null && Number(amount) !== existing.amount)
+        return res.status(400).json({
+          success: false,
+          error:
+            "saleAllocations is required to change the amount of a customer payment linked to invoices",
+        });
+      newAmount = existing.amount;
+    } else {
+      // VENDOR — unchanged behavior
+      if (amount !== undefined && (typeof amount !== "number" || amount <= 0))
+        return res.status(400).json({
+          success: false,
+          error: "amount must be a number greater than 0",
+        });
+      newAmount = amount ?? existing.amount;
+    }
 
     if (transactionDate !== undefined) {
       const parsed = new Date(transactionDate);
@@ -369,9 +606,7 @@ router.put("/:id", async (req, res) => {
     if (newMethod === "CASH" && newBankId)
       return res.status(400).json({ success: false, error: "bankId must not be set when method is CASH" });
 
-    const newAmount = amount ?? existing.amount;
     const parsedDate = transactionDate ? new Date(transactionDate) : existing.transactionDate;
-    const partyType = existing.partyType;
 
     // ---- Load party account ----
     let partyAccount = null;
@@ -408,10 +643,6 @@ router.put("/:id", async (req, res) => {
     }
 
     // ---- Find old bank account/entry (needed only to reverse the BANK leg) ----
-    // NOTE: We do NOT reverse the party leg this way — partyBalanceDelta below is
-    // already the net shift from old amount -> new amount, computed directly from
-    // the party's category rules (same convention as the POST route). Reversing
-    // via old ledger debit/credit AND applying the delta would double-count.
     let oldBankAccount = null;
     let oldBankEntry = null;
     if (existing.method === "BANK_TRANSFER" && existing.bankId) {
@@ -423,14 +654,79 @@ router.put("/:id", async (req, res) => {
       oldBankEntry = existing.ledgerEntries.find((e) => e.accountId === oldBankAccount?.id);
     }
 
-    // ---- Recompute new ledger directions (delta between old amount and new amount) ----
+    // ---- CUSTOMER: work out the per-sale reversal + reallocation plan ----
+    // oldAllocationMap: saleId -> amount previously credited by THIS payment
+    // (read straight off the existing per-sale ledger entries, so it's always
+    // in sync with what was actually posted, regardless of what the payment's
+    // `amount` field says).
+    const oldAllocationMap = new Map();
+    if (partyType === "CUSTOMER") {
+      existing.ledgerEntries.forEach((e) => {
+        if (e.saleId) {
+          oldAllocationMap.set(e.saleId, (oldAllocationMap.get(e.saleId) || 0) + e.credit);
+        }
+      });
+    }
+
+    const unionSaleIds = new Set([
+      ...oldAllocationMap.keys(),
+      ...(allocations ? allocations.map((a) => a.saleId) : []),
+    ]);
+
+    let salesById = new Map();
+    let saleFinalUpdates = []; // { saleId, newPaidAmount, newStatus } — only populated when allocations replace the split
+
+    if (partyType === "CUSTOMER" && unionSaleIds.size > 0) {
+      const saleList = await prisma.sale.findMany({
+        where: { id: { in: [...unionSaleIds] } },
+        include: { invoice: { select: { invoiceNo: true } } },
+      });
+      salesById = new Map(saleList.map((s) => [s.id, s]));
+
+      for (const saleId of unionSaleIds) {
+        const sale = salesById.get(saleId);
+        if (!sale)
+          return res.status(404).json({ success: false, error: `Sale ${saleId} not found` });
+        if (sale.customerId !== existing.customerId)
+          return res.status(400).json({
+            success: false,
+            error: `Sale ${saleId} does not belong to this payment's customer`,
+          });
+      }
+
+      if (allocations) {
+        const newAllocationMap = new Map(allocations.map((a) => [a.saleId, a.amount]));
+
+        for (const saleId of unionSaleIds) {
+          const sale = salesById.get(saleId);
+          const oldAmt = oldAllocationMap.get(saleId) || 0;
+          const newAmt = newAllocationMap.get(saleId) || 0;
+
+          // Reverse this payment's old contribution, then apply the new one.
+          const working = sale.paidAmount - oldAmt + newAmt;
+
+          if (working > sale.sellPrice + 0.01)
+            return res.status(400).json({
+              success: false,
+              error: `Allocation (${newAmt}) for sale ${saleId} would exceed its sell price (remaining after reversing this payment's old contribution: ${(sale.sellPrice - (sale.paidAmount - oldAmt)).toFixed(2)})`,
+            });
+
+          const clamped = Math.max(0, working);
+          const newStatus =
+            clamped <= 0 ? "DUE" : clamped >= sale.sellPrice ? "PAID" : "PARTIAL";
+
+          saleFinalUpdates.push({ saleId, newPaidAmount: clamped, newStatus });
+        }
+      }
+    }
+
+    // ---- Recompute party leg direction/balance delta (net shift old -> new amount) ----
     let partyLegDebit = 0;
     let partyLegCredit = 0;
     let partyBalanceDelta = 0;
 
     if (partyType === "VENDOR" && vendor.category === "DEBIT") {
-      // Debit vendor: balance = amount still owed to vendor. Paying reduces it.
-      const restoredBalance = partyAccount.balance + existing.amount; // balance before old payment
+      const restoredBalance = partyAccount.balance + existing.amount;
       if (newAmount > restoredBalance)
         return res.status(400).json({
           success: false,
@@ -438,13 +734,12 @@ router.put("/:id", async (req, res) => {
         });
 
       partyLegDebit = newAmount;
-      partyBalanceDelta = -(newAmount - existing.amount); // shift balance down by the change in payment
+      partyBalanceDelta = -(newAmount - existing.amount);
     } else if (partyType === "VENDOR" && vendor.category === "CREDIT") {
-      // Credit vendor: paying increases balance (amount we've advanced/credited them)
       partyLegDebit = newAmount;
       partyBalanceDelta = newAmount - existing.amount;
     } else if (partyType === "CUSTOMER") {
-      const restoredBalance = partyAccount.balance + existing.amount; // balance before old payment
+      const restoredBalance = partyAccount.balance + existing.amount;
       if (newAmount > restoredBalance)
         return res.status(400).json({
           success: false,
@@ -461,10 +756,9 @@ router.put("/:id", async (req, res) => {
 
     if (newMethod === "BANK_TRANSFER") {
       if (partyType === "VENDOR") {
-        // Check bank has enough after reversing old bank debit
         const restoredBankBalance =
           oldBankAccount?.id === newBank.account.id
-            ? newBank.account.balance + existing.amount // same bank: restore old debit first
+            ? newBank.account.balance + existing.amount
             : newBank.account.balance;
 
         if (newAmount > restoredBankBalance)
@@ -482,8 +776,6 @@ router.put("/:id", async (req, res) => {
     // ---- Persist atomically ----
     const result = await prisma.$transaction(async (tx) => {
       // 1. Reverse old bank balance if old method was BANK_TRANSFER
-      //    (Bank leg uses full reverse + full reapply, unlike the party leg,
-      //    because it may move to a *different* bank account entirely.)
       if (existing.method === "BANK_TRANSFER" && oldBankAccount) {
         const oldBankDelta = (oldBankEntry?.debit ?? 0) - (oldBankEntry?.credit ?? 0);
         await tx.account.update({
@@ -508,25 +800,84 @@ router.put("/:id", async (req, res) => {
         },
       });
 
-      // 4. Apply party balance delta (net shift from old amount -> new amount) + ledger entry
+      // 4. Party leg(s) + sale status updates
+      if (partyType === "CUSTOMER" && allocations) {
+        // Full re-allocation: recreate one ledger entry per sale in the new
+        // split, and push each affected sale's paidAmount/paymentStatus to
+        // its recomputed (reversed-then-reapplied) value.
+        for (const a of allocations) {
+          const sale = salesById.get(a.saleId);
+          const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
+          const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${a.saleId})${
+            (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+          }`;
+
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: partyAccount.id,
+              entryType: "PAYMENT",
+              debit: 0,
+              credit: a.amount,
+              saleId: a.saleId,
+              vendorCustomerPaymentId: id,
+              transactionDate: parsedDate,
+              remarks: entryRemarks,
+            },
+          });
+        }
+
+        for (const u of saleFinalUpdates) {
+          await tx.sale.update({
+            where: { id: u.saleId },
+            data: { paidAmount: u.newPaidAmount, paymentStatus: u.newStatus },
+          });
+        }
+      } else if (partyType === "CUSTOMER" && !allocations) {
+        // No change to the split — just recreate the same per-sale entries
+        // (amounts unchanged) so they carry the updated transactionDate/remarks.
+        // Sale paidAmount/paymentStatus are untouched since nothing changed.
+        for (const [saleId, oldAmt] of oldAllocationMap.entries()) {
+          const sale = salesById.get(saleId);
+          const invoiceNo = sale?.invoice?.invoiceNo ?? "N/A";
+          const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${saleId})${
+            (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+          }`;
+
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: partyAccount.id,
+              entryType: "PAYMENT",
+              debit: 0,
+              credit: oldAmt,
+              saleId,
+              vendorCustomerPaymentId: id,
+              transactionDate: parsedDate,
+              remarks: entryRemarks,
+            },
+          });
+        }
+      } else {
+        // VENDOR — single combined leg, unchanged behavior
+        await tx.ledgerEntry.create({
+          data: {
+            accountId: partyAccount.id,
+            entryType: "PAYMENT",
+            debit: partyLegDebit,
+            credit: partyLegCredit,
+            vendorCustomerPaymentId: id,
+            transactionDate: parsedDate,
+            remarks: remarks ?? existing.remarks ?? null,
+          },
+        });
+      }
+
+      // 5. Apply party balance delta (net shift from old amount -> new amount)
       await tx.account.update({
         where: { id: partyAccount.id },
         data: { balance: { increment: partyBalanceDelta } },
       });
 
-      await tx.ledgerEntry.create({
-        data: {
-          accountId: partyAccount.id,
-          entryType: "PAYMENT",
-          debit: partyLegDebit,
-          credit: partyLegCredit,
-          vendorCustomerPaymentId: id,
-          transactionDate: parsedDate,
-          remarks: remarks ?? existing.remarks ?? null,
-        },
-      });
-
-      // 5. Apply new bank balance + ledger entry
+      // 6. Apply new bank balance + ledger entry
       if (newMethod === "BANK_TRANSFER") {
         const bankBalanceDelta = partyType === "VENDOR" ? -newAmount : newAmount;
         await tx.account.update({

@@ -225,6 +225,118 @@ router.get("/search", authenticate, async (req, res) => {
 	}
 });
 
+
+/* ======================= GET CUSTOMER SALES (DUE / PARTIAL) ======================= */
+router.get("/customerSales", authenticate, async (req, res) => {
+	try {
+		const { customerId, paymentStatus } = req.query;
+
+		if (!customerId) {
+			return res.status(400).json({ success: false, error: "customerId is required" });
+		}
+
+		// paymentStatus can be a single value ("DUE") or comma-separated ("DUE,PARTIAL").
+		// Defaults to DUE + PARTIAL if not provided, since that's the common use case
+		// (showing a customer's outstanding sales).
+		const statusList = paymentStatus
+			? paymentStatus.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
+			: ["DUE", "PARTIAL"];
+
+		const sales = await prisma.sale.findMany({
+			where: {
+				customerId,
+				paymentStatus: { in: statusList }
+			},
+			orderBy: { createdAt: "desc" },
+			include: {
+				invoice: {
+					select: {
+						id: true,
+						invoiceNo: true,
+						saleDate: true
+					}
+				},
+				airline: { select: { airlineCode: true, airlineName: true } },
+				vendor: {
+					select: {
+						vendorName: true,
+						category: true,
+						account: { select: { balance: true } }
+					}
+				},
+				customer: {
+					select: {
+						customerName: true,
+						phone: true,
+						account: { select: { balance: true } }
+					}
+				},
+				bank: {
+					select: {
+						id: true,
+						bankName: true,
+						accountNumber: true,
+						branchName: true
+					}
+				},
+				payments: {
+					select: {
+						id: true,
+						method: true,
+						amount: true,
+						paymentDate: true,
+						remarks: true
+					},
+					orderBy: { paymentDate: "asc" }
+				}
+			}
+		});
+
+		const data = sales.map((s) => ({
+			id: s.id,
+			invoiceId: s.invoice?.id || null,
+			invoiceNo: s.invoice?.invoiceNo || null,
+			saleDate: s.invoice?.saleDate || null,
+			documentNo: s.documentNo,
+			pnr: s.pnr,
+			paxName: s.paxName,
+			netPrice: s.netPrice,
+			sellPrice: s.sellPrice,
+			profit: s.profit,
+			status: s.status,
+			paymentType: s.paymentType,
+			paymentStatus: s.paymentStatus,
+			paidAmount: s.paidAmount,
+			dueAmount: s.sellPrice - (s.paidAmount || 0),
+			remarks: s.remarks,
+			airlineCode: s.airline?.airlineCode || null,
+			airlineName: s.airline?.airlineName || null,
+			vendorName: s.vendor?.vendorName || null,
+			vendorCategory: s.vendor?.category || null,
+			vendorBalance: s.vendor?.account?.balance ?? null,
+			customerName: s.customer?.customerName || null,
+			customerPhone: s.customer?.phone || null,
+			customerBalance: s.customer?.account?.balance ?? null,
+			bank: s.bank
+				? {
+						id: s.bank.id,
+						bankName: s.bank.bankName,
+						accountNumber: s.bank.accountNumber,
+						branchName: s.bank.branchName
+					}
+				: null,
+			payments: s.payments,
+			createdAt: s.createdAt
+		}));
+
+		res.json({ success: true, data });
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({ success: false, error: "Failed to fetch customer sales" });
+	}
+});
+
+
 /* ======================= GET INVOICE BY ID ======================= */
 router.get("/:invoiceId", authenticate, async (req, res) => {
 	try {
@@ -446,6 +558,7 @@ router.get("/invoice-no", authenticate, async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 
 
