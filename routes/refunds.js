@@ -221,8 +221,8 @@ router.post("/", authenticate, async (req, res) => {
                 data: {
                     accountId:       vendorAccId,
                     entryType:       "REFUND",
-                    debit:           0,
-                    credit:          vendorRefundAmount,
+                    debit:           vendorRefundAmount,
+                    credit:          0,
                     transactionDate: businessDate,
                     saleId:          originalSale.id,
                     invoiceId:       originalSale.invoiceId,
@@ -392,7 +392,7 @@ router.put("/:refundId", authenticate, async (req, res) => {
                 if (vendorLedger) {
                     await tx.ledgerEntry.update({
                         where: { id: vendorLedger.id },
-                        data:  { credit: newVendorRefund, transactionDate: businessDate }
+                        data:  { debit: newVendorRefund, transactionDate: businessDate }
                     });
                 }
 
@@ -455,7 +455,6 @@ router.put("/:refundId", authenticate, async (req, res) => {
         return res.status(400).json({ success: false, error: err.message });
     }
 });
-
 
 router.delete("/:refundId", authenticate, async (req, res) => {
     const { refundId } = req.params;
