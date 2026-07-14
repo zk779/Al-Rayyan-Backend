@@ -190,7 +190,7 @@ model Account {
     id          String      @id @default(auto()) @map("_id") @db.ObjectId
     name        String
     type        AccountType
-    referenceId String?     @db.ObjectId // vendorId / customerId / bankId
+    referenceId String?     @db.ObjectId
     balance     Float       @default(0)
     isActive    Boolean     @default(true)
     createdAt   DateTime    @default(now())
@@ -201,6 +201,11 @@ model Account {
     customers Customer[]
     banks     Bank[]
 
+    sales                  Sale[]
+    salePayments           SalePayment[]
+    vendorCustomerPayments VendorCustomerPayment[]
+    expenses               Expense[]
+
     @@index([type])
     @@index([referenceId])
 }
@@ -210,7 +215,7 @@ model Account {
 // ===========================
 
 model LedgerEntry {
-    id        String  @id @default(auto()) @map("_id") @db.ObjectId
+    id        String   @id @default(auto()) @map("_id") @db.ObjectId
     accountId String?  @db.ObjectId
     account   Account? @relation(fields: [accountId], references: [id])
 
@@ -416,10 +421,13 @@ model Sale {
 
     createdAt DateTime @default(now())
     updatedAt DateTime @updatedAt
+    account   Account? @relation(fields: [accountId], references: [id])
+    accountId String?  @db.ObjectId
 
     @@index([pnr])
     @@index([status])
     @@index([createdAt])
+    @@index([accountId])
 }
 
 // ===========================
@@ -448,11 +456,14 @@ model SalePayment {
     remarks     String?
     paymentDate DateTime
     createdAt   DateTime @default(now())
+    account     Account? @relation(fields: [accountId], references: [id])
+    accountId   String?  @db.ObjectId
 
     @@index([saleId])
     @@index([bankId])
     @@index([customerId])
     @@index([paymentDate])
+    @@index([accountId])
 }
 
 // ===========================
@@ -537,6 +548,8 @@ model VendorCustomerPayment {
 
     // Resulting ledger rows (1 for CASH, 2 for BANK_TRANSFER) — handy for audits/reversals
     ledgerEntries LedgerEntry[]
+    account       Account?      @relation(fields: [accountId], references: [id])
+    accountId     String?       @db.ObjectId
 
     @@index([partyType])
     @@index([vendorId])
@@ -544,6 +557,7 @@ model VendorCustomerPayment {
     @@index([bankId])
     @@index([transactionDate])
     @@index([createdAt])
+    @@index([accountId])
 }
 
 // ===========================
@@ -597,6 +611,8 @@ model Expense {
 
     createdAt DateTime @default(now())
     updatedAt DateTime @updatedAt
+    account   Account? @relation(fields: [accountId], references: [id])
+    accountId String?  @db.ObjectId
 
     @@index([branchId])
     @@index([category])
@@ -605,4 +621,5 @@ model Expense {
     @@index([bankId])
     @@index([expenseDate])
     @@index([createdAt])
+    @@index([accountId])
 }

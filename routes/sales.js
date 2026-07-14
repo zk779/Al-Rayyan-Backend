@@ -85,6 +85,28 @@ router.get("/", authenticate, async (req, res) => {
                                 account: { select: { balance: true } }
                             }
                         },
+                        // Cash account (populated when paymentType = CASH)
+                        account: { select: { balance: true } },
+                        // Bank account (populated when paymentType = BANK_TRANSFER)
+                        bank: {
+                            select: {
+                                bankName: true,
+                                account: { select: { balance: true } }
+                            }
+                        },
+                        // Payment legs for PARTIAL sales — breakdown of how it was split
+                        payments: {
+                            select: {
+                                id: true,
+                                method: true,
+                                amount: true,
+                                remarks: true,
+                                paymentDate: true,
+                                bank: { select: { bankName: true } },
+                                customer: { select: { customerName: true } },
+                                account: { select: { balance: true } }
+                            }
+                        },
                         // Changed field name to match your schema's 'refunds'
                         refunds: { 
                             select: { 
@@ -116,31 +138,54 @@ router.get("/", authenticate, async (req, res) => {
             totalSell: inv.totalSell,
             totalProfit: inv.totalProfit,
             salesCount: inv.sales.length,
-            sales: inv.sales.map(s => ({
-                id: s.id,
-                documentNo: s.documentNo,
-                pnr: s.pnr,
-                paxName: s.paxName,
-                vendorName: s.vendor?.vendorName || null,
-                vendorCategory: s.vendor?.category || null,
-                vendorBalance: s.vendor?.account?.balance ?? null,
-                airlineCode: s.airline?.airlineCode || null,
-                airlineName: s.airline?.airlineName || null,
-                paymentType: s.paymentType,
-                paymentStatus: s.paymentStatus,
-                paidAmount: s.paidAmount,
-                customerId: s.customerId || null,
-                customerName: s.customer?.customerName || null,
-                customerPhone: s.customer?.phone || null,
-                customerBalance: s.customer?.account?.balance ?? null,
-                netPrice: s.netPrice,
-                sellPrice: s.sellPrice,
-                profit: s.profit,
-                remarks: s.remarks,
-                status: s.status,
-                // Flatten the array: take the first refund if it exists
-                refund: s.refunds && s.refunds.length > 0 ? s.refunds[0] : null 
-            })),
+            sales: inv.sales.map(s => {
+                const sellPrice = Number(s.sellPrice || 0);
+                const paidAmount = Number(s.paidAmount || 0);
+                const dueAmount = Math.max(sellPrice - paidAmount, 0);
+
+                return {
+                    id: s.id,
+                    documentNo: s.documentNo,
+                    pnr: s.pnr,
+                    paxName: s.paxName,
+                    vendorName: s.vendor?.vendorName || null,
+                    vendorCategory: s.vendor?.category || null,
+                    vendorBalance: s.vendor?.account?.balance ?? null,
+                    airlineCode: s.airline?.airlineCode || null,
+                    airlineName: s.airline?.airlineName || null,
+                    paymentType: s.paymentType,
+                    paymentStatus: s.paymentStatus,
+                    // Money breakdown
+                    sellPrice,
+                    paidAmount,
+                    dueAmount,
+                    customerId: s.customerId || null,
+                    customerName: s.customer?.customerName || null,
+                    customerPhone: s.customer?.phone || null,
+                    customerBalance: s.customer?.account?.balance ?? null,
+                    // Cash / bank account context (whichever applies)
+                    cashAccountBalance: s.account?.balance ?? null,
+                    bankName: s.bank?.bankName || null,
+                    bankAccountBalance: s.bank?.account?.balance ?? null,
+                    // Split payment breakdown, if PARTIAL
+                    paymentLegs: (s.payments || []).map(p => ({
+                        id: p.id,
+                        method: p.method,
+                        amount: p.amount,
+                        remarks: p.remarks,
+                        paymentDate: p.paymentDate,
+                        bankName: p.bank?.bankName || null,
+                        customerName: p.customer?.customerName || null,
+                        cashAccountBalance: p.account?.balance ?? null
+                    })),
+                    netPrice: s.netPrice,
+                    profit: s.profit,
+                    remarks: s.remarks,
+                    status: s.status,
+                    // Flatten the array: take the first refund if it exists
+                    refund: s.refunds && s.refunds.length > 0 ? s.refunds[0] : null 
+                };
+            }),
             createdAt: inv.createdAt
         }));
 
@@ -704,6 +749,30 @@ router.post("/", authenticate, async (req, res) => {
 			});
 
 			/* ──────────────────────────────────────────────────────
+			   HELPER: get-or-create the singleton CASH account
+			   ────────────────────────────────────────────────────── */
+			let cashAccount = null;
+			const getCashAccount = async () => {
+				if (cashAccount) return cashAccount;
+
+				cashAccount = await tx.account.findFirst({
+					where: { type: "CASH" },
+				});
+
+				if (!cashAccount) {
+					cashAccount = await tx.account.create({
+						data: {
+							name: "Cash Account",
+							type: "CASH",
+							balance: 0,
+						},
+					});
+				}
+
+				return cashAccount;
+			};
+
+			/* ──────────────────────────────────────────────────────
 			   HELPER: record money received into bank account
 			   ────────────────────────────────────────────────────── */
 			const creditBank = async (bankId, amount, saleId, label) => {
@@ -725,6 +794,31 @@ router.post("/", authenticate, async (req, res) => {
 
 				await tx.account.update({
 					where: { id: bank.account.id },
+					data: { balance: { increment: amount } },
+				});
+			};
+
+			/* ──────────────────────────────────────────────────────
+			   HELPER: record money received into cash account
+			   ────────────────────────────────────────────────────── */
+			const creditCash = async (amount, saleId, label) => {
+				const cash = await getCashAccount();
+
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: cash.id,
+						entryType: "PAYMENT",
+						debit: 0,
+						credit: amount,
+						transactionDate: businessDate,
+						saleId,
+						invoiceId: invoice.id,
+						remarks: `${label} - Invoice ${invoiceNo}`,
+					},
+				});
+
+				await tx.account.update({
+					where: { id: cash.id },
 					data: { balance: { increment: amount } },
 				});
 			};
@@ -793,6 +887,7 @@ router.post("/", authenticate, async (req, res) => {
 						vendorId: s.vendorId,
 						customerId: s.customerId || null,
 						bankId: pt === "BANK_TRANSFER" ? (s.bankId || null) : null,
+						accountId: pt === "CASH" ? (await getCashAccount()).id : null,
 						documentNo: s.documentNo || null,
 						pnr: s.pnr || null,
 						routeType: s.routeType || null,
@@ -837,7 +932,7 @@ router.post("/", authenticate, async (req, res) => {
 
 				/* ── Payment-side ledger entries ── */
 				if (pt === "CASH") {
-                    // No ledger entry for cash payments
+                    await creditCash(paid, sale.id, "Cash payment received");
                 } else if (pt === "BANK_TRANSFER") {
                     await creditBank(s.bankId, paid, sale.id, "Bank transfer payment received");
 
@@ -858,6 +953,7 @@ router.post("/", authenticate, async (req, res) => {
 								method: legMethod,
 								amount: legAmount,
 								bankId: legMethod === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+								accountId: legMethod === "CASH" ? (await getCashAccount()).id : null,
 								customerId: legMethod === "CREDIT" ? (leg.customerId || null) : null,
 								remarks: leg.remarks || null,
 								paymentDate: businessDate,
@@ -865,7 +961,7 @@ router.post("/", authenticate, async (req, res) => {
 						});
 
 						if (legMethod === "CASH") {
-							// No ledger entry for cash payment legs
+							await creditCash(legAmount, sale.id, "Partial cash payment received");
 						} else if (legMethod === "BANK_TRANSFER") {
 							await creditBank(
 								leg.bankId,
@@ -909,7 +1005,6 @@ router.post("/", authenticate, async (req, res) => {
 		return res.status(400).json({ success: false, error: err.message });
 	}
 });
-
 
 router.put("/:invoiceId", authenticate, async (req, res) => {
 	const { invoiceId } = req.params;
@@ -960,7 +1055,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		const deletedSales = existingInvoice.sales.filter(s => !payloadSaleIds.has(s.id));
 
 		/* ======================================================
-		   3️⃣  PRE-LOAD ALL VENDORS / CUSTOMERS / BANKS
+		   3️⃣  PRE-LOAD ALL VENDORS / CUSTOMERS / BANKS / CASH
 		====================================================== */
 		const vendorIdSet = new Set();
 		const customerIdSet = new Set();
@@ -988,7 +1083,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			});
 		});
 
-		const [vendors, customers, banks] = await Promise.all([
+		const [vendors, customers, banks, existingCashAccount] = await Promise.all([
 			vendorIdSet.size
 				? prisma.vendor.findMany({ where: { id: { in: [...vendorIdSet] } }, include: { account: true } })
 				: [],
@@ -998,6 +1093,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			bankIdSet.size
 				? prisma.bank.findMany({ where: { id: { in: [...bankIdSet] } }, include: { account: true } })
 				: [],
+			prisma.account.findFirst({ where: { type: "CASH" } }),
 		]);
 
 		const vendorMap = new Map(vendors.map(v => [v.id, v]));
@@ -1041,9 +1137,27 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			customers.forEach(c => seedBalance(c.account));
 			banks.forEach(b => seedBalance(b.account));
 
+			// Seed cash account (if it already exists)
+			let cashAccount = existingCashAccount;
+			if (cashAccount) seedBalance(cashAccount);
+
 			const getBal = (id) => balances.get(id) || 0;
 			const setBal = (id, v) => { balances.set(id, Number(v)); touchedAccounts.add(id); };
 			const adjBal = (id, d) => setBal(id, getBal(id) + d);
+
+			/* ──────────────────────────────────────────────────────
+			   HELPER: get-or-create the singleton CASH account
+			   ────────────────────────────────────────────────────── */
+			const getCashAccount = async () => {
+				if (cashAccount) return cashAccount;
+
+				cashAccount = await tx.account.create({
+					data: { name: "Cash Account", type: "CASH", balance: 0 },
+				});
+				balances.set(cashAccount.id, 0);
+
+				return cashAccount;
+			};
 
 			/* ══════════════════════════════════════════════════════
 			   HELPERS — mirror the POST helpers exactly
@@ -1073,6 +1187,30 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					where: { saleId, accountId: bank.account.id, entryType: "PAYMENT" },
 				});
 				adjBal(bank.account.id, -amount);
+			};
+
+			/** Apply a cash-received-payment ledger entry (money in) */
+			const applyCashPayment = async (amount, saleId) => {
+				const cash = await getCashAccount();
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: cash.id, entryType: "PAYMENT",
+						debit: 0, credit: amount,
+						transactionDate: businessDate,
+						saleId, invoiceId,
+						remarks: `Cash payment received - Invoice ${invoiceNo}`,
+					},
+				});
+				adjBal(cash.id, amount);
+			};
+
+			/** Reverse a previous cash-received-payment (money out) */
+			const reverseCashPayment = async (amount, saleId) => {
+				if (!cashAccount) return;
+				await tx.ledgerEntry.deleteMany({
+					where: { saleId, accountId: cashAccount.id, entryType: "PAYMENT" },
+				});
+				adjBal(cashAccount.id, -amount);
 			};
 
 			/** Apply credit-sale + optional immediate payment entries */
@@ -1129,7 +1267,10 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				}
 
 				// Payment-side reversal
-				// Payment-side reversal
+				if (pt === "CASH") {
+					await reverseCashPayment(paid, sale.id);
+				}
+
 				if (pt === "BANK_TRANSFER" && sale.bank?.account) {
 					await reverseBankPayment(sale.bankId, paid, sale.id);
 					if (sell - paid > 0 && sale.customer?.account) {
@@ -1144,6 +1285,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				if (pt === "PARTIAL") {
 					for (const leg of (sale.payments || [])) {
 						const lm = String(leg.method).toUpperCase();
+						if (lm === "CASH") {
+							await reverseCashPayment(leg.amount, sale.id);
+						}
 						if (lm === "BANK_TRANSFER" && leg.bank?.account) {
 							await reverseBankPayment(leg.bankId, leg.amount, sale.id);
 						}
@@ -1269,7 +1413,10 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 				if (paymentSideChanged) {
 					/* ── REVERSE OLD payment side ── */
-					/* ── REVERSE OLD payment side ── */
+					if (oldPt === "CASH") {
+						await reverseCashPayment(oldPaid, current.id);
+					}
+
 					if (oldPt === "BANK_TRANSFER" && current.bankId) {
 						await reverseBankPayment(current.bankId, oldPaid, current.id);
 						const oldRemainingBT = oldSell - oldPaid;
@@ -1285,6 +1432,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					if (oldPt === "PARTIAL") {
 						for (const leg of (current.payments || [])) {
 							const lm = String(leg.method).toUpperCase();
+							if (lm === "CASH") {
+								await reverseCashPayment(leg.amount, current.id);
+							}
 							if (lm === "BANK_TRANSFER" && leg.bankId) {
 								await reverseBankPayment(leg.bankId, leg.amount, current.id);
 							}
@@ -1298,7 +1448,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 					/* ── APPLY NEW payment side ── */
 					if (newPt === "CASH") {
-						// Cash: no payment-side account entry
+						await applyCashPayment(newPaid, current.id);
 					}
 
 					else if (newPt === "BANK_TRANSFER") {
@@ -1325,11 +1475,16 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 									method: lm,
 									amount: legAmount,
 									bankId: lm === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+									accountId: lm === "CASH" ? (await getCashAccount()).id : null,
 									customerId: lm === "CREDIT" ? (leg.customerId || null) : null,
 									remarks: leg.remarks || null,
 									paymentDate: businessDate,
 								},
 							});
+
+							if (lm === "CASH") {
+								await applyCashPayment(legAmount, current.id);
+							}
 
 							if (lm === "BANK_TRANSFER") {
 								await applyBankPayment(leg.bankId, legAmount, current.id);
@@ -1338,7 +1493,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 							if (lm === "CREDIT") {
 								await applyCreditSale(leg.customerId, legAmount, 0, current.id);
 							}
-							// CASH leg: no account entry
 						}
 					}
 				}
@@ -1351,6 +1505,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						vendorId: payload.vendorId,
 						customerId: (newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null,
 						bankId: newPt === "BANK_TRANSFER" ? (payload.bankId || null) : null,
+						accountId: newPt === "CASH" ? (await getCashAccount()).id : null,
 						documentNo: payload.documentNo || null,
 						pnr: payload.pnr ?? current.pnr,
 						routeType: payload.routeType ?? current.routeType,
@@ -1414,30 +1569,39 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 /* ======================= DELETE INVOICE ======================= */
 router.delete("/:invoiceId", authenticate, async (req, res) => {
 	const { invoiceId } = req.params;
-	
+
 	try {
 		await prisma.$transaction(async (tx) => {
-			/* 1️⃣ Load invoice with sales */
+			/* 1️⃣ Load invoice with sales + all payment-side relations */
 			const invoice = await tx.salesInvoice.findUnique({
 				where: { id: invoiceId },
 				include: {
 					sales: {
 						include: {
 							vendor: { include: { account: true } },
-							customer: { include: { account: true } }
-						}
-					}
-				}
+							customer: { include: { account: true } },
+							bank: { include: { account: true } },
+							account: true, // cash account (populated when paymentType/leg = CASH)
+							payments: {
+								include: {
+									bank: { include: { account: true } },
+									customer: { include: { account: true } },
+									account: true, // cash account for PARTIAL cash legs
+								},
+							},
+						},
+					},
+				},
 			});
 
 			if (!invoice) throw new Error("Invoice not found");
 
 			/* 2️⃣ Reverse each sale */
 			for (const sale of invoice.sales) {
-				const net = Number(sale.netPrice);
-				const sell = Number(sale.sellPrice);
+				const net = Number(sale.netPrice || 0);
+				const sell = Number(sale.sellPrice || 0);
 				const paid = Number(sale.paidAmount || 0);
-				const isCredit = String(sale.paymentType).toUpperCase() === "CREDIT";
+				const pt = String(sale.paymentType || "").toUpperCase();
 
 				/* ──────────────────────────────────────────────────
 				   VENDOR REVERSAL
@@ -1447,83 +1611,177 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 					const accId = vendor.account.id;
 					const isDebit = vendor.category === "DEBIT";
 
-					/* Reverse the sale effect */
 					const delta = isDebit ? -net : net; // Opposite of original
 
-					/* Delete original SALE ledger entries */
 					await tx.ledgerEntry.deleteMany({
 						where: {
 							saleId: sale.id,
 							accountId: accId,
-							entryType: "SALE"
-						}
+							entryType: "SALE",
+						},
 					});
 
-					/* Update vendor balance */
 					await tx.account.update({
 						where: { id: accId },
-						data: { balance: { increment: delta } }
+						data: { balance: { increment: delta } },
 					});
 				}
 
 				/* ──────────────────────────────────────────────────
-				   CUSTOMER REVERSAL (if CREDIT sale)
+				   PAYMENT-SIDE REVERSAL
 				────────────────────────────────────────────────── */
-				if (isCredit && sale.customer?.account) {
-					const accId = sale.customer.account.id;
+				if (pt === "CASH") {
+					if (sale.account) {
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: sale.account.id,
+								entryType: "PAYMENT",
+							},
+						});
 
-					/* Delete SALE ledger entry */
-					await tx.ledgerEntry.deleteMany({
-						where: {
-							saleId: sale.id,
-							accountId: accId,
-							entryType: "SALE"
+						await tx.account.update({
+							where: { id: sale.account.id },
+							data: { balance: { decrement: paid } },
+						});
+					}
+				}
+
+				else if (pt === "BANK_TRANSFER") {
+					if (sale.bank?.account) {
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: sale.bank.account.id,
+								entryType: "PAYMENT",
+							},
+						});
+
+						await tx.account.update({
+							where: { id: sale.bank.account.id },
+							data: { balance: { decrement: paid } },
+						});
+					}
+
+					const remainingBT = sell - paid;
+					if (remainingBT > 0 && sale.customer?.account) {
+						const accId = sale.customer.account.id;
+
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: accId,
+								entryType: { in: ["SALE", "PAYMENT"] },
+							},
+						});
+
+						await tx.account.update({
+							where: { id: accId },
+							data: { balance: { decrement: remainingBT } },
+						});
+					}
+				}
+
+				else if (pt === "CREDIT") {
+					if (sale.customer?.account) {
+						const accId = sale.customer.account.id;
+
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: accId,
+								entryType: { in: ["SALE", "PAYMENT"] },
+							},
+						});
+
+						const balanceDelta = -(sell - paid); // Remove receivable created at sale time
+						await tx.account.update({
+							where: { id: accId },
+							data: { balance: { increment: balanceDelta } },
+						});
+					}
+				}
+
+				else if (pt === "PARTIAL") {
+					for (const leg of sale.payments || []) {
+						const lm = String(leg.method || "").toUpperCase();
+						const legAmount = Number(leg.amount || 0);
+
+						if (lm === "CASH" && leg.account) {
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
 						}
-					});
 
-					/* Delete PAYMENT ledger entry (if exists) */
-					await tx.ledgerEntry.deleteMany({
-						where: {
-							saleId: sale.id,
-							accountId: accId,
-							entryType: "PAYMENT"
+						else if (lm === "BANK_TRANSFER" && leg.bank?.account) {
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.bank.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.bank.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
 						}
-					});
 
-					/* Update customer balance */
-					const balanceDelta = -sell + paid; // Remove sale, restore payment
-					await tx.account.update({
-						where: { id: accId },
-						data: { balance: { increment: balanceDelta } }
-					});
+						else if (lm === "CREDIT" && leg.customer?.account) {
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.customer.account.id,
+									entryType: { in: ["SALE", "PAYMENT"] },
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.customer.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
+						}
+					}
+
+					await tx.salePayment.deleteMany({ where: { saleId: sale.id } });
 				}
 			}
 
-			/* 3️⃣ Delete all ledger entries for this invoice */
+			/* 3️⃣ Safety cleanup — delete all remaining ledger entries for this invoice */
 			await tx.ledgerEntry.deleteMany({
-				where: { invoiceId }
+				where: { invoiceId },
 			});
 
 			/* 4️⃣ Delete sales */
 			await tx.sale.deleteMany({
-				where: { invoiceId }
+				where: { invoiceId },
 			});
 
 			/* 5️⃣ Delete invoice */
 			await tx.salesInvoice.delete({
-				where: { id: invoiceId }
+				where: { id: invoiceId },
 			});
-		});
+		}, { timeout: 30000 });
 
-		res.json({ 
+		res.json({
 			success: true,
-			message: "Invoice deleted successfully"
+			message: "Invoice deleted successfully",
 		});
 	} catch (err) {
 		console.error(err);
 		res.status(400).json({
 			success: false,
-			error: err.message || "Failed to delete invoice"
+			error: err.message || "Failed to delete invoice",
 		});
 	}
 });
@@ -1541,10 +1799,12 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 					vendor: { include: { account: true } },
 					customer: { include: { account: true } },
 					bank: { include: { account: true } },
+					account: true, // cash account
 					payments: {
 						include: {
 							bank: { include: { account: true } },
 							customer: { include: { account: true } },
+							account: true, // cash account for PARTIAL cash legs
 						},
 					},
 				},
@@ -1589,11 +1849,25 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 			══════════════════════════════════════════════════════ */
 
 			if (pt === "CASH") {
-				/* No ledger entry for cash in create API, so nothing to reverse */
+				/* Cash received full paid amount in create/update API */
+				if (sale.account) {
+					await tx.ledgerEntry.deleteMany({
+						where: {
+							saleId: sale.id,
+							accountId: sale.account.id,
+							entryType: "PAYMENT",
+						},
+					});
+
+					await tx.account.update({
+						where: { id: sale.account.id },
+						data: { balance: { decrement: paid } },
+					});
+				}
 			}
 
 			else if (pt === "BANK_TRANSFER") {
-				/* Bank received full sell amount in create API */
+				/* Bank received paid amount in create API */
 				if (!sale.bank?.account) {
 					throw new Error("Related bank account not found for bank transfer sale");
 				}
@@ -1609,9 +1883,28 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 				await tx.account.update({
 					where: { id: sale.bank.account.id },
 					data: {
-						balance: { decrement: sell },
+						balance: { decrement: paid },
 					},
 				});
+
+				/* If there was a remaining balance charged to customer */
+				const remainingBT = sell - paid;
+				if (remainingBT > 0 && sale.customer?.account) {
+					const accId = sale.customer.account.id;
+
+					await tx.ledgerEntry.deleteMany({
+						where: {
+							saleId: sale.id,
+							accountId: accId,
+							entryType: { in: ["SALE", "PAYMENT"] },
+						},
+					});
+
+					await tx.account.update({
+						where: { id: accId },
+						data: { balance: { decrement: remainingBT } },
+					});
+				}
 			}
 
 			else if (pt === "CREDIT") {
@@ -1649,7 +1942,25 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 					const legAmount = Number(leg.amount || 0);
 
 					if (legMethod === "CASH") {
-						/* No ledger entry for cash leg in create API */
+						if (!leg.account) {
+							throw new Error(`Related cash account not found for payment leg ${leg.id}`);
+						}
+
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: leg.account.id,
+								entryType: "PAYMENT",
+							},
+						});
+
+						await tx.account.update({
+							where: { id: leg.account.id },
+							data: {
+								balance: { decrement: legAmount },
+							},
+						});
+
 						continue;
 					}
 

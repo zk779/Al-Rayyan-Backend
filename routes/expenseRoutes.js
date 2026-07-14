@@ -115,7 +115,7 @@ router.post("/", async (req, res) => {
         return res.status(400).json({ success: false, error: "User is inactive" });
     }
 
-    // ---- Load + validate bank (BANK_TRANSFER only — CASH attaches no account at all) ----
+    // ---- Load + validate bank (BANK_TRANSFER only) ----
     let bank = null;
     if (paymentMode === "BANK_TRANSFER") {
       bank = await prisma.bank.findUnique({
@@ -136,7 +136,49 @@ router.post("/", async (req, res) => {
         });
     }
 
+    // ---- Load cash account (CASH only) — validation, not creation ----
+    let cashAccount = null;
+    if (paymentMode === "CASH") {
+      cashAccount = await prisma.account.findFirst({ where: { type: "CASH" } });
+
+      if (newStatus === "APPROVED" && cashAccount && amount > cashAccount.balance)
+        return res.status(400).json({
+          success: false,
+          error: `Insufficient cash balance. Trying to pay ${amount} but cash account only has ${cashAccount.balance} available.`,
+        });
+    }
+
     const result = await prisma.$transaction(async (tx) => {
+      // ---- Get-or-create the singleton EXPENSE account ----
+      const getExpenseAccount = async () => {
+        let expenseAccount = await tx.account.findFirst({ where: { type: "EXPENSE" } });
+
+        if (!expenseAccount) {
+          expenseAccount = await tx.account.create({
+            data: { name: "Expense Account", type: "EXPENSE", balance: 0 },
+          });
+        }
+
+        return expenseAccount;
+      };
+
+      // ---- Get-or-create the singleton CASH account (only if needed) ----
+      const getCashAccount = async () => {
+        if (cashAccount) return cashAccount;
+
+        cashAccount = await tx.account.findFirst({ where: { type: "CASH" } });
+
+        if (!cashAccount) {
+          cashAccount = await tx.account.create({
+            data: { name: "Cash Account", type: "CASH", balance: 0 },
+          });
+        }
+
+        return cashAccount;
+      };
+
+      const cash = paymentMode === "CASH" ? await getCashAccount() : null;
+
       const expense = await tx.expense.create({
         data: {
           date: parsedDate,
@@ -147,14 +189,37 @@ router.post("/", async (req, res) => {
           status: newStatus,
           paymentMode,
           bankId: paymentMode === "BANK_TRANSFER" ? bankId : null,
+          accountId: paymentMode === "CASH" ? cash.id : null,
           userId: category === "SALARY" ? userId : null,
           description: description ?? null,
         },
       });
 
       if (newStatus === "APPROVED") {
+        // ── 1. Always post a debit entry against the Expense account, and
+        //       grow its balance — this tracks total expenses regardless
+        //       of payment mode.
+        const expenseAccount = await getExpenseAccount();
+
+        await tx.ledgerEntry.create({
+          data: {
+            accountId: expenseAccount.id,
+            entryType: "EXPENSE",
+            debit: amount,
+            credit: 0,
+            expenseId: expense.id,
+            transactionDate: parsedExpenseDate,
+            remarks: description ?? null,
+          },
+        });
+
+        await tx.account.update({
+          where: { id: expenseAccount.id },
+          data: { balance: { increment: amount } },
+        });
+
+        // ── 2. Deduct from wherever the money actually came from ──
         if (paymentMode === "BANK_TRANSFER") {
-          // Only BANK_TRANSFER actually moves money out of an account.
           await tx.account.update({
             where: { id: bank.account.id },
             data: { balance: { increment: -amount } },
@@ -171,10 +236,15 @@ router.post("/", async (req, res) => {
               remarks: description ?? null,
             },
           });
-        } else {
-          // CASH — record-only ledger entry, no account attached, no balance touched.
+        } else if (paymentMode === "CASH") {
+          await tx.account.update({
+            where: { id: cash.id },
+            data: { balance: { increment: -amount } },
+          });
+
           await tx.ledgerEntry.create({
             data: {
+              accountId: cash.id,
               entryType: "EXPENSE",
               debit: amount,
               credit: 0,
@@ -194,6 +264,7 @@ router.post("/", async (req, res) => {
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
         user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
@@ -224,6 +295,7 @@ router.get("/", async (req, res) => {
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
         user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
@@ -247,6 +319,7 @@ router.get("/:id", async (req, res) => {
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
         user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
@@ -440,6 +513,12 @@ router.put("/:id", async (req, res) => {
       });
     }
 
+    // ---- Load OLD cash account (only needed to reverse a CASH balance leg) ----
+    let oldCashAccount = null;
+    if (wasApproved && existing.paymentMode === "CASH" && existing.accountId) {
+      oldCashAccount = await prisma.account.findUnique({ where: { id: existing.accountId } });
+    }
+
     // ---- Load + validate NEW bank (needed if the new state posts a BANK_TRANSFER leg) ----
     let newBank = null;
     if (willBeApproved && newPaymentMode === "BANK_TRANSFER") {
@@ -454,8 +533,7 @@ router.put("/:id", async (req, res) => {
       if (!newBank.isActive)
         return res.status(400).json({ success: false, error: "Bank account is inactive" });
 
-      // Sufficiency check — only meaningful for BANK_TRANSFER since CASH never
-      // touches a balance. If it's the same bank as before (and it was already
+      // Sufficiency check. If it's the same bank as before (and it was already
       // posting), restore its old debit first.
       const restoredBankBalance =
         oldBank?.id === newBank.id
@@ -469,8 +547,68 @@ router.put("/:id", async (req, res) => {
         });
     }
 
+    // ---- Load + validate NEW cash account (needed if the new state posts a CASH leg) ----
+    let newCashAccount = null;
+    if (willBeApproved && newPaymentMode === "CASH") {
+      newCashAccount = await prisma.account.findFirst({ where: { type: "CASH" } });
+
+      if (newCashAccount) {
+        const restoredCashBalance =
+          oldCashAccount?.id === newCashAccount.id
+            ? newCashAccount.balance + existing.amount
+            : newCashAccount.balance;
+
+        if (newAmount > restoredCashBalance)
+          return res.status(400).json({
+            success: false,
+            error: `Insufficient cash balance. Trying to pay ${newAmount} but cash account only has ${restoredCashBalance} available.`,
+          });
+      }
+    }
+
     const result = await prisma.$transaction(async (tx) => {
-      // ---- 1. Reverse the OLD balance leg — BANK_TRANSFER only ----
+      // ---- Get-or-create the singleton EXPENSE account ----
+      const getExpenseAccount = async () => {
+        let expenseAccount = await tx.account.findFirst({ where: { type: "EXPENSE" } });
+
+        if (!expenseAccount) {
+          expenseAccount = await tx.account.create({
+            data: { name: "Expense Account", type: "EXPENSE", balance: 0 },
+          });
+        }
+
+        return expenseAccount;
+      };
+
+      // ---- Get-or-create the singleton CASH account (only if needed) ----
+      const getCashAccount = async () => {
+        if (newCashAccount) return newCashAccount;
+
+        newCashAccount = await tx.account.findFirst({ where: { type: "CASH" } });
+
+        if (!newCashAccount) {
+          newCashAccount = await tx.account.create({
+            data: { name: "Cash Account", type: "CASH", balance: 0 },
+          });
+        }
+
+        return newCashAccount;
+      };
+
+      const expenseAccount = await getExpenseAccount();
+      const cash = willBeApproved && newPaymentMode === "CASH" ? await getCashAccount() : null;
+
+      // ---- 1. Reverse the OLD legs (if the old expense was APPROVED) ----
+
+      // 1a. Expense-account leg — always reversed if it was previously approved
+      if (wasApproved) {
+        await tx.account.update({
+          where: { id: expenseAccount.id },
+          data: { balance: { increment: -existing.amount } }, // undo the old +amount growth
+        });
+      }
+
+      // 1b. Bank leg — BANK_TRANSFER only
       if (wasApproved && existing.paymentMode === "BANK_TRANSFER" && oldBank) {
         await tx.account.update({
           where: { id: oldBank.account.id },
@@ -478,8 +616,16 @@ router.put("/:id", async (req, res) => {
         });
       }
 
+      // 1c. Cash leg — CASH only
+      if (wasApproved && existing.paymentMode === "CASH" && oldCashAccount) {
+        await tx.account.update({
+          where: { id: oldCashAccount.id },
+          data: { balance: { increment: existing.amount } }, // undo the old -amount debit
+        });
+      }
+
       // Old ledger entries are always cleared; recreated below if the new
-      // state needs one (CASH or BANK_TRANSFER).
+      // state needs them.
       await tx.ledgerEntry.deleteMany({ where: { expenseId: id } });
 
       // ---- 2. Update the expense record ----
@@ -494,13 +640,33 @@ router.put("/:id", async (req, res) => {
           status: newStatus,
           paymentMode: newPaymentMode,
           bankId: newPaymentMode === "BANK_TRANSFER" ? newBankId : null,
+          accountId: newPaymentMode === "CASH" ? cash?.id ?? null : null,
           userId: newCategory === "SALARY" ? newUserId : null,
           description: newDescription,
         },
       });
 
-      // ---- 3. Apply the NEW leg ----
+      // ---- 3. Apply the NEW legs (only if the new state is APPROVED) ----
       if (willBeApproved) {
+        // 3a. Expense-account leg — always posted regardless of payment mode
+        await tx.ledgerEntry.create({
+          data: {
+            accountId: expenseAccount.id,
+            entryType: "EXPENSE",
+            debit: newAmount,
+            credit: 0,
+            expenseId: id,
+            transactionDate: newExpenseDate,
+            remarks: newDescription ?? null,
+          },
+        });
+
+        await tx.account.update({
+          where: { id: expenseAccount.id },
+          data: { balance: { increment: newAmount } },
+        });
+
+        // 3b. Source-account leg
         if (newPaymentMode === "BANK_TRANSFER") {
           await tx.account.update({
             where: { id: newBank.account.id },
@@ -518,10 +684,15 @@ router.put("/:id", async (req, res) => {
               remarks: newDescription ?? null,
             },
           });
-        } else {
-          // CASH — record-only ledger entry, no account attached, no balance touched.
+        } else if (newPaymentMode === "CASH") {
+          await tx.account.update({
+            where: { id: cash.id },
+            data: { balance: { increment: -newAmount } },
+          });
+
           await tx.ledgerEntry.create({
             data: {
+              accountId: cash.id,
               entryType: "EXPENSE",
               debit: newAmount,
               credit: 0,
@@ -541,6 +712,7 @@ router.put("/:id", async (req, res) => {
       include: {
         branch: { select: { id: true, name: true, code: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
         user: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
@@ -566,25 +738,59 @@ router.delete("/:id", async (req, res) => {
     if (!existing)
       return res.status(404).json({ success: false, error: "Expense not found" });
 
-    // Only a BANK_TRANSFER leg ever needs its balance reversed — CASH never
-    // touched any balance in the first place.
+    // Nothing to reverse at all unless the expense was actually APPROVED —
+    // REJECTED expenses never touched any account/ledger.
+    const wasApproved = existing.status === "APPROVED";
+
+    // ---- Load the Expense account (always involved when wasApproved) ----
+    let expenseAccount = null;
+    if (wasApproved) {
+      expenseAccount = await prisma.account.findFirst({ where: { type: "EXPENSE" } });
+    }
+
+    // ---- Load bank (only needed to reverse a BANK_TRANSFER leg) ----
     let bank = null;
-    if (existing.status === "APPROVED" && existing.paymentMode === "BANK_TRANSFER" && existing.bankId) {
+    if (wasApproved && existing.paymentMode === "BANK_TRANSFER" && existing.bankId) {
       bank = await prisma.bank.findUnique({
         where: { id: existing.bankId },
         include: { account: true },
       });
     }
 
+    // ---- Load cash account (only needed to reverse a CASH leg) ----
+    let cashAccount = null;
+    if (wasApproved && existing.paymentMode === "CASH" && existing.accountId) {
+      cashAccount = await prisma.account.findUnique({ where: { id: existing.accountId } });
+    }
+
     await prisma.$transaction(async (tx) => {
-      if (bank) {
+      // ---- 1. Reverse the Expense-account leg (grows on approve, shrinks on delete) ----
+      if (wasApproved && expenseAccount) {
         await tx.account.update({
-          where: { id: bank.account.id },
-          data: { balance: { increment: existing.amount } },
+          where: { id: expenseAccount.id },
+          data: { balance: { increment: -existing.amount } },
         });
       }
 
+      // ---- 2. Reverse the source-account leg (bank OR cash — whichever was used) ----
+      if (wasApproved && existing.paymentMode === "BANK_TRANSFER" && bank) {
+        await tx.account.update({
+          where: { id: bank.account.id },
+          data: { balance: { increment: existing.amount } }, // undo the -amount debit
+        });
+      }
+
+      if (wasApproved && existing.paymentMode === "CASH" && cashAccount) {
+        await tx.account.update({
+          where: { id: cashAccount.id },
+          data: { balance: { increment: existing.amount } }, // undo the -amount debit
+        });
+      }
+
+      // ---- 3. Delete all ledger entries tied to this expense ----
       await tx.ledgerEntry.deleteMany({ where: { expenseId: id } });
+
+      // ---- 4. Delete the expense record itself ----
       await tx.expense.delete({ where: { id } });
     });
 

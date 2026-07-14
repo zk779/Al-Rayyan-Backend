@@ -273,6 +273,18 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                 });
         }
 
+        // ---- Load (or lazily create) the singleton CASH account if relevant ----
+        let cashAccount = null;
+        if (method === "CASH") {
+            cashAccount = await prisma.account.findFirst({ where: { type: "CASH" } });
+
+            if (partyType === "VENDOR" && cashAccount && amount > cashAccount.balance)
+                return res.status(400).json({
+                    success: false,
+                    error: `Insufficient cash balance. Trying to pay ${amount} but cash account only has ${cashAccount.balance} available.`,
+                });
+        }
+
         // ---- Determine ledger direction + enforce balance cap rules ----
         const partyAccount = partyType === "VENDOR" ? vendor.account : customer.account;
         const currentBalance = partyAccount.balance;
@@ -318,8 +330,43 @@ router.post("/", upload.single("attachment"), async (req, res) => {
             }
         }
 
+        // ---- Cash leg direction ----
+        // VENDOR payment (money going out)  -> debit cash, balance decreases
+        // CUSTOMER payment (money coming in) -> credit cash, balance increases
+        let cashLegDebit = 0;
+        let cashLegCredit = 0;
+        let cashBalanceDelta = 0;
+
+        if (method === "CASH") {
+            if (partyType === "VENDOR") {
+                cashLegDebit = amount;
+                cashBalanceDelta = -amount;
+            } else {
+                cashLegCredit = amount;
+                cashBalanceDelta = amount;
+            }
+        }
+
         // ---- Persist everything atomically ----
         const result = await prisma.$transaction(async (tx) => {
+            // Get-or-create the singleton cash account inside the transaction
+            // so we always have a fresh, lockable reference to update.
+            const getCashAccount = async () => {
+                if (cashAccount) return cashAccount;
+
+                cashAccount = await tx.account.findFirst({ where: { type: "CASH" } });
+
+                if (!cashAccount) {
+                    cashAccount = await tx.account.create({
+                        data: { name: "Cash Account", type: "CASH", balance: 0 },
+                    });
+                }
+
+                return cashAccount;
+            };
+
+            const cash = method === "CASH" ? await getCashAccount() : null;
+
             const payment = await tx.vendorCustomerPayment.create({
                 data: {
                     partyType,
@@ -328,6 +375,7 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                     method,
                     amount,
                     bankId: method === "BANK_TRANSFER" ? bankId : null,
+                    accountId: method === "CASH" ? cash.id : null,
                     attachmentUrl: attachmentUrl,
                     remarks: remarks ?? null,
                     transactionDate: parsedDate,
@@ -357,6 +405,24 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                         },
                     });
 
+                    // ---- Cash leg per allocation (CUSTOMER + CASH only) ----
+                    if (method === "CASH") {
+                        await tx.ledgerEntry.create({
+                            data: {
+                                accountId: cash.id,
+                                entryType: "PAYMENT",
+                                debit: 0,
+                                credit: a.amount,
+                                saleId: a.saleId,
+                                vendorCustomerPaymentId: payment.id,
+                                transactionDate: parsedDate,
+                                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${a.saleId})${
+                                    remarks ? ` — ${remarks}` : ""
+                                }`,
+                            },
+                        });
+                    }
+
                     // Update the sale's paid amount + status
                     const newPaidAmount = sale.paidAmount + a.amount;
                     const newStatus =
@@ -383,6 +449,21 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                         remarks: remarks ?? null,
                     },
                 });
+
+                // ---- Cash leg (VENDOR + CASH) — single combined entry ----
+                if (method === "CASH") {
+                    await tx.ledgerEntry.create({
+                        data: {
+                            accountId: cash.id,
+                            entryType: "PAYMENT",
+                            debit: cashLegDebit,
+                            credit: cashLegCredit,
+                            vendorCustomerPaymentId: payment.id,
+                            transactionDate: parsedDate,
+                            remarks: remarks ?? null,
+                        },
+                    });
+                }
             }
 
             await tx.account.update({
@@ -410,6 +491,14 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                 });
             }
 
+            // ---- Cash account balance update (only for CASH) ----
+            if (method === "CASH") {
+                await tx.account.update({
+                    where: { id: cash.id },
+                    data: { balance: { increment: cashBalanceDelta } },
+                });
+            }
+
             return payment;
         });
 
@@ -419,6 +508,7 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                 vendor: { select: { id: true, vendorName: true, category: true } },
                 customer: { select: { id: true, customerName: true } },
                 bank: { select: { id: true, bankName: true, accountNumber: true } },
+                account: { select: { id: true, name: true, type: true, balance: true } },
                 ledgerEntries: true,
             },
         });
@@ -430,7 +520,6 @@ router.post("/", upload.single("attachment"), async (req, res) => {
     }
 });
 
-
 // ---- GET ALL ----
 router.get("/", async (req, res) => {
   try {
@@ -439,6 +528,7 @@ router.get("/", async (req, res) => {
         vendor: { select: { id: true, vendorName: true, category: true } },
         customer: { select: { id: true, customerName: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
         ledgerEntries: true,
       },
       orderBy: { transactionDate: "desc" },
@@ -463,6 +553,7 @@ router.get("/:id", async (req, res) => {
         vendor: { select: { id: true, vendorName: true, category: true } },
         customer: { select: { id: true, customerName: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
         ledgerEntries: true,
       },
     });
@@ -509,9 +600,6 @@ router.put("/:id", async (req, res) => {
     const partyType = existing.partyType;
 
     // ---- Parse saleAllocations (CUSTOMER only) ----
-    // `allocations === null` means "not provided in this request" — keep the
-    // existing per-invoice split untouched. `allocations` being a (possibly
-    // validated) array means the caller wants to replace the split entirely.
     let allocations = null;
     if (partyType === "CUSTOMER" && saleAllocations !== undefined && saleAllocations !== null) {
       if (typeof saleAllocations === "string") {
@@ -571,8 +659,6 @@ router.put("/:id", async (req, res) => {
 
       newAmount = allocationTotal;
     } else if (partyType === "CUSTOMER" && !allocations) {
-      // No new allocation supplied — amount cannot be changed in isolation,
-      // since we wouldn't know which invoice(s) the delta applies to.
       if (amount !== undefined && amount !== null && Number(amount) !== existing.amount)
         return res.status(400).json({
           success: false,
@@ -642,6 +728,12 @@ router.put("/:id", async (req, res) => {
         return res.status(400).json({ success: false, error: "Bank account is inactive" });
     }
 
+    // ---- Load new cash account if method is CASH (get, not yet create) ----
+    let newCashAccount = null;
+    if (newMethod === "CASH") {
+      newCashAccount = await prisma.account.findFirst({ where: { type: "CASH" } });
+    }
+
     // ---- Find old bank account/entry (needed only to reverse the BANK leg) ----
     let oldBankAccount = null;
     let oldBankEntry = null;
@@ -654,15 +746,25 @@ router.put("/:id", async (req, res) => {
       oldBankEntry = existing.ledgerEntries.find((e) => e.accountId === oldBankAccount?.id);
     }
 
+    // ---- Find old cash account/entries (needed only to reverse the CASH leg) ----
+    // Note: for CUSTOMER payments cash may be split across multiple entries
+    // (one per sale), so we sum debit-credit across all of them for reversal.
+    let oldCashAccount = null;
+    let oldCashDelta = 0;
+    if (existing.method === "CASH" && existing.accountId) {
+      oldCashAccount = await prisma.account.findUnique({ where: { id: existing.accountId } });
+      const oldCashEntries = existing.ledgerEntries.filter((e) => e.accountId === existing.accountId);
+      oldCashDelta = oldCashEntries.reduce((sum, e) => sum + (e.debit - e.credit), 0);
+    }
+
     // ---- CUSTOMER: work out the per-sale reversal + reallocation plan ----
-    // oldAllocationMap: saleId -> amount previously credited by THIS payment
-    // (read straight off the existing per-sale ledger entries, so it's always
-    // in sync with what was actually posted, regardless of what the payment's
-    // `amount` field says).
     const oldAllocationMap = new Map();
     if (partyType === "CUSTOMER") {
       existing.ledgerEntries.forEach((e) => {
-        if (e.saleId) {
+        // Only count the PARTY-side entries (i.e. against the customer's own
+        // account), not the mirrored bank/cash-side entries, to avoid
+        // double-counting saleId contributions.
+        if (e.saleId && e.accountId === partyAccount.id) {
           oldAllocationMap.set(e.saleId, (oldAllocationMap.get(e.saleId) || 0) + e.credit);
         }
       });
@@ -674,7 +776,7 @@ router.put("/:id", async (req, res) => {
     ]);
 
     let salesById = new Map();
-    let saleFinalUpdates = []; // { saleId, newPaidAmount, newStatus } — only populated when allocations replace the split
+    let saleFinalUpdates = [];
 
     if (partyType === "CUSTOMER" && unionSaleIds.size > 0) {
       const saleList = await prisma.sale.findMany({
@@ -702,7 +804,6 @@ router.put("/:id", async (req, res) => {
           const oldAmt = oldAllocationMap.get(saleId) || 0;
           const newAmt = newAllocationMap.get(saleId) || 0;
 
-          // Reverse this payment's old contribution, then apply the new one.
           const working = sale.paidAmount - oldAmt + newAmt;
 
           if (working > sale.sellPrice + 0.01)
@@ -773,14 +874,65 @@ router.put("/:id", async (req, res) => {
       }
     }
 
+    // ---- Cash leg ----
+    // VENDOR + CASH -> debit cash (money out), single combined entry
+    // CUSTOMER + CASH -> credit cash (money in), per-sale entries
+    let cashLegDebit = 0;
+    let cashLegCredit = 0;
+
+    if (newMethod === "CASH") {
+      if (partyType === "VENDOR") {
+        const restoredCashBalance = newCashAccount
+          ? (oldCashAccount?.id === newCashAccount.id
+              ? newCashAccount.balance + existing.amount
+              : newCashAccount.balance)
+          : 0;
+
+        if (newAmount > restoredCashBalance)
+          return res.status(400).json({
+            success: false,
+            error: `Insufficient cash balance. Trying to pay ${newAmount} but cash account only has ${restoredCashBalance} available.`,
+          });
+
+        cashLegDebit = newAmount;
+      } else {
+        cashLegCredit = newAmount;
+      }
+    }
+
     // ---- Persist atomically ----
     const result = await prisma.$transaction(async (tx) => {
+      // Get-or-create the singleton cash account inside the transaction
+      const getCashAccount = async () => {
+        if (newCashAccount) return newCashAccount;
+
+        newCashAccount = await tx.account.findFirst({ where: { type: "CASH" } });
+
+        if (!newCashAccount) {
+          newCashAccount = await tx.account.create({
+            data: { name: "Cash Account", type: "CASH", balance: 0 },
+          });
+        }
+
+        return newCashAccount;
+      };
+
+      const cash = newMethod === "CASH" ? await getCashAccount() : null;
+
       // 1. Reverse old bank balance if old method was BANK_TRANSFER
       if (existing.method === "BANK_TRANSFER" && oldBankAccount) {
         const oldBankDelta = (oldBankEntry?.debit ?? 0) - (oldBankEntry?.credit ?? 0);
         await tx.account.update({
           where: { id: oldBankAccount.id },
           data: { balance: { increment: oldBankDelta } },
+        });
+      }
+
+      // 1b. Reverse old cash balance if old method was CASH
+      if (existing.method === "CASH" && oldCashAccount) {
+        await tx.account.update({
+          where: { id: oldCashAccount.id },
+          data: { balance: { increment: oldCashDelta } },
         });
       }
 
@@ -794,6 +946,7 @@ router.put("/:id", async (req, res) => {
           amount: newAmount,
           method: newMethod,
           bankId: newMethod === "BANK_TRANSFER" ? newBankId : null,
+          accountId: newMethod === "CASH" ? cash.id : null,
           attachmentUrl: attachmentUrl ?? existing.attachmentUrl,
           remarks: remarks ?? existing.remarks,
           transactionDate: parsedDate,
@@ -802,9 +955,6 @@ router.put("/:id", async (req, res) => {
 
       // 4. Party leg(s) + sale status updates
       if (partyType === "CUSTOMER" && allocations) {
-        // Full re-allocation: recreate one ledger entry per sale in the new
-        // split, and push each affected sale's paidAmount/paymentStatus to
-        // its recomputed (reversed-then-reapplied) value.
         for (const a of allocations) {
           const sale = salesById.get(a.saleId);
           const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
@@ -824,6 +974,24 @@ router.put("/:id", async (req, res) => {
               remarks: entryRemarks,
             },
           });
+
+          // ---- Cash leg per allocation (CUSTOMER + CASH only) ----
+          if (newMethod === "CASH") {
+            await tx.ledgerEntry.create({
+              data: {
+                accountId: cash.id,
+                entryType: "PAYMENT",
+                debit: 0,
+                credit: a.amount,
+                saleId: a.saleId,
+                vendorCustomerPaymentId: id,
+                transactionDate: parsedDate,
+                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${a.saleId})${
+                  (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+                }`,
+              },
+            });
+          }
         }
 
         for (const u of saleFinalUpdates) {
@@ -833,9 +1001,7 @@ router.put("/:id", async (req, res) => {
           });
         }
       } else if (partyType === "CUSTOMER" && !allocations) {
-        // No change to the split — just recreate the same per-sale entries
-        // (amounts unchanged) so they carry the updated transactionDate/remarks.
-        // Sale paidAmount/paymentStatus are untouched since nothing changed.
+        // No change to the split — recreate the same per-sale entries
         for (const [saleId, oldAmt] of oldAllocationMap.entries()) {
           const sale = salesById.get(saleId);
           const invoiceNo = sale?.invoice?.invoiceNo ?? "N/A";
@@ -855,6 +1021,24 @@ router.put("/:id", async (req, res) => {
               remarks: entryRemarks,
             },
           });
+
+          // ---- Cash leg per allocation (unchanged split, CASH only) ----
+          if (newMethod === "CASH") {
+            await tx.ledgerEntry.create({
+              data: {
+                accountId: cash.id,
+                entryType: "PAYMENT",
+                debit: 0,
+                credit: oldAmt,
+                saleId,
+                vendorCustomerPaymentId: id,
+                transactionDate: parsedDate,
+                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${saleId})${
+                  (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+                }`,
+              },
+            });
+          }
         }
       } else {
         // VENDOR — single combined leg, unchanged behavior
@@ -869,6 +1053,21 @@ router.put("/:id", async (req, res) => {
             remarks: remarks ?? existing.remarks ?? null,
           },
         });
+
+        // ---- Cash leg (VENDOR + CASH) — single combined entry ----
+        if (newMethod === "CASH") {
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: cash.id,
+              entryType: "PAYMENT",
+              debit: cashLegDebit,
+              credit: cashLegCredit,
+              vendorCustomerPaymentId: id,
+              transactionDate: parsedDate,
+              remarks: remarks ?? existing.remarks ?? null,
+            },
+          });
+        }
       }
 
       // 5. Apply party balance delta (net shift from old amount -> new amount)
@@ -898,6 +1097,15 @@ router.put("/:id", async (req, res) => {
         });
       }
 
+      // 7. Apply new cash balance (only for CASH)
+      if (newMethod === "CASH") {
+        const cashBalanceDelta = partyType === "VENDOR" ? -newAmount : newAmount;
+        await tx.account.update({
+          where: { id: cash.id },
+          data: { balance: { increment: cashBalanceDelta } },
+        });
+      }
+
       return updated;
     });
 
@@ -907,6 +1115,7 @@ router.put("/:id", async (req, res) => {
         vendor: { select: { id: true, vendorName: true, category: true } },
         customer: { select: { id: true, customerName: true } },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
         ledgerEntries: true,
       },
     });
@@ -959,11 +1168,17 @@ router.delete("/:id", async (req, res) => {
       bankAccount = bank?.account ?? null;
     }
 
+    // ---- Load cash account (if this payment used CASH) ----
+    let cashAccount = null;
+    if (existing.method === "CASH" && existing.accountId) {
+      cashAccount = await prisma.account.findUnique({ where: { id: existing.accountId } });
+    }
+
     // ---- Compute the correct reversal for the party leg ----
     // This must mirror the ORIGINAL balance effect (from the POST route), negated.
     // We can't safely derive this from (debit - credit) on the ledger entry, because
     // that convention only lines up as the true negative of the balance effect for
-    // the bank leg — not for the party leg (CUSTOMER / VENDOR-CREDIT have the same
+    // the bank/cash leg — not for the party leg (CUSTOMER / VENDOR-CREDIT have the same
     // sign as debit-credit, so using it directly would double the change instead of
     // undoing it).
     let partyReverseDelta = 0;
@@ -976,6 +1191,32 @@ router.delete("/:id", async (req, res) => {
     } else if (existing.partyType === "CUSTOMER") {
       // Original effect was -amount. Reverse = +amount.
       partyReverseDelta = existing.amount;
+    }
+
+    // ---- CUSTOMER: work out per-sale reversal for paidAmount / paymentStatus ----
+    // Only count the PARTY-side entries (against the customer's own account),
+    // not the mirrored bank/cash-side entries, to avoid double-counting.
+    let saleReversals = []; // [{ saleId, amountToReverse }]
+    let salesById = new Map();
+
+    if (existing.partyType === "CUSTOMER") {
+      const perSaleMap = new Map();
+      existing.ledgerEntries.forEach((e) => {
+        if (e.saleId && e.accountId === partyAccount.id) {
+          perSaleMap.set(e.saleId, (perSaleMap.get(e.saleId) || 0) + e.credit);
+        }
+      });
+
+      saleReversals = [...perSaleMap.entries()].map(([saleId, amountToReverse]) => ({
+        saleId,
+        amountToReverse,
+      }));
+
+      if (saleReversals.length > 0) {
+        const saleIds = saleReversals.map((s) => s.saleId);
+        const sales = await prisma.sale.findMany({ where: { id: { in: saleIds } } });
+        salesById = new Map(sales.map((s) => [s.id, s]));
+      }
     }
 
     await prisma.$transaction(async (tx) => {
@@ -992,6 +1233,36 @@ router.delete("/:id", async (req, res) => {
         await tx.account.update({
           where: { id: bankAccount.id },
           data: { balance: { increment: bankReverseDelta } },
+        });
+      }
+
+      // Reverse cash account balance — sum debit-credit across ALL cash entries
+      // tied to this payment (CUSTOMER payments may have one entry per sale).
+      if (cashAccount) {
+        const cashEntries = existing.ledgerEntries.filter((e) => e.accountId === cashAccount.id);
+        const cashReverseDelta = cashEntries.reduce((sum, e) => sum + (e.debit - e.credit), 0);
+        await tx.account.update({
+          where: { id: cashAccount.id },
+          data: { balance: { increment: cashReverseDelta } },
+        });
+      }
+
+      // ---- Reverse each affected sale's paidAmount + paymentStatus ----
+      for (const { saleId, amountToReverse } of saleReversals) {
+        const sale = salesById.get(saleId);
+        if (!sale) continue;
+
+        const newPaidAmount = Math.max(0, Number(sale.paidAmount || 0) - amountToReverse);
+        const newStatus =
+          newPaidAmount <= 0
+            ? "DUE"
+            : newPaidAmount >= Number(sale.sellPrice || 0)
+            ? "PAID"
+            : "PARTIAL";
+
+        await tx.sale.update({
+          where: { id: saleId },
+          data: { paidAmount: newPaidAmount, paymentStatus: newStatus },
         });
       }
 
