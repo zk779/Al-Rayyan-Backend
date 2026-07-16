@@ -410,11 +410,18 @@ model Sale {
     paxName      String?
     destinations Json?
 
+    // Edit history — array of { userId, userName, userEmail, updatedAt, changes }
+    // Each entry logs who edited this sale and a snapshot of what changed.
+    // Newest entries are appended (push), oldest first.
+    updatedBy Json?
+
     // Relations
-    invoice  SalesInvoice @relation(fields: [invoiceId], references: [id])
-    airline  AirlineCode  @relation(fields: [airlineId], references: [id])
-    vendor   Vendor       @relation(fields: [vendorId], references: [id])
-    customer Customer?    @relation(fields: [customerId], references: [id])
+    invoice        SalesInvoice @relation(fields: [invoiceId], references: [id])
+    airline        AirlineCode  @relation(fields: [airlineId], references: [id])
+    vendor         Vendor       @relation(fields: [vendorId], references: [id])
+    customer       Customer?    @relation(fields: [customerId], references: [id])
+    refundRecordId String?      @unique @db.ObjectId
+    refundRecord   Refund?      @relation("NegativeSaleRefund", fields: [refundRecordId], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
     refunds  Refund[]
     payments SalePayment[]
@@ -490,9 +497,10 @@ model Refund {
     status       RefundStatus @default(PENDING)
 
     // Dates
-    refundDate  DateTime
-    approvedAt  DateTime?
-    completedAt DateTime?
+    refundDate   DateTime
+    approvedAt   DateTime?
+    completedAt  DateTime?
+    negativeSale Sale?     @relation("NegativeSaleRefund")
 
     // Who processed
     processedById String? @db.ObjectId

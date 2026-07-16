@@ -31,170 +31,250 @@ async function authenticate(req, res, next) {
 /* ------------------------------------------------------------------------ */
 /* ======================= GET ALL INVOICES ======================= */
 router.get("/", authenticate, async (req, res) => {
-    try {
-        const { search } = req.query;
+	try {
+		const { search } = req.query;
 
-        const whereClause = search ? {
-            OR: [
-                { invoiceNo: { contains: search, mode: "insensitive" } },
-                {
-                    sales: {
-                        some: {
-                            OR: [
-                                { documentNo: { contains: search, mode: "insensitive" } },
-                                { remarks: { contains: search, mode: "insensitive" } }
-                            ]
-                        }
-                    }
-                }
-            ]
-        } : {};
+		const whereClause = search ? {
+			OR: [
+				{ invoiceNo: { contains: search, mode: "insensitive" } },
+				{
+					sales: {
+						some: {
+							OR: [
+								{ documentNo: { contains: search, mode: "insensitive" } },
+								{ remarks: { contains: search, mode: "insensitive" } }
+							]
+						}
+					}
+				}
+			]
+		} : {};
 
-        const invoices = await prisma.salesInvoice.findMany({
-            where: whereClause,
-            orderBy: { createdAt: "desc" },
-            include: {
-                user: { select: { id: true, fullName: true, email: true } },
-                sales: {
-                    select: {
-                        id: true,
-                        netPrice: true,
-                        sellPrice: true,
-                        profit: true,
-                        status: true,
-                        documentNo: true,
-                        paymentType: true,
-                        paymentStatus: true,
-                        paidAmount: true,
-                        customerId: true,
-                        remarks: true,
-                        pnr: true,
-                        paxName: true,
-                        vendor: {
-                            select: {
-                                vendorName: true,
-                                category: true,
-                                account: { select: { balance: true } }
-                            }
-                        },
-                        airline: { select: { airlineCode: true, airlineName: true } },
-                        customer: {
-                            select: {
-                                customerName: true,
-                                phone: true,
-                                account: { select: { balance: true } }
-                            }
-                        },
-                        // Cash account (populated when paymentType = CASH)
-                        account: { select: { balance: true } },
-                        // Bank account (populated when paymentType = BANK_TRANSFER)
-                        bank: {
-                            select: {
-                                bankName: true,
-                                account: { select: { balance: true } }
-                            }
-                        },
-                        // Payment legs for PARTIAL sales — breakdown of how it was split
-                        payments: {
-                            select: {
-                                id: true,
-                                method: true,
-                                amount: true,
-                                remarks: true,
-                                paymentDate: true,
-                                bank: { select: { bankName: true } },
-                                customer: { select: { customerName: true } },
-                                account: { select: { balance: true } }
-                            }
-                        },
-                        // Changed field name to match your schema's 'refunds'
-                        refunds: { 
-                            select: { 
-                                id: true,
-                                status: true, 
-                                refundDate: true,
-                                netRefundToCustomer: true,
-                                vendorRefundAmount: true,
-                                refundFee: true,
-                                cancellationCharges: true, // Matches your schema
-                                refundReason: true,
-                                remarks: true,
-                                netRefundToCustomer: true
-                            } 
-                        } 
-                    }
-                }
-            }
-        });
+		const invoices = await prisma.salesInvoice.findMany({
+			where: whereClause,
+			orderBy: { createdAt: "desc" },
+			include: {
+				user: { select: { id: true, fullName: true, email: true } },
+				sales: {
+					select: {
+						id: true,
+						netPrice: true,
+						sellPrice: true,
+						profit: true,
+						status: true,
+						documentNo: true,
+						paymentType: true,
+						paymentStatus: true,
+						paidAmount: true,
+						customerId: true,
+						remarks: true,
+						pnr: true,
+						paxName: true,
+						vendor: {
+							select: {
+								vendorName: true,
+								category: true,
+								account: { select: { balance: true } }
+							}
+						},
+						airline: { select: { airlineCode: true, airlineName: true } },
+						customer: {
+							select: {
+								customerName: true,
+								phone: true,
+								account: { select: { balance: true } }
+							}
+						},
+						// Cash account (populated when paymentType = CASH)
+						account: { select: { balance: true } },
+						// Bank account (populated when paymentType = BANK_TRANSFER)
+						bank: {
+							select: {
+								bankName: true,
+								account: { select: { balance: true } }
+							}
+						},
+						// Payment legs for PARTIAL sales — breakdown of how it was split
+						payments: {
+							select: {
+								id: true,
+								method: true,
+								amount: true,
+								remarks: true,
+								paymentDate: true,
+								bank: { select: { bankName: true } },
+								customer: { select: { customerName: true } },
+								account: { select: { balance: true } }
+							}
+						},
+						// Refund created FROM this sale (original sale side)
+						refunds: {
+							select: {
+								id: true,
+								status: true,
+								refundDate: true,
+								netRefundToCustomer: true,
+								vendorRefundAmount: true,
+								refundFee: true,
+								cancellationCharges: true,
+								refundReason: true,
+								remarks: true,
+							}
+						},
+						// Refund that CREATED this sale (negative mirror sale side)
+						refundRecord: {
+							select: {
+								id: true,
+								status: true,
+								refundDate: true,
+								netRefundToCustomer: true,
+								vendorRefundAmount: true,
+								refundFee: true,
+								cancellationCharges: true,
+								refundReason: true,
+								remarks: true,
+							}
+						}
+					}
+				}
+			}
+		});
 
-        const data = invoices.map(inv => ({
-            id: inv.id,
-            invoiceNo: inv.invoiceNo,
-            saleDate: inv.saleDate,
-            createdById: inv.user?.id || null,
-            createdByName: inv.user?.fullName || null,
-            createdByEmail: inv.user?.email || null,
-            totalNet: inv.totalNet,
-            totalSell: inv.totalSell,
-            totalProfit: inv.totalProfit,
-            salesCount: inv.sales.length,
-            sales: inv.sales.map(s => {
-                const sellPrice = Number(s.sellPrice || 0);
-                const paidAmount = Number(s.paidAmount || 0);
-                const dueAmount = Math.max(sellPrice - paidAmount, 0);
+		const data = invoices.map(inv => ({
+			id: inv.id,
+			invoiceNo: inv.invoiceNo,
+			saleDate: inv.saleDate,
+			createdById: inv.user?.id || null,
+			createdByName: inv.user?.fullName || null,
+			createdByEmail: inv.user?.email || null,
+			totalNet: inv.totalNet,
+			totalSell: inv.totalSell,
+			totalProfit: inv.totalProfit,
+			salesCount: inv.sales.length,
+			sales: inv.sales.map(s => {
+				const sellPrice = Number(s.sellPrice || 0);
+				const paidAmount = Number(s.paidAmount || 0);
+				const dueAmount = Math.max(sellPrice - paidAmount, 0);
 
-                return {
-                    id: s.id,
-                    documentNo: s.documentNo,
-                    pnr: s.pnr,
-                    paxName: s.paxName,
-                    vendorName: s.vendor?.vendorName || null,
-                    vendorCategory: s.vendor?.category || null,
-                    vendorBalance: s.vendor?.account?.balance ?? null,
-                    airlineCode: s.airline?.airlineCode || null,
-                    airlineName: s.airline?.airlineName || null,
-                    paymentType: s.paymentType,
-                    paymentStatus: s.paymentStatus,
-                    // Money breakdown
-                    sellPrice,
-                    paidAmount,
-                    dueAmount,
-                    customerId: s.customerId || null,
-                    customerName: s.customer?.customerName || null,
-                    customerPhone: s.customer?.phone || null,
-                    customerBalance: s.customer?.account?.balance ?? null,
-                    // Cash / bank account context (whichever applies)
-                    cashAccountBalance: s.account?.balance ?? null,
-                    bankName: s.bank?.bankName || null,
-                    bankAccountBalance: s.bank?.account?.balance ?? null,
-                    // Split payment breakdown, if PARTIAL
-                    paymentLegs: (s.payments || []).map(p => ({
-                        id: p.id,
-                        method: p.method,
-                        amount: p.amount,
-                        remarks: p.remarks,
-                        paymentDate: p.paymentDate,
-                        bankName: p.bank?.bankName || null,
-                        customerName: p.customer?.customerName || null,
-                        cashAccountBalance: p.account?.balance ?? null
-                    })),
-                    netPrice: s.netPrice,
-                    profit: s.profit,
-                    remarks: s.remarks,
-                    status: s.status,
-                    // Flatten the array: take the first refund if it exists
-                    refund: s.refunds && s.refunds.length > 0 ? s.refunds[0] : null 
-                };
-            }),
-            createdAt: inv.createdAt
-        }));
+				// Original sale (has its own refunds[0]) OR negative mirror
+				// sale (has refundRecord instead) — whichever is present.
+				const refundDetails =
+					(s.refunds && s.refunds.length > 0 ? s.refunds[0] : null) ||
+					s.refundRecord ||
+					null;
 
-        res.json({ success: true, data });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ success: false, error: "Failed to fetch sales invoices" });
-    }
+				return {
+					id: s.id,
+					documentNo: s.documentNo,
+					pnr: s.pnr,
+					paxName: s.paxName,
+					vendorName: s.vendor?.vendorName || null,
+					vendorCategory: s.vendor?.category || null,
+					vendorBalance: s.vendor?.account?.balance ?? null,
+					airlineCode: s.airline?.airlineCode || null,
+					airlineName: s.airline?.airlineName || null,
+					paymentType: s.paymentType,
+					paymentStatus: s.paymentStatus,
+					// Money breakdown
+					sellPrice,
+					paidAmount,
+					dueAmount,
+					customerId: s.customerId || null,
+					customerName: s.customer?.customerName || null,
+					customerPhone: s.customer?.phone || null,
+					customerBalance: s.customer?.account?.balance ?? null,
+					// Cash / bank account context (whichever applies)
+					cashAccountBalance: s.account?.balance ?? null,
+					bankName: s.bank?.bankName || null,
+					bankAccountBalance: s.bank?.account?.balance ?? null,
+					// Split payment breakdown, if PARTIAL
+					paymentLegs: (s.payments || []).map(p => ({
+						id: p.id,
+						method: p.method,
+						amount: p.amount,
+						remarks: p.remarks,
+						paymentDate: p.paymentDate,
+						bankName: p.bank?.bankName || null,
+						customerName: p.customer?.customerName || null,
+						cashAccountBalance: p.account?.balance ?? null
+					})),
+					netPrice: s.netPrice,
+					profit: s.profit,
+					remarks: s.remarks,
+					status: s.status,
+					// Works for both the original sale (via refunds[]) and the
+					// negative mirror sale (via refundRecord) — whichever applies.
+					refund: refundDetails
+				};
+			}),
+			createdAt: inv.createdAt
+		}));
+
+		res.json({ success: true, data });
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({ success: false, error: "Failed to fetch sales invoices" });
+	}
 });
+
+// GET /api/sales/:saleId/history
+router.get("/:saleId/history", authenticate, async (req, res) => {
+	const { saleId } = req.params;
+
+	try {
+		const sale = await prisma.sale.findUnique({
+			where: { id: saleId },
+			select: {
+				id: true,
+				documentNo: true,
+				pnr: true,
+				createdAt: true,
+				updatedAt: true,
+				updatedBy: true,
+				invoice: {
+					select: {
+						invoiceNo: true,
+						saleDate: true,
+						user: {
+							select: { id: true, fullName: true, email: true },
+						},
+					},
+				},
+			},
+		});
+
+		if (!sale) {
+			return res.status(404).json({ success: false, error: "Sale not found" });
+		}
+
+		const editHistory = Array.isArray(sale.updatedBy) ? sale.updatedBy : [];
+
+		const data = {
+			saleId: sale.id,
+			documentNo: sale.documentNo,
+			pnr: sale.pnr,
+			invoiceNo: sale.invoice?.invoiceNo || null,
+			createdBy: {
+				userId: sale.invoice?.user?.id || null,
+				userName: sale.invoice?.user?.fullName || null,
+				userEmail: sale.invoice?.user?.email || null,
+				createdAt: sale.createdAt,
+			},
+			editCount: editHistory.length,
+			edits: [...editHistory].sort(
+				(a, b) => new Date(a.updatedAt) - new Date(b.updatedAt)
+			), // most recent first
+			lastEditedAt: sale.updatedAt,
+		};
+
+		res.status(200).json({ success: true, data });
+	} catch (err) {
+		console.error("Error fetching sale history:", err);
+		res.status(500).json({ success: false, error: "Failed to fetch sale history" });
+	}
+});
+
+
 /* ======================= SEARCH SALES BY DOCUMENT NO ======================= */
 router.get("/search", authenticate, async (req, res) => {
 	try {
@@ -364,11 +444,11 @@ router.get("/customerSales", authenticate, async (req, res) => {
 			customerBalance: s.customer?.account?.balance ?? null,
 			bank: s.bank
 				? {
-						id: s.bank.id,
-						bankName: s.bank.bankName,
-						accountNumber: s.bank.accountNumber,
-						branchName: s.bank.branchName
-					}
+					id: s.bank.id,
+					bankName: s.bank.bankName,
+					accountNumber: s.bank.accountNumber,
+					branchName: s.bank.branchName
+				}
 				: null,
 			payments: s.payments,
 			createdAt: s.createdAt
@@ -474,44 +554,44 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 
 			if (pt === "CASH") {
 				paymentSummary = {
-					type:   "CASH",
-					label:  "Cash",
+					type: "CASH",
+					label: "Cash",
 					amount: sale.paidAmount,
 				};
 			} else if (pt === "BANK_TRANSFER") {
 				paymentSummary = {
-					type:      "BANK_TRANSFER",
-					label:     "Bank Transfer",
-					amount:    sale.paidAmount,
-					bankId:    sale.bank?.id            || null,
-					bankName:  sale.bank?.bankName       || null,
-					accountNo: sale.bank?.accountNumber  || null,
+					type: "BANK_TRANSFER",
+					label: "Bank Transfer",
+					amount: sale.paidAmount,
+					bankId: sale.bank?.id || null,
+					bankName: sale.bank?.bankName || null,
+					accountNo: sale.bank?.accountNumber || null,
 				};
 			} else if (pt === "CREDIT") {
 				paymentSummary = {
-					type:          "CREDIT",
-					label:         "Credit",
-					amount:        sale.sellPrice,
-					paidAmount:    sale.paidAmount,
-					dueAmount:     sale.sellPrice - sale.paidAmount,
-					customerId:    sale.customer?.id           || null,
-					customerName:  sale.customer?.customerName || null,
+					type: "CREDIT",
+					label: "Credit",
+					amount: sale.sellPrice,
+					paidAmount: sale.paidAmount,
+					dueAmount: sale.sellPrice - sale.paidAmount,
+					customerId: sale.customer?.id || null,
+					customerName: sale.customer?.customerName || null,
 				};
 			} else if (pt === "PARTIAL") {
 				const legs = (sale.payments || []).map((leg) => {
 					const lm = String(leg.method).toUpperCase();
 					return {
-						id:           leg.id,
-						method:       lm,
-						amount:       leg.amount,
-						paymentDate:  leg.paymentDate,
-						remarks:      leg.remarks      || null,
+						id: leg.id,
+						method: lm,
+						amount: leg.amount,
+						paymentDate: leg.paymentDate,
+						remarks: leg.remarks || null,
 						// bank fields — only populated for BANK_TRANSFER legs
-						bankId:       lm === "BANK_TRANSFER" ? (leg.bank?.id           || null) : null,
-						bankName:     lm === "BANK_TRANSFER" ? (leg.bank?.bankName      || null) : null,
-						accountNo:    lm === "BANK_TRANSFER" ? (leg.bank?.accountNumber || null) : null,
+						bankId: lm === "BANK_TRANSFER" ? (leg.bank?.id || null) : null,
+						bankName: lm === "BANK_TRANSFER" ? (leg.bank?.bankName || null) : null,
+						accountNo: lm === "BANK_TRANSFER" ? (leg.bank?.accountNumber || null) : null,
 						// customer fields — only populated for CREDIT legs
-						customerId:   lm === "CREDIT" ? (leg.customer?.id           || null) : null,
+						customerId: lm === "CREDIT" ? (leg.customer?.id || null) : null,
 						customerName: lm === "CREDIT" ? (leg.customer?.customerName || null) : null,
 					};
 				});
@@ -519,11 +599,11 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 				const comboKey = legs.map((l) => l.method).join("+");
 
 				paymentSummary = {
-					type:     "PARTIAL",
-					label:    `Split (${legs.length} methods)`,
-					combo:    comboKey,
+					type: "PARTIAL",
+					label: `Split (${legs.length} methods)`,
+					combo: comboKey,
 					legs,
-					total:    legs.reduce((s, l) => s + l.amount, 0),
+					total: legs.reduce((s, l) => s + l.amount, 0),
 				};
 			} else {
 				paymentSummary = { type: pt, label: pt, amount: sale.paidAmount };
@@ -536,11 +616,11 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 			success: true,
 			data: {
 				...invoice,
-				sales:          enrichedSales,
-				salesCount:     enrichedSales.length,
-				createdById:    invoice.user?.id        || null,
-				createdByName:  invoice.user?.fullName  || null,
-				createdByEmail: invoice.user?.email     || null,
+				sales: enrichedSales,
+				salesCount: enrichedSales.length,
+				createdById: invoice.user?.id || null,
+				createdByName: invoice.user?.fullName || null,
+				createdByEmail: invoice.user?.email || null,
 			},
 		});
 	} catch (err) {
@@ -582,26 +662,26 @@ router.get("/saleId/:saleId", authenticate, async (req, res) => {
 });
 
 router.get("/invoice-no", authenticate, async (req, res) => {
-  try {
-    const { saleDate } = req.query;
-    const date = saleDate ? new Date(saleDate) : new Date();
+	try {
+		const { saleDate } = req.query;
+		const date = saleDate ? new Date(saleDate) : new Date();
 
-    const yy = String(date.getFullYear()).slice(-2);
-    const key = `INV-ALR${yy}`;
+		const yy = String(date.getFullYear()).slice(-2);
+		const key = `INV-ALR${yy}`;
 
-    const counter = await prisma.invoiceCounter.findUnique({
-      where: { key },
-      select: { currentNumber: true },
-    });
+		const counter = await prisma.invoiceCounter.findUnique({
+			where: { key },
+			select: { currentNumber: true },
+		});
 
-    const next = (counter?.currentNumber || 0) + 1;
-    const invoiceNo = `${key}-${String(next).padStart(4, "0")}`;
+		const next = (counter?.currentNumber || 0) + 1;
+		const invoiceNo = `${key}-${String(next).padStart(4, "0")}`;
 
-    return res.json({ success: true, invoiceNo, reserved: false });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ success: false, error: err.message });
-  }
+		return res.json({ success: true, invoiceNo, reserved: false });
+	} catch (err) {
+		console.error(err);
+		return res.status(500).json({ success: false, error: err.message });
+	}
 });
 
 
@@ -625,28 +705,28 @@ router.post("/", authenticate, async (req, res) => {
 		   1️⃣  VALIDATION PHASE
 		====================================================== */
 		for (const s of sales) {
-			const net  = Number(s.netPrice);
+			const net = Number(s.netPrice);
 			const sell = Number(s.sellPrice);
 			const paid = Number(s.paidAmount || 0);
-			const vat    = Number(s.vatAmount   || 0);
-			const paxVat = Number(s.paxVat      || 0);
-			const misc   = Number(s.miscCharges || 0);
+			const vat = Number(s.vatAmount || 0);
+			const paxVat = Number(s.paxVat || 0);
+			const misc = Number(s.miscCharges || 0);
 
-			if (isNaN(net) || isNaN(sell))         throw new Error("netPrice and sellPrice must be numbers");
-			if (net < 0 || sell < 0)               throw new Error("Prices cannot be negative");
-			if (paid < 0 || paid > sell)           throw new Error("Invalid paidAmount");
+			if (isNaN(net) || isNaN(sell)) throw new Error("netPrice and sellPrice must be numbers");
+			if (net < 0 || sell < 0) throw new Error("Prices cannot be negative");
+			if (paid < 0 || paid > sell) throw new Error("Invalid paidAmount");
 			if (vat < 0 || paxVat < 0 || misc < 0) throw new Error("Taxes/charges cannot be negative");
 
 			const pt = String(s.paymentType).toUpperCase();
 
 			if (pt === "CREDIT" && !s.customerId)
-                throw new Error("customerId required for CREDIT sales");
+				throw new Error("customerId required for CREDIT sales");
 
-            if (pt === "BANK_TRANSFER" && !s.bankId)
-                throw new Error("bankId required for BANK_TRANSFER sales");
+			if (pt === "BANK_TRANSFER" && !s.bankId)
+				throw new Error("bankId required for BANK_TRANSFER sales");
 
-            // if (pt === "BANK_TRANSFER" && paid < sell && !s.customerId)
-            //     throw new Error("customerId required for BANK_TRANSFER sales when paidAmount is less than sellPrice");
+			// if (pt === "BANK_TRANSFER" && paid < sell && !s.customerId)
+			//     throw new Error("customerId required for BANK_TRANSFER sales when paidAmount is less than sellPrice");
 
 			if (pt === "PARTIAL") {
 				if (!Array.isArray(s.paymentLegs) || s.paymentLegs.length === 0)
@@ -670,9 +750,9 @@ router.post("/", authenticate, async (req, res) => {
 		const vendorIds = [...new Set(sales.map(s => s.vendorId).filter(Boolean))];
 		const vendors = vendorIds.length
 			? await prisma.vendor.findMany({
-					where: { id: { in: vendorIds } },
-					include: { account: true },
-			  })
+				where: { id: { in: vendorIds } },
+				include: { account: true },
+			})
 			: [];
 		const vendorMap = Object.fromEntries(vendors.map(v => [v.id, v]));
 
@@ -689,9 +769,9 @@ router.post("/", authenticate, async (req, res) => {
 
 		const customers = customerIds.length
 			? await prisma.customer.findMany({
-					where: { id: { in: customerIds } },
-					include: { account: true },
-			  })
+				where: { id: { in: customerIds } },
+				include: { account: true },
+			})
 			: [];
 		const customerMap = Object.fromEntries(customers.map(c => [c.id, c]));
 
@@ -708,9 +788,9 @@ router.post("/", authenticate, async (req, res) => {
 
 		const banks = bankIds.length
 			? await prisma.bank.findMany({
-					where: { id: { in: bankIds } },
-					include: { account: true },
-			  })
+				where: { id: { in: bankIds } },
+				include: { account: true },
+			})
 			: [];
 		const bankMap = Object.fromEntries(banks.map(b => [b.id, b]));
 
@@ -866,9 +946,6 @@ router.post("/", authenticate, async (req, res) => {
 				});
 			};
 
-			let totalNet = 0,
-				totalSell = 0,
-				totalProfit = 0;
 
 			/* ── Process each sale ── */
 			for (const s of sales) {
@@ -876,7 +953,8 @@ router.post("/", authenticate, async (req, res) => {
 				const net = Number(s.netPrice);
 				const sell = Number(s.sellPrice);
 				const paid = Number(s.paidAmount || 0);
-				const profit = sell - net;
+				const vatAmt = Number(s.vatAmount || 0);
+				const profit = sell - net - vatAmt;
 				const pt = String(s.paymentType).toUpperCase();
 
 				/* ── Create sale record ── */
@@ -932,17 +1010,17 @@ router.post("/", authenticate, async (req, res) => {
 
 				/* ── Payment-side ledger entries ── */
 				if (pt === "CASH") {
-                    await creditCash(paid, sale.id, "Cash payment received");
-                } else if (pt === "BANK_TRANSFER") {
-                    await creditBank(s.bankId, paid, sale.id, "Bank transfer payment received");
+					await creditCash(paid, sale.id, "Cash payment received");
+				} else if (pt === "BANK_TRANSFER") {
+					await creditBank(s.bankId, paid, sale.id, "Bank transfer payment received");
 
-                    const remainingBT = sell - paid;
-                    if (remainingBT > 0 && s.customerId) {
-                        await creditCustomer(s.customerId, remainingBT, 0, sale.id, "Balance due after bank transfer");
-                    }
-                } else if (pt === "CREDIT") {
-                    await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
-                } else if (pt === "PARTIAL") {
+					const remainingBT = sell - paid;
+					if (remainingBT > 0 && s.customerId) {
+						await creditCustomer(s.customerId, remainingBT, 0, sale.id, "Balance due after bank transfer");
+					}
+				} else if (pt === "CREDIT") {
+					await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
+				} else if (pt === "PARTIAL") {
 					for (const leg of s.paymentLegs) {
 						const legMethod = String(leg.method).toUpperCase();
 						const legAmount = Number(leg.amount);
@@ -981,15 +1059,23 @@ router.post("/", authenticate, async (req, res) => {
 					}
 				}
 
-				totalNet += net;
-				totalSell += sell;
-				totalProfit += profit;
 			}
 
-			/* ── Update invoice totals ── */
+			/* ── Update invoice totals — computed via live aggregate, not manual
+	   accumulation, so this stays correct even if other routes (edit,
+	   refund) touch this invoice's sales later ── */
+			const totals = await tx.sale.aggregate({
+				where: { invoiceId: invoice.id },
+				_sum: { netPrice: true, sellPrice: true, profit: true },
+			});
+
 			await tx.salesInvoice.update({
 				where: { id: invoice.id },
-				data: { totalNet, totalSell, totalProfit },
+				data: {
+					totalNet: totals._sum.netPrice || 0,
+					totalSell: totals._sum.sellPrice || 0,
+					totalProfit: totals._sum.profit || 0,
+				},
 			});
 
 			return invoice;
@@ -1226,15 +1312,19 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						remarks: `Sale on credit - Invoice ${invoiceNo}`,
 					},
 				});
-				await tx.ledgerEntry.create({
-					data: {
-						accountId: cust.account.id, entryType: "PAYMENT",
-						debit: 0, credit: paidNow,
-						transactionDate: businessDate,
-						saleId, invoiceId,
-						remarks: `Payment received - Invoice ${invoiceNo}`,
-					},
-				});
+
+				if (paidNow > 0) {
+					await tx.ledgerEntry.create({
+						data: {
+							accountId: cust.account.id, entryType: "PAYMENT",
+							debit: 0, credit: paidNow,
+							transactionDate: businessDate,
+							saleId, invoiceId,
+							remarks: `Payment received - Invoice ${invoiceNo}`,
+						},
+					});
+				}
+
 				adjBal(cust.account.id, saleAmount - paidNow);
 			};
 
@@ -1304,7 +1394,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			/* ══════════════════════════════════════════════════════
 			   4.2  UPDATE EACH SALE IN PAYLOAD
 			══════════════════════════════════════════════════════ */
-			let totalNet = 0, totalSell = 0, totalProfit = 0;
 
 			for (const payload of sales) {
 				const current = saleMap.get(payload.id);
@@ -1497,6 +1586,18 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					}
 				}
 
+				/* ── Track who edited this sale ── */
+				const updatedByHistory = Array.isArray(current.updatedBy) ? current.updatedBy : [];
+				const newUpdatedBy = [
+					...updatedByHistory,
+					{
+						userId: req.user.id,
+						userName: req.user.fullName || null,
+						userEmail: req.user.email || null,
+						updatedAt: new Date().toISOString(),
+					},
+				];
+
 				/* ── UPDATE SALE RECORD ── */
 				await tx.sale.update({
 					where: { id: current.id },
@@ -1512,11 +1613,11 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						tripType: payload.tripType ?? current.tripType,
 						departureDate: payload.departureDate ? new Date(payload.departureDate) : current.departureDate,
 						returnDate: payload.returnDate ? new Date(payload.returnDate) : current.returnDate,
-						paxName: payload.paxName ?? current.paxName,
+						paxName: payload.paxName === undefined ? current.paxName : payload.paxName,
 						destinations: payload.destinations ?? current.destinations,
 						netPrice: newNet,
 						sellPrice: newSell,
-						profit: newSell - newNet,
+						profit: newSell - newNet - Number(payload.vatAmount || 0),
 						vatAmount: Number(payload.vatAmount || 0),
 						paxVat: Number(payload.paxVat || 0),
 						miscCharges: Number(payload.miscCharges || 0),
@@ -1524,12 +1625,10 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						paymentType: newPt,
 						paymentStatus: newPaid >= newSell ? "PAID" : newPaid > 0 ? "PARTIAL" : "DUE",
 						remarks: payload.remarks || null,
+						updatedBy: newUpdatedBy,
 					},
 				});
 
-				totalNet += newNet;
-				totalSell += newSell;
-				totalProfit += newSell - newNet;
 			}
 
 			/* ══════════════════════════════════════════════════════
@@ -1545,9 +1644,23 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			/* ══════════════════════════════════════════════════════
 			   4.4  UPDATE INVOICE TOTALS
 			══════════════════════════════════════════════════════ */
+			/* ══════════════════════════════════════════════════════
+   4.4  UPDATE INVOICE TOTALS — computed via live aggregate over
+   ALL sales currently belonging to this invoice (including any
+   negative refund-mirror sales), not just the ones in this payload.
+══════════════════════════════════════════════════════ */
+			const totals = await tx.sale.aggregate({
+				where: { invoiceId },
+				_sum: { netPrice: true, sellPrice: true, profit: true },
+			});
+
 			await tx.salesInvoice.update({
 				where: { id: invoiceId },
-				data: { totalNet, totalSell, totalProfit },
+				data: {
+					totalNet: totals._sum.netPrice || 0,
+					totalSell: totals._sum.sellPrice || 0,
+					totalProfit: totals._sum.profit || 0,
+				},
 			});
 
 			return { invoiceId, deletedSalesCount: deletedSales.length };

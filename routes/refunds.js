@@ -263,9 +263,33 @@ router.post("/", authenticate, async (req, res) => {
             }
 
             /* ====================================================
-               5️⃣ CREATE NEGATIVE MIRROR SALE
+               5️⃣ CREATE REFUND RECORD (linked to original sale)
+               Created BEFORE the negative sale so we have refund.id
+               ready to stamp onto the negative sale's refundRecordId.
+            ==================================================== */
+            const refund = await tx.refund.create({
+                data: {
+                    saleId:               originalSale.id,
+                    originalSaleAmount:   originalSell,
+                    customerRefundAmount: customerRefundAmount,
+                    vendorRefundAmount:   vendorRefundAmount,
+                    refundFee:            fee,
+                    cancellationCharges:  charges,
+                    netRefundToCustomer:  netRefundToCustomer,
+                    netCostToUs:          netCostToUs,
+                    refundReason:         refundReason || null,
+                    remarks:              remarks      || null,
+                    refundDate:           businessDate,
+                    status:               "COMPLETED",
+                    processedById:        req.user.id,
+                }
+            });
+
+            /* ====================================================
+               6️⃣ CREATE NEGATIVE MIRROR SALE
                Original sale is completely untouched.
-               Negative sale carries the REFUNDED status.
+               Negative sale carries the REFUNDED status and links
+               back to the Refund record via refundRecordId.
             ==================================================== */
             const negativeSale = await tx.sale.create({
                 data: {
@@ -295,12 +319,14 @@ router.post("/", authenticate, async (req, res) => {
                     paymentStatus: "PAID",
                     status:        "REFUNDED",
 
+                    refundRecordId: refund.id,
+
                     remarks: `REFUND | Original Doc: ${originalSale.documentNo || originalSale.id} | Reason: ${refundReason || "-"}`,
                 }
             });
 
             /* ====================================================
-               6️⃣ UPDATE INVOICE TOTALS
+               7️⃣ UPDATE INVOICE TOTALS
             ==================================================== */
             await tx.salesInvoice.update({
                 where: { id: originalSale.invoiceId },
@@ -308,27 +334,6 @@ router.post("/", authenticate, async (req, res) => {
                     totalNet:    { increment: -originalNet },
                     totalSell:   { increment: -originalSell },
                     totalProfit: { increment: -(Number(originalSale.profit || 0)) },
-                }
-            });
-
-            /* ====================================================
-               7️⃣ CREATE REFUND RECORD (linked to original sale)
-            ==================================================== */
-            const refund = await tx.refund.create({
-                data: {
-                    saleId:               originalSale.id,
-                    originalSaleAmount:   originalSell,
-                    customerRefundAmount: customerRefundAmount,
-                    vendorRefundAmount:   vendorRefundAmount,
-                    refundFee:            fee,
-                    cancellationCharges:  charges,
-                    netRefundToCustomer:  netRefundToCustomer,
-                    netCostToUs:          netCostToUs,
-                    refundReason:         refundReason || null,
-                    remarks:              remarks      || null,
-                    refundDate:           businessDate,
-                    status:               "COMPLETED",
-                    processedById:        req.user.id,
                 }
             });
 
@@ -430,7 +435,27 @@ router.put("/:refundId", authenticate, async (req, res) => {
             }
 
             /* ====================================================
-               3️⃣ UPDATE REFUND RECORD
+               3️⃣ SYNC THE NEGATIVE MIRROR SALE'S PAID AMOUNT
+               Only paidAmount on the negative sale reflects the
+               customer refund side — net/sell/profit stay mirrored
+               to the original sale and are untouched by fee/charge edits.
+               Found via refundRecordId now, not documentNo string match.
+            ==================================================== */
+            const negativeSale = await tx.sale.findFirst({
+                where: { refundRecordId: refundId }
+            });
+
+            if (negativeSale && customerDelta !== 0) {
+                await tx.sale.update({
+                    where: { id: negativeSale.id },
+                    data: {
+                        paidAmount: { increment: -customerDelta },
+                    }
+                });
+            }
+
+            /* ====================================================
+               4️⃣ UPDATE REFUND RECORD
             ==================================================== */
             return await tx.refund.update({
                 where: { id: refundId },
@@ -525,23 +550,30 @@ router.delete("/:refundId", authenticate, async (req, res) => {
 
             /* ====================================================
                5️⃣ FIND & DELETE THE NEGATIVE MIRROR SALE
+               Try refundRecordId first (new refunds, reliable direct
+               link). Fall back to documentNo matching for refunds
+               created before that field existed.
                This also reverses the invoice totals automatically
                since the negative sale is removed from the invoice.
             ==================================================== */
-            const negativeSale = await tx.sale.findFirst({
-                where: {
-                    invoiceId:  originalSale.invoiceId,
-                    documentNo: `REF-${originalSale.documentNo || originalSale.id}`,
-                    status:     "REFUNDED",
-                }
+            let negativeSale = await tx.sale.findFirst({
+                where: { refundRecordId: refundId }
             });
 
-            if (negativeSale) {
-                await tx.sale.delete({
-                    where: { id: negativeSale.id }
+            if (!negativeSale) {
+                negativeSale = await tx.sale.findFirst({
+                    where: {
+                        invoiceId:  originalSale.invoiceId,
+                        documentNo: `REF-${originalSale.documentNo || originalSale.id}`,
+                        status:     "REFUNDED",
+                    }
                 });
+            }
 
-                // Re-add the negative sale's amounts back to invoice totals
+            if (negativeSale) {
+                // Reverse the invoice totals BEFORE deleting the negative
+                // sale — we need its amounts, and once deleted we can't
+                // read them back.
                 await tx.salesInvoice.update({
                     where: { id: originalSale.invoiceId },
                     data: {
@@ -550,11 +582,17 @@ router.delete("/:refundId", authenticate, async (req, res) => {
                         totalProfit: { increment: -Number(negativeSale.profit)    },
                     }
                 });
+
+                await tx.sale.delete({
+                    where: { id: negativeSale.id }
+                });
             }
 
             /* ====================================================
                6️⃣ DELETE THE REFUND RECORD
                Original sale is left completely untouched.
+               Negative sale (if any) is already deleted above, so
+               there's no dangling refundRecordId reference left.
             ==================================================== */
             await tx.refund.delete({
                 where: { id: refundId }
