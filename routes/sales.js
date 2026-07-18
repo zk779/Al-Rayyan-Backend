@@ -946,6 +946,97 @@ router.post("/", authenticate, async (req, res) => {
 				});
 			};
 
+			/* ──────────────────────────────────────────────────────
+			   HELPER: record a PARTIAL sale that includes a CREDIT leg.
+			   Books the FULL sellPrice as one SALE debit on the credit
+			   customer's ledger, then books every CASH/BANK_TRANSFER
+			   leg both into its own account AND as a PAYMENT credit on
+			   that same customer's ledger (so the customer's ledger
+			   shows the whole invoice picture, not just the unpaid part).
+			   ────────────────────────────────────────────────────── */
+			const processPartialWithCredit = async (s, sale, sell, creditLeg) => {
+				const cust = customerMap[creditLeg.customerId];
+				if (!cust) throw new Error(`Customer not found: ${creditLeg.customerId}`);
+
+				// 1) Book the FULL sell price as a single SALE debit
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: cust.account.id,
+						entryType: "SALE",
+						debit: sell,
+						credit: 0,
+						transactionDate: businessDate,
+						saleId: sale.id,
+						invoiceId: invoice.id,
+						remarks: `Partial sale (full invoice amount) - Invoice ${invoiceNo}`,
+					},
+				});
+
+				let totalPaidNow = 0;
+
+				for (const leg of s.paymentLegs) {
+					const legMethod = String(leg.method).toUpperCase();
+					const legAmount = Number(leg.amount);
+
+					await tx.salePayment.create({
+						data: {
+							saleId: sale.id,
+							method: legMethod,
+							amount: legAmount,
+							bankId: legMethod === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+							accountId: legMethod === "CASH" ? (await getCashAccount()).id : null,
+							customerId: legMethod === "CREDIT" ? (leg.customerId || null) : null,
+							remarks: leg.remarks || null,
+							paymentDate: businessDate,
+						},
+					});
+
+					if (legMethod === "CASH") {
+						await creditCash(legAmount, sale.id, "Partial cash payment received");
+
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: cust.account.id,
+								entryType: "PAYMENT",
+								debit: 0,
+								credit: legAmount,
+								transactionDate: businessDate,
+								saleId: sale.id,
+								invoiceId: invoice.id,
+								remarks: `Cash payment against credit sale - Invoice ${invoiceNo}`,
+							},
+						});
+
+						totalPaidNow += legAmount;
+					} else if (legMethod === "BANK_TRANSFER") {
+						await creditBank(leg.bankId, legAmount, sale.id, "Partial bank transfer received");
+
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: cust.account.id,
+								entryType: "PAYMENT",
+								debit: 0,
+								credit: legAmount,
+								transactionDate: businessDate,
+								saleId: sale.id,
+								invoiceId: invoice.id,
+								remarks: `Bank transfer payment against credit sale - Invoice ${invoiceNo}`,
+							},
+						});
+
+						totalPaidNow += legAmount;
+					}
+					// CREDIT leg(s): no extra ledger entry needed here —
+					// already covered by the full SALE debit booked above.
+				}
+
+				// 2) Net the customer's balance: full sell price minus whatever
+				//    was actually paid via cash/bank legs right now.
+				await tx.account.update({
+					where: { id: cust.account.id },
+					data: { balance: { increment: sell - totalPaidNow } },
+				});
+			};
 
 			/* ── Process each sale ── */
 			for (const s of sales) {
@@ -1021,40 +1112,45 @@ router.post("/", authenticate, async (req, res) => {
 				} else if (pt === "CREDIT") {
 					await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
 				} else if (pt === "PARTIAL") {
-					for (const leg of s.paymentLegs) {
-						const legMethod = String(leg.method).toUpperCase();
-						const legAmount = Number(leg.amount);
+					const creditLeg = s.paymentLegs.find(
+						l => String(l.method).toUpperCase() === "CREDIT"
+					);
 
-						await tx.salePayment.create({
-							data: {
-								saleId: sale.id,
-								method: legMethod,
-								amount: legAmount,
-								bankId: legMethod === "BANK_TRANSFER" ? (leg.bankId || null) : null,
-								accountId: legMethod === "CASH" ? (await getCashAccount()).id : null,
-								customerId: legMethod === "CREDIT" ? (leg.customerId || null) : null,
-								remarks: leg.remarks || null,
-								paymentDate: businessDate,
-							},
-						});
+					if (creditLeg) {
+						// New flow: CASH+CREDIT or BANK_TRANSFER+CREDIT (or any mix
+						// that includes a CREDIT leg) — full sellPrice booked to
+						// customer, cash/bank legs booked in both places.
+						await processPartialWithCredit(s, sale, sell, creditLeg);
+					} else {
+						// Unchanged flow: e.g. CASH + BANK_TRANSFER, no credit leg
+						// involved, so no customer ledger entries at all.
+						for (const leg of s.paymentLegs) {
+							const legMethod = String(leg.method).toUpperCase();
+							const legAmount = Number(leg.amount);
 
-						if (legMethod === "CASH") {
-							await creditCash(legAmount, sale.id, "Partial cash payment received");
-						} else if (legMethod === "BANK_TRANSFER") {
-							await creditBank(
-								leg.bankId,
-								legAmount,
-								sale.id,
-								"Partial bank transfer received"
-							);
-						} else if (legMethod === "CREDIT") {
-							await creditCustomer(
-								leg.customerId,
-								legAmount,
-								0,
-								sale.id,
-								"Partial credit sale"
-							);
+							await tx.salePayment.create({
+								data: {
+									saleId: sale.id,
+									method: legMethod,
+									amount: legAmount,
+									bankId: legMethod === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+									accountId: legMethod === "CASH" ? (await getCashAccount()).id : null,
+									customerId: null,
+									remarks: leg.remarks || null,
+									paymentDate: businessDate,
+								},
+							});
+
+							if (legMethod === "CASH") {
+								await creditCash(legAmount, sale.id, "Partial cash payment received");
+							} else if (legMethod === "BANK_TRANSFER") {
+								await creditBank(
+									leg.bankId,
+									legAmount,
+									sale.id,
+									"Partial bank transfer received"
+								);
+							}
 						}
 					}
 				}
@@ -1338,6 +1434,130 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				adjBal(cust.account.id, -(oldSell - oldPaid));
 			};
 
+			/* ──────────────────────────────────────────────────────
+			   HELPER: apply a PARTIAL sale that includes a CREDIT leg.
+			   Mirrors the POST route's processPartialWithCredit:
+			   books the FULL sellPrice as one SALE debit on the credit
+			   customer's ledger, then books every CASH/BANK_TRANSFER
+			   leg both into its own account AND as a PAYMENT credit on
+			   that same customer's ledger.
+			   ────────────────────────────────────────────────────── */
+			const applyPartialWithCredit = async (payload, saleId, creditLeg) => {
+				const cust = customerMap.get(creditLeg.customerId);
+				if (!cust) throw new Error(`Customer not found: ${creditLeg.customerId}`);
+
+				const sell = Number(payload.sellPrice);
+
+				// 1) Book the FULL sell price as a single SALE debit
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: cust.account.id,
+						entryType: "SALE",
+						debit: sell,
+						credit: 0,
+						transactionDate: businessDate,
+						saleId, invoiceId,
+						remarks: `Partial sale (full invoice amount) - Invoice ${invoiceNo}`,
+					},
+				});
+
+				let totalPaidNow = 0;
+
+				for (const leg of payload.paymentLegs) {
+					const lm = String(leg.method).toUpperCase();
+					const legAmount = Number(leg.amount);
+
+					await tx.salePayment.create({
+						data: {
+							saleId,
+							method: lm,
+							amount: legAmount,
+							bankId: lm === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+							accountId: lm === "CASH" ? (await getCashAccount()).id : null,
+							customerId: lm === "CREDIT" ? (leg.customerId || null) : null,
+							remarks: leg.remarks || null,
+							paymentDate: businessDate,
+						},
+					});
+
+					if (lm === "CASH") {
+						await applyCashPayment(legAmount, saleId);
+
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: cust.account.id,
+								entryType: "PAYMENT",
+								debit: 0,
+								credit: legAmount,
+								transactionDate: businessDate,
+								saleId, invoiceId,
+								remarks: `Cash payment against credit sale - Invoice ${invoiceNo}`,
+							},
+						});
+
+						totalPaidNow += legAmount;
+					} else if (lm === "BANK_TRANSFER") {
+						await applyBankPayment(leg.bankId, legAmount, saleId);
+
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: cust.account.id,
+								entryType: "PAYMENT",
+								debit: 0,
+								credit: legAmount,
+								transactionDate: businessDate,
+								saleId, invoiceId,
+								remarks: `Bank transfer payment against credit sale - Invoice ${invoiceNo}`,
+							},
+						});
+
+						totalPaidNow += legAmount;
+					}
+					// CREDIT leg(s): no extra ledger entry — already covered
+					// by the full SALE debit booked above.
+				}
+
+				adjBal(cust.account.id, sell - totalPaidNow);
+			};
+
+			/* ──────────────────────────────────────────────────────
+			   HELPER: reverse a PARTIAL sale that included a CREDIT leg
+			   (i.e. undo exactly what applyPartialWithCredit created).
+			   `sale` can be either an existingInvoice.sales row (for
+			   deleted sales) or `current` from saleMap (for edited
+			   sales) — both carry `.payments`, `.id`, `.sellPrice`.
+			   ────────────────────────────────────────────────────── */
+			const reversePartialWithCredit = async (sale, creditLeg) => {
+				const cust = customerMap.get(creditLeg.customerId);
+				if (!cust) return;
+
+				// Delete the consolidated SALE debit + all PAYMENT credits
+				// booked on the customer's ledger for this sale.
+				await tx.ledgerEntry.deleteMany({
+					where: { saleId: sale.id, accountId: cust.account.id, entryType: { in: ["SALE", "PAYMENT"] } },
+				});
+
+				let oldTotalPaidNow = 0;
+
+				for (const leg of (sale.payments || [])) {
+					const lm = String(leg.method).toUpperCase();
+					const legAmount = Number(leg.amount);
+
+					if (lm === "CASH") {
+						await reverseCashPayment(legAmount, sale.id);
+						oldTotalPaidNow += legAmount;
+					} else if (lm === "BANK_TRANSFER" && leg.bankId) {
+						await reverseBankPayment(leg.bankId, legAmount, sale.id);
+						oldTotalPaidNow += legAmount;
+					}
+					// CREDIT leg(s): no separate account to reverse here —
+					// it was folded into the consolidated customer entries above.
+				}
+
+				const oldSell = Number(sale.sellPrice);
+				adjBal(cust.account.id, -(oldSell - oldTotalPaidNow));
+			};
+
 			/* ══════════════════════════════════════════════════════
 			   4.1  DELETE OMITTED SALES (full reversal)
 			══════════════════════════════════════════════════════ */
@@ -1373,16 +1593,21 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				}
 
 				if (pt === "PARTIAL") {
-					for (const leg of (sale.payments || [])) {
-						const lm = String(leg.method).toUpperCase();
-						if (lm === "CASH") {
-							await reverseCashPayment(leg.amount, sale.id);
-						}
-						if (lm === "BANK_TRANSFER" && leg.bank?.account) {
-							await reverseBankPayment(leg.bankId, leg.amount, sale.id);
-						}
-						if (lm === "CREDIT" && leg.customer?.account) {
-							await reverseCreditSale(leg.customerId, leg.amount, 0, sale.id);
+					const creditLeg = (sale.payments || []).find(
+						l => String(l.method).toUpperCase() === "CREDIT"
+					);
+
+					if (creditLeg) {
+						await reversePartialWithCredit(sale, creditLeg);
+					} else {
+						for (const leg of (sale.payments || [])) {
+							const lm = String(leg.method).toUpperCase();
+							if (lm === "CASH") {
+								await reverseCashPayment(leg.amount, sale.id);
+							}
+							if (lm === "BANK_TRANSFER" && leg.bank?.account) {
+								await reverseBankPayment(leg.bankId, leg.amount, sale.id);
+							}
 						}
 					}
 					await tx.salePayment.deleteMany({ where: { saleId: sale.id } });
@@ -1519,16 +1744,21 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					}
 
 					if (oldPt === "PARTIAL") {
-						for (const leg of (current.payments || [])) {
-							const lm = String(leg.method).toUpperCase();
-							if (lm === "CASH") {
-								await reverseCashPayment(leg.amount, current.id);
-							}
-							if (lm === "BANK_TRANSFER" && leg.bankId) {
-								await reverseBankPayment(leg.bankId, leg.amount, current.id);
-							}
-							if (lm === "CREDIT" && leg.customerId) {
-								await reverseCreditSale(leg.customerId, leg.amount, 0, current.id);
+						const oldCreditLeg = (current.payments || []).find(
+							l => String(l.method).toUpperCase() === "CREDIT"
+						);
+
+						if (oldCreditLeg) {
+							await reversePartialWithCredit(current, oldCreditLeg);
+						} else {
+							for (const leg of (current.payments || [])) {
+								const lm = String(leg.method).toUpperCase();
+								if (lm === "CASH") {
+									await reverseCashPayment(leg.amount, current.id);
+								}
+								if (lm === "BANK_TRANSFER" && leg.bankId) {
+									await reverseBankPayment(leg.bankId, leg.amount, current.id);
+								}
 							}
 						}
 						// Delete all old SalePayment legs
@@ -1553,34 +1783,38 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					}
 
 					else if (newPt === "PARTIAL") {
-						for (const leg of payload.paymentLegs) {
-							const lm = String(leg.method).toUpperCase();
-							const legAmount = Number(leg.amount);
+						const newCreditLeg = payload.paymentLegs.find(
+							l => String(l.method).toUpperCase() === "CREDIT"
+						);
 
-							// Persist SalePayment leg record
-							await tx.salePayment.create({
-								data: {
-									saleId: current.id,
-									method: lm,
-									amount: legAmount,
-									bankId: lm === "BANK_TRANSFER" ? (leg.bankId || null) : null,
-									accountId: lm === "CASH" ? (await getCashAccount()).id : null,
-									customerId: lm === "CREDIT" ? (leg.customerId || null) : null,
-									remarks: leg.remarks || null,
-									paymentDate: businessDate,
-								},
-							});
+						if (newCreditLeg) {
+							await applyPartialWithCredit(payload, current.id, newCreditLeg);
+						} else {
+							for (const leg of payload.paymentLegs) {
+								const lm = String(leg.method).toUpperCase();
+								const legAmount = Number(leg.amount);
 
-							if (lm === "CASH") {
-								await applyCashPayment(legAmount, current.id);
-							}
+								// Persist SalePayment leg record
+								await tx.salePayment.create({
+									data: {
+										saleId: current.id,
+										method: lm,
+										amount: legAmount,
+										bankId: lm === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+										accountId: lm === "CASH" ? (await getCashAccount()).id : null,
+										customerId: null,
+										remarks: leg.remarks || null,
+										paymentDate: businessDate,
+									},
+								});
 
-							if (lm === "BANK_TRANSFER") {
-								await applyBankPayment(leg.bankId, legAmount, current.id);
-							}
+								if (lm === "CASH") {
+									await applyCashPayment(legAmount, current.id);
+								}
 
-							if (lm === "CREDIT") {
-								await applyCreditSale(leg.customerId, legAmount, 0, current.id);
+								if (lm === "BANK_TRANSFER") {
+									await applyBankPayment(leg.bankId, legAmount, current.id);
+								}
 							}
 						}
 					}
@@ -2049,78 +2283,136 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 			}
 
 			else if (pt === "PARTIAL") {
-				/* Reverse each salePayment leg one by one */
-				for (const leg of sale.payments) {
-					const legMethod = String(leg.method || "").toUpperCase();
-					const legAmount = Number(leg.amount || 0);
+				/* ── Detect whether this PARTIAL sale used a CREDIT leg ──
+				   New booking model (CASH+CREDIT / BANK_TRANSFER+CREDIT):
+				     - ONE consolidated SALE debit for the full sellPrice
+				       on the credit customer's ledger
+				     - ONE PAYMENT credit on that SAME customer's ledger
+				       for every CASH/BANK_TRANSFER leg (in addition to
+				       that leg's own cash/bank account entry)
+				   So reversal must delete the customer's SALE+PAYMENT
+				   entries as a single block, not per-leg. Cash/bank
+				   account entries are still reversed per leg exactly
+				   as before. */
+				const creditLeg = sale.payments.find(
+					l => String(l.method || "").toUpperCase() === "CREDIT"
+				);
 
-					if (legMethod === "CASH") {
-						if (!leg.account) {
-							throw new Error(`Related cash account not found for payment leg ${leg.id}`);
-						}
-
-						await tx.ledgerEntry.deleteMany({
-							where: {
-								saleId: sale.id,
-								accountId: leg.account.id,
-								entryType: "PAYMENT",
-							},
-						});
-
-						await tx.account.update({
-							where: { id: leg.account.id },
-							data: {
-								balance: { decrement: legAmount },
-							},
-						});
-
-						continue;
+				if (creditLeg) {
+					if (!creditLeg.customer?.account) {
+						throw new Error(`Related customer account not found for payment leg ${creditLeg.id}`);
 					}
 
-					if (legMethod === "BANK_TRANSFER") {
-						if (!leg.bank?.account) {
-							throw new Error(`Related bank account not found for payment leg ${leg.id}`);
+					const custAccId = creditLeg.customer.account.id;
+
+					// Delete the consolidated SALE debit + PAYMENT credits
+					// booked on the customer's ledger for this sale.
+					await tx.ledgerEntry.deleteMany({
+						where: {
+							saleId: sale.id,
+							accountId: custAccId,
+							entryType: { in: ["SALE", "PAYMENT"] },
+						},
+					});
+
+					let totalPaidNow = 0;
+
+					for (const leg of sale.payments) {
+						const legMethod = String(leg.method || "").toUpperCase();
+						const legAmount = Number(leg.amount || 0);
+
+						if (legMethod === "CASH") {
+							if (!leg.account) {
+								throw new Error(`Related cash account not found for payment leg ${leg.id}`);
+							}
+
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
+
+							totalPaidNow += legAmount;
+						} else if (legMethod === "BANK_TRANSFER") {
+							if (!leg.bank?.account) {
+								throw new Error(`Related bank account not found for payment leg ${leg.id}`);
+							}
+
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.bank.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.bank.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
+
+							totalPaidNow += legAmount;
 						}
-
-						await tx.ledgerEntry.deleteMany({
-							where: {
-								saleId: sale.id,
-								accountId: leg.bank.account.id,
-								entryType: "PAYMENT",
-							},
-						});
-
-						await tx.account.update({
-							where: { id: leg.bank.account.id },
-							data: {
-								balance: { decrement: legAmount },
-							},
-						});
+						// CREDIT leg(s): no separate per-leg account action —
+						// already covered by the consolidated block deleted above.
 					}
 
-					else if (legMethod === "CREDIT") {
-						if (!leg.customer?.account) {
-							throw new Error(`Related customer account not found for payment leg ${leg.id}`);
+					// Restore customer balance: undo (sell - totalPaidNow) that
+					// was added when this PARTIAL+CREDIT sale was created/edited.
+					await tx.account.update({
+						where: { id: custAccId },
+						data: { balance: { decrement: sell - totalPaidNow } },
+					});
+
+				} else {
+					/* Pure CASH + BANK_TRANSFER combo — no customer involved,
+					   unchanged from the original per-leg reversal. */
+					for (const leg of sale.payments) {
+						const legMethod = String(leg.method || "").toUpperCase();
+						const legAmount = Number(leg.amount || 0);
+
+						if (legMethod === "CASH") {
+							if (!leg.account) {
+								throw new Error(`Related cash account not found for payment leg ${leg.id}`);
+							}
+
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
+						} else if (legMethod === "BANK_TRANSFER") {
+							if (!leg.bank?.account) {
+								throw new Error(`Related bank account not found for payment leg ${leg.id}`);
+							}
+
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.bank.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.bank.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
 						}
-
-						await tx.ledgerEntry.deleteMany({
-							where: {
-								saleId: sale.id,
-								accountId: leg.customer.account.id,
-								entryType: { in: ["SALE", "PAYMENT"] },
-							},
-						});
-
-						/* For partial credit leg, create API did:
-						   creditCustomer(customerId, legAmount, 0, ...)
-						   => balance incremented by legAmount
-						*/
-						await tx.account.update({
-							where: { id: leg.customer.account.id },
-							data: {
-								balance: { decrement: legAmount },
-							},
-						});
 					}
 				}
 
