@@ -383,131 +383,175 @@ router.post("/", authenticate, async (req, res) => {
         return res.status(400).json({ success: false, error: err.message });
     }
 });
-/* ======================= UPDATE REFUND ======================= */
+/* ──────────────────────────────────────────────────────
+   HELPER: retry a transaction on write-conflict/deadlock
+   errors (Prisma error code P2034), with a small backoff
+   between attempts.
+   ────────────────────────────────────────────────────── */
+async function runWithRetry(fn, retries = 3) {
+	for (let i = 0; i < retries; i++) {
+		try {
+			return await fn();
+		} catch (err) {
+			const isConflict = err.code === "P2034" || /write conflict|deadlock/i.test(err.message || "");
+			if (isConflict && i < retries - 1) {
+				await new Promise(r => setTimeout(r, 100 * (i + 1))); // 100ms, 200ms, ...
+				continue;
+			}
+			throw err;
+		}
+	}
+}
+
 router.put("/:refundId", authenticate, async (req, res) => {
     const { refundId } = req.params;
     const { refundDate, refundFee, serviceCharges, refundReason, remarks } = req.body;
 
     try {
-        const result = await prisma.$transaction(async (tx) => {
-            const existingRefund = await tx.refund.findUnique({
-                where: { id: refundId },
-                include: {
-                    sale: {
-                        include: {
-                            vendor: { include: { account: true } },
-                            customer: { include: { account: true } },
-                            invoice: true
+        const result = await runWithRetry(() =>
+            prisma.$transaction(async (tx) => {
+                const existingRefund = await tx.refund.findUnique({
+                    where: { id: refundId },
+                    include: {
+                        sale: {
+                            include: {
+                                vendor: { include: { account: true } },
+                                customer: { include: { account: true } },
+                                invoice: true,
+                                payments: {                              // SalePayment legs (for PARTIAL sales)
+                                    include: {
+                                        customer: { include: { account: true } },
+                                    },
+                                },
+                            }
                         }
                     }
-                }
-            });
-
-            if (!existingRefund) throw new Error("Refund not found");
-
-            const originalSale = existingRefund.sale;
-            const originalNet  = Number(originalSale.netPrice);
-
-            const newFee     = refundFee        !== undefined ? Number(refundFee)        : Number(existingRefund.refundFee);
-            const newCharges = serviceCharges   !== undefined ? Number(serviceCharges)   : Number(existingRefund.cancellationCharges);
-
-            const newVendorRefund        = originalNet - newFee;
-            const newCustomerRefundAmount = originalNet - newFee;
-            const newNetRefundToCustomer  = newCustomerRefundAmount - newCharges;
-
-            const vendorDelta   = newVendorRefund        - Number(existingRefund.vendorRefundAmount);
-            const customerDelta = newNetRefundToCustomer - Number(existingRefund.netRefundToCustomer);
-
-            const businessDate = refundDate ? new Date(refundDate) : existingRefund.refundDate;
-
-            /* ====================================================
-               1️⃣ UPDATE VENDOR LEDGER + BALANCE
-            ==================================================== */
-            if (vendorDelta !== 0) {
-                const vendorAccId = originalSale.vendor.account.id;
-
-                const vendorLedger = await tx.ledgerEntry.findFirst({
-                    where: { saleId: originalSale.id, accountId: vendorAccId, entryType: "REFUND" }
                 });
 
-                if (vendorLedger) {
-                    await tx.ledgerEntry.update({
-                        where: { id: vendorLedger.id },
-                        data:  { debit: newVendorRefund, transactionDate: businessDate }
+                if (!existingRefund) throw new Error("Refund not found");
+
+                const originalSale = existingRefund.sale;
+                const originalNet  = Number(originalSale.netPrice);
+
+                const newFee     = refundFee        !== undefined ? Number(refundFee)        : Number(existingRefund.refundFee);
+                const newCharges = serviceCharges   !== undefined ? Number(serviceCharges)   : Number(existingRefund.cancellationCharges);
+
+                const newVendorRefund        = originalNet - newFee;
+                const newCustomerRefundAmount = originalNet - newFee;
+                const newNetRefundToCustomer  = newCustomerRefundAmount - newCharges;
+
+                const vendorDelta   = newVendorRefund        - Number(existingRefund.vendorRefundAmount);
+                const customerDelta = newNetRefundToCustomer - Number(existingRefund.netRefundToCustomer);
+
+                const businessDate = refundDate ? new Date(refundDate) : existingRefund.refundDate;
+
+                /* ====================================================
+                   1️⃣ UPDATE VENDOR LEDGER + BALANCE
+                ==================================================== */
+                if (vendorDelta !== 0) {
+                    const vendorAccId = originalSale.vendor.account.id;
+
+                    const vendorLedger = await tx.ledgerEntry.findFirst({
+                        where: { saleId: originalSale.id, accountId: vendorAccId, entryType: "REFUND" }
+                    });
+
+                    if (vendorLedger) {
+                        await tx.ledgerEntry.update({
+                            where: { id: vendorLedger.id },
+                            data:  { debit: newVendorRefund, transactionDate: businessDate }
+                        });
+                    }
+
+                    const vendorBalanceDelta = originalSale.vendor.category === "DEBIT"
+                        ? -vendorDelta
+                        :  vendorDelta;
+
+                    await tx.account.update({
+                        where: { id: vendorAccId },
+                        data:  { balance: { increment: vendorBalanceDelta } }
                     });
                 }
 
-                const vendorBalanceDelta = originalSale.vendor.category === "DEBIT"
-                    ? -vendorDelta
-                    :  vendorDelta;
+                /* ====================================================
+                   2️⃣ UPDATE CUSTOMER LEDGER + BALANCE
+                   Applies to:
+                     - pure CREDIT sales (uses originalSale.customer directly)
+                     - PARTIAL sales that included a CREDIT leg (uses that
+                       leg's customer, since originalSale.customer may not
+                       be populated the same way for PARTIAL sales)
+                ==================================================== */
+                const pt = String(originalSale.paymentType).toUpperCase();
+                const isCredit = pt === "CREDIT";
 
-                await tx.account.update({
-                    where: { id: vendorAccId },
-                    data:  { balance: { increment: vendorBalanceDelta } }
-                });
-            }
+                const partialCreditLeg = pt === "PARTIAL"
+                    ? (originalSale.payments || []).find(
+                        l => String(l.method).toUpperCase() === "CREDIT"
+                    )
+                    : null;
 
-            /* ====================================================
-               2️⃣ UPDATE CUSTOMER LEDGER + BALANCE (CREDIT ONLY)
-            ==================================================== */
-            if (customerDelta !== 0 && originalSale.customer?.account) {
-                const custAccId = originalSale.customer.account.id;
+                const refundCustomer = isCredit
+                    ? originalSale.customer
+                    : (partialCreditLeg ? partialCreditLeg.customer : null);
 
-                const customerLedger = await tx.ledgerEntry.findFirst({
-                    where: { saleId: originalSale.id, accountId: custAccId, entryType: "REFUND" }
-                });
+                if (customerDelta !== 0 && (isCredit || partialCreditLeg) && refundCustomer?.account) {
+                    const custAccId = refundCustomer.account.id;
 
-                if (customerLedger) {
-                    await tx.ledgerEntry.update({
-                        where: { id: customerLedger.id },
-                        data:  { credit: newNetRefundToCustomer, transactionDate: businessDate }
+                    const customerLedger = await tx.ledgerEntry.findFirst({
+                        where: { saleId: originalSale.id, accountId: custAccId, entryType: "REFUND" }
+                    });
+
+                    if (customerLedger) {
+                        await tx.ledgerEntry.update({
+                            where: { id: customerLedger.id },
+                            data:  { credit: newNetRefundToCustomer, transactionDate: businessDate }
+                        });
+                    }
+
+                    await tx.account.update({
+                        where: { id: custAccId },
+                        data:  { balance: { decrement: customerDelta } }
                     });
                 }
 
-                await tx.account.update({
-                    where: { id: custAccId },
-                    data:  { balance: { decrement: customerDelta } }
+                /* ====================================================
+                   3️⃣ SYNC THE NEGATIVE MIRROR SALE'S PAID AMOUNT
+                   Only paidAmount on the negative sale reflects the
+                   customer refund side — net/sell/profit stay mirrored
+                   to the original sale and are untouched by fee/charge edits.
+                   Found via refundRecordId now, not documentNo string match.
+                ==================================================== */
+                const negativeSale = await tx.sale.findFirst({
+                    where: { refundRecordId: refundId }
                 });
-            }
 
-            /* ====================================================
-               3️⃣ SYNC THE NEGATIVE MIRROR SALE'S PAID AMOUNT
-               Only paidAmount on the negative sale reflects the
-               customer refund side — net/sell/profit stay mirrored
-               to the original sale and are untouched by fee/charge edits.
-               Found via refundRecordId now, not documentNo string match.
-            ==================================================== */
-            const negativeSale = await tx.sale.findFirst({
-                where: { refundRecordId: refundId }
-            });
+                if (negativeSale && customerDelta !== 0) {
+                    await tx.sale.update({
+                        where: { id: negativeSale.id },
+                        data: {
+                            paidAmount: { increment: -customerDelta },
+                        }
+                    });
+                }
 
-            if (negativeSale && customerDelta !== 0) {
-                await tx.sale.update({
-                    where: { id: negativeSale.id },
+                /* ====================================================
+                   4️⃣ UPDATE REFUND RECORD
+                ==================================================== */
+                return await tx.refund.update({
+                    where: { id: refundId },
                     data: {
-                        paidAmount: { increment: -customerDelta },
+                        vendorRefundAmount:   newVendorRefund,
+                        customerRefundAmount: newCustomerRefundAmount,
+                        netRefundToCustomer:  newNetRefundToCustomer,
+                        refundFee:            newFee,
+                        cancellationCharges:  newCharges,
+                        netCostToUs:          newCharges,
+                        refundDate:           businessDate,
+                        refundReason:         refundReason  ?? existingRefund.refundReason,
+                        remarks:              remarks        ?? existingRefund.remarks,
                     }
                 });
-            }
-
-            /* ====================================================
-               4️⃣ UPDATE REFUND RECORD
-            ==================================================== */
-            return await tx.refund.update({
-                where: { id: refundId },
-                data: {
-                    vendorRefundAmount:   newVendorRefund,
-                    customerRefundAmount: newCustomerRefundAmount,
-                    netRefundToCustomer:  newNetRefundToCustomer,
-                    refundFee:            newFee,
-                    cancellationCharges:  newCharges,
-                    netCostToUs:          newCharges,
-                    refundDate:           businessDate,
-                    refundReason:         refundReason  ?? existingRefund.refundReason,
-                    remarks:              remarks        ?? existingRefund.remarks,
-                }
-            });
-        });
+            }, { timeout: 20000, maxWait: 10000 })
+        );
 
         return res.json({ success: true, data: result });
 
@@ -521,121 +565,142 @@ router.delete("/:refundId", authenticate, async (req, res) => {
     const { refundId } = req.params;
 
     try {
-        const result = await prisma.$transaction(async (tx) => {
+        const result = await runWithRetry(() =>
+            prisma.$transaction(async (tx) => {
 
-            /* ====================================================
-               1️⃣ LOAD REFUND WITH ALL RELATIONS
-            ==================================================== */
-            const refund = await tx.refund.findUnique({
-                where: { id: refundId },
-                include: {
-                    sale: {
-                        include: {
-                            vendor:   { include: { account: true } },
-                            customer: { include: { account: true } },
-                            invoice:  true
+                /* ====================================================
+                   1️⃣ LOAD REFUND WITH ALL RELATIONS
+                ==================================================== */
+                const refund = await tx.refund.findUnique({
+                    where: { id: refundId },
+                    include: {
+                        sale: {
+                            include: {
+                                vendor:   { include: { account: true } },
+                                customer: { include: { account: true } },
+                                invoice:  true,
+                                payments: {                              // SalePayment legs (for PARTIAL sales)
+                                    include: {
+                                        customer: { include: { account: true } },
+                                    },
+                                },
+                            }
                         }
                     }
-                }
-            });
-
-            if (!refund) throw new Error("Refund record not found");
-
-            const originalSale = refund.sale;
-            const vendor       = originalSale.vendor;
-            const customer     = originalSale.customer;
-
-            /* ====================================================
-               2️⃣ REVERSE VENDOR ACCOUNT BALANCE
-            ==================================================== */
-            if (vendor?.account) {
-                const vendorRefundAmt    = Number(refund.vendorRefundAmount);
-                const vendorReverseDelta = vendor.category === "DEBIT"
-                    ?  vendorRefundAmt
-                    : -vendorRefundAmt;
-
-                await tx.account.update({
-                    where: { id: vendor.account.id },
-                    data:  { balance: { increment: vendorReverseDelta } }
                 });
-            }
 
-            /* ====================================================
-               3️⃣ REVERSE CUSTOMER ACCOUNT BALANCE (CREDIT ONLY)
-            ==================================================== */
-            const isCredit = String(originalSale.paymentType).toUpperCase() === "CREDIT";
+                if (!refund) throw new Error("Refund record not found");
 
-            if (isCredit && customer?.account) {
-                const customerRefundAmt = Number(refund.netRefundToCustomer);
+                const originalSale = refund.sale;
+                const vendor       = originalSale.vendor;
 
-                await tx.account.update({
-                    where: { id: customer.account.id },
-                    data:  { balance: { increment: customerRefundAmt } }
-                });
-            }
+                /* ====================================================
+                   2️⃣ REVERSE VENDOR ACCOUNT BALANCE
+                ==================================================== */
+                if (vendor?.account) {
+                    const vendorRefundAmt    = Number(refund.vendorRefundAmount);
+                    const vendorReverseDelta = vendor.category === "DEBIT"
+                        ?  vendorRefundAmt
+                        : -vendorRefundAmt;
 
-            /* ====================================================
-               4️⃣ REMOVE REFUND LEDGER ENTRIES
-            ==================================================== */
-            await tx.ledgerEntry.deleteMany({
-                where: {
-                    saleId:    originalSale.id,
-                    entryType: "REFUND"
+                    await tx.account.update({
+                        where: { id: vendor.account.id },
+                        data:  { balance: { increment: vendorReverseDelta } }
+                    });
                 }
-            });
 
-            /* ====================================================
-               5️⃣ FIND & DELETE THE NEGATIVE MIRROR SALE
-               Try refundRecordId first (new refunds, reliable direct
-               link). Fall back to documentNo matching for refunds
-               created before that field existed.
-               This also reverses the invoice totals automatically
-               since the negative sale is removed from the invoice.
-            ==================================================== */
-            let negativeSale = await tx.sale.findFirst({
-                where: { refundRecordId: refundId }
-            });
+                /* ====================================================
+                   3️⃣ REVERSE CUSTOMER ACCOUNT BALANCE
+                   Applies to:
+                     - pure CREDIT sales (uses originalSale.customer directly)
+                     - PARTIAL sales that included a CREDIT leg (uses that
+                       leg's customer)
+                ==================================================== */
+                const pt = String(originalSale.paymentType).toUpperCase();
+                const isCredit = pt === "CREDIT";
 
-            if (!negativeSale) {
-                negativeSale = await tx.sale.findFirst({
+                const partialCreditLeg = pt === "PARTIAL"
+                    ? (originalSale.payments || []).find(
+                        l => String(l.method).toUpperCase() === "CREDIT"
+                    )
+                    : null;
+
+                const refundCustomer = isCredit
+                    ? originalSale.customer
+                    : (partialCreditLeg ? partialCreditLeg.customer : null);
+
+                if ((isCredit || partialCreditLeg) && refundCustomer?.account) {
+                    const customerRefundAmt = Number(refund.netRefundToCustomer);
+
+                    await tx.account.update({
+                        where: { id: refundCustomer.account.id },
+                        data:  { balance: { increment: customerRefundAmt } }
+                    });
+                }
+
+                /* ====================================================
+                   4️⃣ REMOVE REFUND LEDGER ENTRIES
+                ==================================================== */
+                await tx.ledgerEntry.deleteMany({
                     where: {
-                        invoiceId:  originalSale.invoiceId,
-                        documentNo: `REF-${originalSale.documentNo || originalSale.id}`,
-                        status:     "REFUNDED",
-                    }
-                });
-            }
-
-            if (negativeSale) {
-                // Reverse the invoice totals BEFORE deleting the negative
-                // sale — we need its amounts, and once deleted we can't
-                // read them back.
-                await tx.salesInvoice.update({
-                    where: { id: originalSale.invoiceId },
-                    data: {
-                        totalNet:    { increment: -Number(negativeSale.netPrice)  },  // netPrice was negative, so -negative = positive
-                        totalSell:   { increment: -Number(negativeSale.sellPrice) },
-                        totalProfit: { increment: -Number(negativeSale.profit)    },
+                        saleId:    originalSale.id,
+                        entryType: "REFUND"
                     }
                 });
 
-                await tx.sale.delete({
-                    where: { id: negativeSale.id }
+                /* ====================================================
+                   5️⃣ FIND & DELETE THE NEGATIVE MIRROR SALE
+                   Try refundRecordId first (new refunds, reliable direct
+                   link). Fall back to documentNo matching for refunds
+                   created before that field existed.
+                   This also reverses the invoice totals automatically
+                   since the negative sale is removed from the invoice.
+                ==================================================== */
+                let negativeSale = await tx.sale.findFirst({
+                    where: { refundRecordId: refundId }
                 });
-            }
 
-            /* ====================================================
-               6️⃣ DELETE THE REFUND RECORD
-               Original sale is left completely untouched.
-               Negative sale (if any) is already deleted above, so
-               there's no dangling refundRecordId reference left.
-            ==================================================== */
-            await tx.refund.delete({
-                where: { id: refundId }
-            });
+                if (!negativeSale) {
+                    negativeSale = await tx.sale.findFirst({
+                        where: {
+                            invoiceId:  originalSale.invoiceId,
+                            documentNo: `REF-${originalSale.documentNo || originalSale.id}`,
+                            status:     "REFUNDED",
+                        }
+                    });
+                }
 
-            return { message: "Refund fully reversed and deleted" };
-        }, { timeout: 20000 });
+                if (negativeSale) {
+                    // Reverse the invoice totals BEFORE deleting the negative
+                    // sale — we need its amounts, and once deleted we can't
+                    // read them back.
+                    await tx.salesInvoice.update({
+                        where: { id: originalSale.invoiceId },
+                        data: {
+                            totalNet:    { increment: -Number(negativeSale.netPrice)  },  // netPrice was negative, so -negative = positive
+                            totalSell:   { increment: -Number(negativeSale.sellPrice) },
+                            totalProfit: { increment: -Number(negativeSale.profit)    },
+                        }
+                    });
+
+                    await tx.sale.delete({
+                        where: { id: negativeSale.id }
+                    });
+                }
+
+                /* ====================================================
+                   6️⃣ DELETE THE REFUND RECORD
+                   Original sale is left completely untouched.
+                   Negative sale (if any) is already deleted above, so
+                   there's no dangling refundRecordId reference left.
+                ==================================================== */
+                await tx.refund.delete({
+                    where: { id: refundId }
+                });
+
+                return { message: "Refund fully reversed and deleted" };
+            }, { timeout: 20000, maxWait: 10000 })
+        );
 
         return res.json({ success: true, message: result.message });
 
