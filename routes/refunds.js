@@ -189,6 +189,11 @@ router.post("/", authenticate, async (req, res) => {
                     vendor: { include: { account: true } },
                     customer: { include: { account: true } },
                     invoice: true,
+                    payments: {                              // SalePayment legs (for PARTIAL sales)
+                        include: {
+                            customer: { include: { account: true } },
+                        },
+                    },
                 }
             });
 
@@ -201,64 +206,95 @@ router.post("/", authenticate, async (req, res) => {
             /* ====================================================
                2️⃣ CALCULATE REFUND AMOUNTS
             ==================================================== */
-            const originalNet  = Number(originalSale.netPrice);
+            const originalNet = Number(originalSale.netPrice);
             const originalSell = Number(originalSale.sellPrice);
 
-            const vendorRefundAmount   = originalNet - fee;
+            const vendorRefundAmount = originalNet - fee;
             const customerRefundAmount = originalNet - fee;
-            const netRefundToCustomer  = customerRefundAmount - charges;
-            const netCostToUs          = charges;
+            const netRefundToCustomer = customerRefundAmount - charges;
+            const netCostToUs = charges;
 
             /* ====================================================
                3️⃣ VENDOR LEDGER ENTRY + BALANCE UPDATE
             ==================================================== */
-            const vendorAccId    = originalSale.vendor.account.id;
-            const vendorBalDelta  = originalSale.vendor.category === "DEBIT"
+            const vendorAccId = originalSale.vendor.account.id;
+            const vendorBalDelta = originalSale.vendor.category === "DEBIT"
                 ? -vendorRefundAmount
-                :  vendorRefundAmount;
+                : vendorRefundAmount;
 
             await tx.ledgerEntry.create({
                 data: {
-                    accountId:       vendorAccId,
-                    entryType:       "REFUND",
-                    debit:           vendorRefundAmount,
-                    credit:          0,
+                    accountId: vendorAccId,
+                    entryType: "REFUND",
+                    debit: vendorRefundAmount,
+                    credit: 0,
                     transactionDate: businessDate,
-                    saleId:          originalSale.id,
-                    invoiceId:       originalSale.invoiceId,
-                    remarks:         `Vendor refund (Net Base) - Fee: ${fee}`,
+                    saleId: originalSale.id,
+                    invoiceId: originalSale.invoiceId,
+                    remarks: `Vendor refund (Net Base) - Fee: ${fee}`,
                 }
             });
 
             await tx.account.update({
                 where: { id: vendorAccId },
-                data:  { balance: { increment: vendorBalDelta } }
+                data: { balance: { increment: vendorBalDelta } }
             });
 
             /* ====================================================
-               4️⃣ CUSTOMER LEDGER ENTRY + BALANCE UPDATE (CREDIT ONLY)
+               4️⃣ CUSTOMER LEDGER ENTRY + BALANCE UPDATE
+               Applies to:
+                 - pure CREDIT sales (uses originalSale.customer directly)
+                 - PARTIAL sales that included a CREDIT leg (uses that
+                   leg's customer, since originalSale.customer may not
+                   be populated the same way for PARTIAL sales)
             ==================================================== */
-            const isCredit = String(originalSale.paymentType).toUpperCase() === "CREDIT";
+            const pt = String(originalSale.paymentType).toUpperCase();
+            const isCredit = pt === "CREDIT";
 
-            if (isCredit && originalSale.customer?.account) {
-                const custAccId = originalSale.customer.account.id;
+            const partialCreditLeg = pt === "PARTIAL"
+                ? (originalSale.payments || []).find(
+                    l => String(l.method).toUpperCase() === "CREDIT"
+                )
+                : null;
+
+            // Resolve which customer account (if any) actually carries the
+            // receivable for this sale — either the direct CREDIT customer,
+            // or the CREDIT leg's customer for a PARTIAL sale.
+            const refundCustomer = isCredit
+                ? originalSale.customer
+                : (partialCreditLeg ? partialCreditLeg.customer : null);
+
+            if ((isCredit || partialCreditLeg) && refundCustomer?.account) {
+                const custAccId = refundCustomer.account.id;
+                const currentBalance = Number(refundCustomer.account.balance || 0);
+                const paidAmount = Number(originalSale.paidAmount || 0);
+
+                // How much of the refund is actual cash paid back (bounded by what
+                // was actually collected) vs. how much is just writing down the debt.
+                const cashRefundPortion = Math.min(netRefundToCustomer, paidAmount);
+                const receivableWriteDown = netRefundToCustomer - cashRefundPortion;
+
+                // Total ledger credit can never exceed what the customer actually owes.
+                const ledgerCredit = Math.min(netRefundToCustomer, currentBalance);
 
                 await tx.ledgerEntry.create({
                     data: {
-                        accountId:       custAccId,
-                        entryType:       "REFUND",
-                        debit:           0,
-                        credit:          netRefundToCustomer,
+                        accountId: custAccId,
+                        entryType: "REFUND",
+                        debit: 0,
+                        credit: ledgerCredit,
                         transactionDate: businessDate,
-                        saleId:          originalSale.id,
-                        invoiceId:       originalSale.invoiceId,
-                        remarks:         `Customer refund (Net Base) - Fee: ${fee}, Srv: ${charges}`,
+                        saleId: originalSale.id,
+                        invoiceId: originalSale.invoiceId,
+                        remarks: cashRefundPortion > 0
+                            ? `Customer refund - Cash portion: ${cashRefundPortion}, Balance write-down: ${receivableWriteDown} (Fee: ${fee}, Srv: ${charges})`
+                            : `Receivable write-down (no cash paid) - Fee: ${fee}, Srv: ${charges}`,
                     }
                 });
 
                 await tx.account.update({
                     where: { id: custAccId },
-                    data:  { balance: { decrement: netRefundToCustomer } }
+                    data: { balance: { decrement: ledgerCredit } }
                 });
             }
 
@@ -269,19 +305,19 @@ router.post("/", authenticate, async (req, res) => {
             ==================================================== */
             const refund = await tx.refund.create({
                 data: {
-                    saleId:               originalSale.id,
-                    originalSaleAmount:   originalSell,
+                    saleId: originalSale.id,
+                    originalSaleAmount: originalSell,
                     customerRefundAmount: customerRefundAmount,
-                    vendorRefundAmount:   vendorRefundAmount,
-                    refundFee:            fee,
-                    cancellationCharges:  charges,
-                    netRefundToCustomer:  netRefundToCustomer,
-                    netCostToUs:          netCostToUs,
-                    refundReason:         refundReason || null,
-                    remarks:              remarks      || null,
-                    refundDate:           businessDate,
-                    status:               "COMPLETED",
-                    processedById:        req.user.id,
+                    vendorRefundAmount: vendorRefundAmount,
+                    refundFee: fee,
+                    cancellationCharges: charges,
+                    netRefundToCustomer: netRefundToCustomer,
+                    netCostToUs: netCostToUs,
+                    refundReason: refundReason || null,
+                    remarks: remarks || null,
+                    refundDate: businessDate,
+                    status: "COMPLETED",
+                    processedById: req.user.id,
                 }
             });
 
@@ -293,31 +329,31 @@ router.post("/", authenticate, async (req, res) => {
             ==================================================== */
             const negativeSale = await tx.sale.create({
                 data: {
-                    invoiceId:     originalSale.invoiceId,
-                    airlineId:     originalSale.airlineId,
-                    vendorId:      originalSale.vendorId,
-                    customerId:    originalSale.customerId   || null,
+                    invoiceId: originalSale.invoiceId,
+                    airlineId: originalSale.airlineId,
+                    vendorId: originalSale.vendorId,
+                    customerId: originalSale.customerId || (partialCreditLeg?.customerId || null),
 
-                    documentNo:    `REF-${originalSale.documentNo || originalSale.id}`,
-                    pnr:           originalSale.pnr           || null,
-                    paxName:       originalSale.paxName        || null,
-                    routeType:     originalSale.routeType      || null,
-                    tripType:      originalSale.tripType        || null,
-                    departureDate: originalSale.departureDate  || null,
-                    returnDate:    originalSale.returnDate      || null,
-                    destinations:  originalSale.destinations    || null,
+                    documentNo: `REF-${originalSale.documentNo || originalSale.id}`,
+                    pnr: originalSale.pnr || null,
+                    paxName: originalSale.paxName || null,
+                    routeType: originalSale.routeType || null,
+                    tripType: originalSale.tripType || null,
+                    departureDate: originalSale.departureDate || null,
+                    returnDate: originalSale.returnDate || null,
+                    destinations: originalSale.destinations || null,
 
-                    netPrice:     -originalNet,
-                    sellPrice:    -originalSell,
-                    profit:       -(Number(originalSale.profit     || 0)),
-                    vatAmount:    -(Number(originalSale.vatAmount   || 0)),
-                    paxVat:       -(Number(originalSale.paxVat      || 0)),
-                    miscCharges:  -(Number(originalSale.miscCharges || 0)),
-                    paidAmount:   -(Number(originalSale.paidAmount  || 0)),
+                    netPrice: -originalNet,
+                    sellPrice: -originalSell,
+                    profit: -(Number(originalSale.profit || 0)),
+                    vatAmount: -(Number(originalSale.vatAmount || 0)),
+                    paxVat: -(Number(originalSale.paxVat || 0)),
+                    miscCharges: -(Number(originalSale.miscCharges || 0)),
+                    paidAmount: -(Number(originalSale.paidAmount || 0)),
 
-                    paymentType:   originalSale.paymentType,
+                    paymentType: originalSale.paymentType,
                     paymentStatus: "PAID",
-                    status:        "REFUNDED",
+                    status: "REFUNDED",
 
                     refundRecordId: refund.id,
 
@@ -331,8 +367,8 @@ router.post("/", authenticate, async (req, res) => {
             await tx.salesInvoice.update({
                 where: { id: originalSale.invoiceId },
                 data: {
-                    totalNet:    { increment: -originalNet },
-                    totalSell:   { increment: -originalSell },
+                    totalNet: { increment: -originalNet },
+                    totalSell: { increment: -originalSell },
                     totalProfit: { increment: -(Number(originalSale.profit || 0)) },
                 }
             });

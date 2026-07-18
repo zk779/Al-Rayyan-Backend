@@ -1048,13 +1048,24 @@ router.post("/", authenticate, async (req, res) => {
 				const profit = sell - net - vatAmt;
 				const pt = String(s.paymentType).toUpperCase();
 
+				// For PARTIAL sales, the customer (if any) only comes from the
+				// CREDIT leg inside paymentLegs — s.customerId isn't set at the
+				// top level for this payment type, so fall back to that leg's
+				// customerId instead of defaulting to null/WALKIN.
+				const partialCreditLeg = pt === "PARTIAL"
+					? s.paymentLegs.find(l => String(l.method).toUpperCase() === "CREDIT")
+					: null;
+				const saleCustomerId = pt === "PARTIAL"
+					? (partialCreditLeg?.customerId || null)
+					: (s.customerId || null);
+
 				/* ── Create sale record ── */
 				const sale = await tx.sale.create({
 					data: {
 						invoiceId: invoice.id,
 						airlineId: s.airlineId,
 						vendorId: s.vendorId,
-						customerId: s.customerId || null,
+						customerId: saleCustomerId,
 						bankId: pt === "BANK_TRANSFER" ? (s.bankId || null) : null,
 						accountId: pt === "CASH" ? (await getCashAccount()).id : null,
 						documentNo: s.documentNo || null,
@@ -1112,9 +1123,7 @@ router.post("/", authenticate, async (req, res) => {
 				} else if (pt === "CREDIT") {
 					await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
 				} else if (pt === "PARTIAL") {
-					const creditLeg = s.paymentLegs.find(
-						l => String(l.method).toUpperCase() === "CREDIT"
-					);
+					const creditLeg = partialCreditLeg;
 
 					if (creditLeg) {
 						// New flow: CASH+CREDIT or BANK_TRANSFER+CREDIT (or any mix
@@ -1832,13 +1841,21 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					},
 				];
 
+				// For PARTIAL sales, the customer (if any) only comes from the
+				// CREDIT leg inside paymentLegs — payload.customerId isn't set
+				// at the top level for this payment type, so fall back to that
+				// leg's customerId instead of defaulting to null/WALKIN.
+				const saleCustomerId = newPt === "PARTIAL"
+					? (payload.paymentLegs.find(l => String(l.method).toUpperCase() === "CREDIT")?.customerId || null)
+					: ((newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null);
+
 				/* ── UPDATE SALE RECORD ── */
 				await tx.sale.update({
 					where: { id: current.id },
 					data: {
 						airlineId: payload.airlineId,
 						vendorId: payload.vendorId,
-						customerId: (newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null,
+						customerId: saleCustomerId,
 						bankId: newPt === "BANK_TRANSFER" ? (payload.bankId || null) : null,
 						accountId: newPt === "CASH" ? (await getCashAccount()).id : null,
 						documentNo: payload.documentNo || null,
