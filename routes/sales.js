@@ -751,6 +751,15 @@ router.get("/saleId/:saleId", authenticate, async (req, res) => {
 					include: {
 						account: { select: { balance: true } }
 					}
+				},
+				// Minimal selection to check if this sale has since been
+				// refunded, and by how much — same logic as /customerSales.
+				refunds: {
+					select: {
+						id: true,
+						netRefundToCustomer: true,
+						refundDate: true,
+					}
 				}
 			}
 		});
@@ -759,7 +768,27 @@ router.get("/saleId/:saleId", authenticate, async (req, res) => {
 			return res.status(404).json({ success: false, error: "Sale not found" });
 		}
 
-		res.json({ success: true, data: sale });
+		// A sale can have at most one refund (enforced when the refund is
+		// created), so just take the first one if present.
+		const refund = sale.refunds && sale.refunds.length > 0 ? sale.refunds[0] : null;
+
+		const originalDueAmount = sale.sellPrice - (sale.paidAmount || 0);
+
+		// If this sale was refunded, whatever was refunded to the customer
+		// reduces what they still owe on it. e.g. sale 2000, paid 500 →
+		// due 1500; refund of 1350 to the customer → remaining due 150.
+		const netRefundToCustomer = refund ? Number(refund.netRefundToCustomer || 0) : 0;
+		const dueAmount = originalDueAmount - netRefundToCustomer;
+
+		res.json({
+			success: true,
+			data: {
+				...sale,
+				dueAmount,
+				isRefunded: !!refund,
+				refundedAmount: netRefundToCustomer,
+			}
+		});
 	} catch (err) {
 		console.error(err);
 		res.status(500).json({ success: false, error: "Failed to fetch sale" });

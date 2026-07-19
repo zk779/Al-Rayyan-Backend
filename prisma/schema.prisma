@@ -426,10 +426,11 @@ model Sale {
     refunds  Refund[]
     payments SalePayment[]
 
-    createdAt DateTime @default(now())
-    updatedAt DateTime @updatedAt
-    account   Account? @relation(fields: [accountId], references: [id])
-    accountId String?  @db.ObjectId
+    createdAt              DateTime                @default(now())
+    updatedAt              DateTime                @updatedAt
+    account                Account?                @relation(fields: [accountId], references: [id])
+    accountId              String?                 @db.ObjectId
+    vendorCustomerPayments VendorCustomerPayment[]
 
     @@index([pnr])
     @@index([status])
@@ -536,6 +537,9 @@ model VendorCustomerPayment {
     customerId String?   @db.ObjectId
     customer   Customer? @relation(fields: [customerId], references: [id])
 
+    saleId String? @db.ObjectId
+    sale   Sale?   @relation(fields: [saleId], references: [id])
+
     method PaymentType // CASH | BANK_TRANSFER only (never CREDIT / PARTIAL here)
     amount Float
 
@@ -562,26 +566,12 @@ model VendorCustomerPayment {
     @@index([partyType])
     @@index([vendorId])
     @@index([customerId])
+    @@index([saleId])
     @@index([bankId])
     @@index([transactionDate])
     @@index([createdAt])
     @@index([accountId])
 }
-
-// ===========================
-// EXPENSE
-// One row per expense transaction.
-//
-// - branchId is a PLAIN REFERENCE ONLY — it does NOT correspond to any Account
-//   record. Per-branch totals are computed on demand (e.g. groupBy branchId
-//   and sum amount), not tracked as a running balance.
-// - paymentMode = CASH          -> nothing posts to any account/ledger at all.
-//                                   The expense is just recorded.
-// - paymentMode = BANK_TRANSFER -> the bank account is debited (balance
-//                                   decreases) and exactly ONE LedgerEntry is
-//                                   created against the bank's Account.
-// - Only status = APPROVED expenses ever touch the bank balance / ledger.
-// ===========================
 
 model Expense {
     id String @id @default(auto()) @map("_id") @db.ObjectId
