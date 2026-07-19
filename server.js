@@ -21,7 +21,7 @@ import refundsRoutes from "./routes/refunds.js";
 import bankRoutes from "./routes/bankRoutes.js";
 import vendorCustomerPaymentRoutes from "./routes/Vendorcustomerpayment.js";
 import expenseRoutes from "./routes/expenseRoutes.js";
-import salePaymentRoutes from "./routes/salePayment.js";
+import salePaymentRoutes from "./routes/SalePayment.js";
 
 dotenv.config();
 
