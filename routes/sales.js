@@ -93,10 +93,19 @@ router.get("/", authenticate, async (req, res) => {
 
 		const invoices = await prisma.salesInvoice.findMany({
 			where: whereClause,
-			orderBy: { createdAt: sortDirection },
+			// Sort invoices by saleDate (full date+time), not createdAt — the
+			// most recently DATED invoice comes first (or last, if ascending),
+			// not just the most recently inserted row.
+			orderBy: { saleDate: sortDirection },
 			include: {
 				user: { select: { id: true, fullName: true, email: true } },
 				sales: {
+					// Within each invoice, its sales are ordered by their own
+					// createdAt in the SAME direction as the invoice sort — so
+					// if an invoice has 5 sales and we're sorting newest-first,
+					// that invoice's most recently created sale appears first
+					// among its own sales too.
+					orderBy: { createdAt: sortDirection },
 					select: {
 						id: true,
 						netPrice: true,
