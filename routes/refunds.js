@@ -36,31 +36,66 @@ router.get("/", authenticate, async (req, res) => {
         startDate,
         endDate,
         sortBy = "createdAt",
-        sortOrder = "desc"
+        sortOrder = "desc",
+        search,
+        processedById
     } = req.query;
 
     const skip = (Number(page) - 1) * Number(limit);
     const take = Number(limit);
 
-    const where = {};
+    // Each condition below is pushed into `filters` and combined with AND,
+    // so search + status + saleId + date range + processedBy can all be
+    // applied together.
+    const filters = [];
 
     if (status) {
-        where.status = status.toUpperCase();
+        filters.push({ status: status.toUpperCase() });
     }
 
     if (saleId) {
-        where.saleId = saleId;
+        filters.push({ saleId });
+    }
+
+    if (processedById) {
+        filters.push({ processedById });
     }
 
     if (startDate || endDate) {
-        where.refundDate = {};
-        if (startDate) where.refundDate.gte = new Date(startDate);
+        const refundDateFilter = {};
+
+        if (startDate) {
+            const start = new Date(startDate);
+            if (!isNaN(start.getTime())) refundDateFilter.gte = start;
+        }
+
         if (endDate) {
             const end = new Date(endDate);
-            end.setHours(23, 59, 59, 999);
-            where.refundDate.lte = end;
+            if (!isNaN(end.getTime())) {
+                end.setHours(23, 59, 59, 999);
+                refundDateFilter.lte = end;
+            }
+        }
+
+        if (Object.keys(refundDateFilter).length > 0) {
+            filters.push({ refundDate: refundDateFilter });
         }
     }
+
+    // Search across: the refund's own remarks/refundReason, the linked
+    // sale's documentNo, or that sale's invoice's invoiceNo.
+    if (search) {
+        filters.push({
+            OR: [
+                { remarks: { contains: search, mode: "insensitive" } },
+                { refundReason: { contains: search, mode: "insensitive" } },
+                { sale: { documentNo: { contains: search, mode: "insensitive" } } },
+                { sale: { invoice: { invoiceNo: { contains: search, mode: "insensitive" } } } }
+            ]
+        });
+    }
+
+    const where = filters.length > 0 ? { AND: filters } : {};
 
     try {
         const [refunds, total] = await prisma.$transaction([
@@ -75,6 +110,7 @@ router.get("/", authenticate, async (req, res) => {
                             id: true,
                             netPrice: true,
                             sellPrice: true,
+                            documentNo: true,
                             // ✅ FIXED: Using vendorName instead of name
                             vendor: { select: { id: true, vendorName: true } },
                             // ✅ FIXED: Using customerName instead of name
@@ -247,6 +283,17 @@ router.post("/", authenticate, async (req, res) => {
                  - PARTIAL sales that included a CREDIT leg (uses that
                    leg's customer, since originalSale.customer may not
                    be populated the same way for PARTIAL sales)
+
+               NOTE: the full netRefundToCustomer is always credited here,
+               uncapped by the customer's current outstanding balance. If
+               the refund exceeds what the customer still owed, their
+               account balance is allowed to go NEGATIVE — a negative
+               balance means the business now owes that amount BACK to
+               the customer in cash (e.g. sellPrice 2000, paid 500, so
+               balance was +1500 owed to us; a 1700 refund brings it to
+               -200, meaning we now owe the customer 200).
+               This keeps the ledger entry and the Refund record's
+               netRefundToCustomer always in agreement — no silent gaps.
             ==================================================== */
             const pt = String(originalSale.paymentType).toUpperCase();
             const isCredit = pt === "CREDIT";
@@ -266,35 +313,23 @@ router.post("/", authenticate, async (req, res) => {
 
             if ((isCredit || partialCreditLeg) && refundCustomer?.account) {
                 const custAccId = refundCustomer.account.id;
-                const currentBalance = Number(refundCustomer.account.balance || 0);
-                const paidAmount = Number(originalSale.paidAmount || 0);
-
-                // How much of the refund is actual cash paid back (bounded by what
-                // was actually collected) vs. how much is just writing down the debt.
-                const cashRefundPortion = Math.min(netRefundToCustomer, paidAmount);
-                const receivableWriteDown = netRefundToCustomer - cashRefundPortion;
-
-                // Total ledger credit can never exceed what the customer actually owes.
-                const ledgerCredit = Math.min(netRefundToCustomer, currentBalance);
 
                 await tx.ledgerEntry.create({
                     data: {
                         accountId: custAccId,
                         entryType: "REFUND",
                         debit: 0,
-                        credit: ledgerCredit,
+                        credit: netRefundToCustomer,
                         transactionDate: businessDate,
                         saleId: originalSale.id,
                         invoiceId: originalSale.invoiceId,
-                        remarks: cashRefundPortion > 0
-                            ? `Customer refund - Cash portion: ${cashRefundPortion}, Balance write-down: ${receivableWriteDown} (Fee: ${fee}, Srv: ${charges})`
-                            : `Receivable write-down (no cash paid) - Fee: ${fee}, Srv: ${charges}`,
+                        remarks: `Customer refund - ${netRefundToCustomer} (Fee: ${fee}, Srv: ${charges})`,
                     }
                 });
 
                 await tx.account.update({
                     where: { id: custAccId },
-                    data: { balance: { decrement: ledgerCredit } }
+                    data: { balance: { decrement: netRefundToCustomer } }
                 });
             }
 
@@ -479,6 +514,16 @@ router.put("/:refundId", authenticate, async (req, res) => {
                      - PARTIAL sales that included a CREDIT leg (uses that
                        leg's customer, since originalSale.customer may not
                        be populated the same way for PARTIAL sales)
+
+                   NOTE: this always uses the FULL newNetRefundToCustomer,
+                   uncapped by the customer's current balance — matching
+                   the POST route. The customer's account balance is
+                   allowed to go negative, which means the business now
+                   owes that amount back to the customer in cash. Editing
+                   a refund's fee/charges here simply re-deltas the ledger
+                   and balance by (new - old), same logic as before, but
+                   now both sides always agree with each other since POST
+                   no longer caps the initial credit.
                 ==================================================== */
                 const pt = String(originalSale.paymentType).toUpperCase();
                 const isCredit = pt === "CREDIT";
@@ -615,6 +660,14 @@ router.delete("/:refundId", authenticate, async (req, res) => {
                      - pure CREDIT sales (uses originalSale.customer directly)
                      - PARTIAL sales that included a CREDIT leg (uses that
                        leg's customer)
+
+                   NOTE: this reverses the FULL refund.netRefundToCustomer,
+                   uncapped — matching what POST actually credited. Since
+                   the customer's balance may currently be negative (i.e.
+                   the business owes them money from this refund), this
+                   increment correctly restores it back to whatever it was
+                   before the refund was ever created, even if that means
+                   moving from a negative value back up to a positive one.
                 ==================================================== */
                 const pt = String(originalSale.paymentType).toUpperCase();
                 const isCredit = pt === "CREDIT";

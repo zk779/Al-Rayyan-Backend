@@ -32,27 +32,68 @@ async function authenticate(req, res, next) {
 /* ======================= GET ALL INVOICES ======================= */
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search } = req.query;
+		const { search, dateFrom, dateTo, order, createdById } = req.query;
 
-		const whereClause = search ? {
-			OR: [
-				{ invoiceNo: { contains: search, mode: "insensitive" } },
-				{
-					sales: {
-						some: {
-							OR: [
-								{ documentNo: { contains: search, mode: "insensitive" } },
-								{ remarks: { contains: search, mode: "insensitive" } }
-							]
+		// Each condition below is pushed into `filters` and combined with AND,
+		// so search + date range + createdBy can all be applied together.
+		const filters = [];
+
+		// Search across invoiceNo (on the invoice itself) OR documentNo/remarks
+		// (on any of its sales).
+		if (search) {
+			filters.push({
+				OR: [
+					{ invoiceNo: { contains: search, mode: "insensitive" } },
+					{
+						sales: {
+							some: {
+								OR: [
+									{ documentNo: { contains: search, mode: "insensitive" } },
+									{ remarks: { contains: search, mode: "insensitive" } }
+								]
+							}
 						}
 					}
+				]
+			});
+		}
+
+		// Filter by who created the invoice
+		if (createdById) {
+			filters.push({ userId: createdById });
+		}
+
+		// Date range filter on saleDate — either bound is optional.
+		// dateTo is treated as inclusive of the entire day.
+		if (dateFrom || dateTo) {
+			const saleDateFilter = {};
+
+			if (dateFrom) {
+				const from = new Date(dateFrom);
+				if (!isNaN(from.getTime())) saleDateFilter.gte = from;
+			}
+
+			if (dateTo) {
+				const to = new Date(dateTo);
+				if (!isNaN(to.getTime())) {
+					to.setHours(23, 59, 59, 999);
+					saleDateFilter.lte = to;
 				}
-			]
-		} : {};
+			}
+
+			if (Object.keys(saleDateFilter).length > 0) {
+				filters.push({ saleDate: saleDateFilter });
+			}
+		}
+
+		const whereClause = filters.length > 0 ? { AND: filters } : {};
+
+		// Sort direction — defaults to newest first, same as before.
+		const sortDirection = String(order || "").toLowerCase() === "asc" ? "asc" : "desc";
 
 		const invoices = await prisma.salesInvoice.findMany({
 			where: whereClause,
-			orderBy: { createdAt: "desc" },
+			orderBy: { createdAt: sortDirection },
 			include: {
 				user: { select: { id: true, fullName: true, email: true } },
 				sales: {
@@ -370,7 +411,7 @@ router.get("/customerSales", authenticate, async (req, res) => {
 		const sales = await prisma.sale.findMany({
 			where: {
 				customerId,
-				paymentStatus: { in: statusList }
+				paymentStatus: { in: statusList },
 			},
 			orderBy: { createdAt: "desc" },
 			include: {
@@ -413,46 +454,80 @@ router.get("/customerSales", authenticate, async (req, res) => {
 						remarks: true
 					},
 					orderBy: { paymentDate: "asc" }
+				},
+				// Minimal selection to check if this sale has since been refunded,
+				// and by how much — needed to adjust the due amount below.
+				refunds: {
+					select: {
+						id: true,
+						netRefundToCustomer: true,
+						refundDate: true,
+					}
 				}
 			}
 		});
 
-		const data = sales.map((s) => ({
-			id: s.id,
-			invoiceId: s.invoice?.id || null,
-			invoiceNo: s.invoice?.invoiceNo || null,
-			saleDate: s.invoice?.saleDate || null,
-			documentNo: s.documentNo,
-			pnr: s.pnr,
-			paxName: s.paxName,
-			netPrice: s.netPrice,
-			sellPrice: s.sellPrice,
-			profit: s.profit,
-			status: s.status,
-			paymentType: s.paymentType,
-			paymentStatus: s.paymentStatus,
-			paidAmount: s.paidAmount,
-			dueAmount: s.sellPrice - (s.paidAmount || 0),
-			remarks: s.remarks,
-			airlineCode: s.airline?.airlineCode || null,
-			airlineName: s.airline?.airlineName || null,
-			vendorName: s.vendor?.vendorName || null,
-			vendorCategory: s.vendor?.category || null,
-			vendorBalance: s.vendor?.account?.balance ?? null,
-			customerName: s.customer?.customerName || null,
-			customerPhone: s.customer?.phone || null,
-			customerBalance: s.customer?.account?.balance ?? null,
-			bank: s.bank
-				? {
-					id: s.bank.id,
-					bankName: s.bank.bankName,
-					accountNumber: s.bank.accountNumber,
-					branchName: s.bank.branchName
-				}
-				: null,
-			payments: s.payments,
-			createdAt: s.createdAt
-		}));
+		const data = sales
+			// Exclude the negative mirror sale (identified by refundRecordId
+			// being set) in JS rather than in the Prisma `where` clause —
+			// combining that scalar filter with the `refunds` relation include
+			// was causing the query to return zero rows entirely on Mongo.
+			.filter((s) => !s.refundRecordId)
+			.map((s) => {
+				// A sale can have at most one refund (enforced when the refund is
+				// created), so just take the first one if present.
+				const refund = s.refunds && s.refunds.length > 0 ? s.refunds[0] : null;
+
+				const originalDueAmount = s.sellPrice - (s.paidAmount || 0);
+
+				// If this sale was refunded, whatever was refunded to the customer
+				// reduces what they still owe on it. e.g. sale 2000, paid 500 →
+				// due 1500; refund of 1350 to the customer → remaining due 150.
+				const netRefundToCustomer = refund ? Number(refund.netRefundToCustomer || 0) : 0;
+				const dueAmount = originalDueAmount - netRefundToCustomer;
+
+				return {
+					id: s.id,
+					invoiceId: s.invoice?.id || null,
+					invoiceNo: s.invoice?.invoiceNo || null,
+					saleDate: s.invoice?.saleDate || null,
+					documentNo: s.documentNo,
+					pnr: s.pnr,
+					paxName: s.paxName,
+					netPrice: s.netPrice,
+					sellPrice: s.sellPrice,
+					profit: s.profit,
+					status: s.status,
+					paymentType: s.paymentType,
+					paymentStatus: s.paymentStatus,
+					paidAmount: s.paidAmount,
+					dueAmount,
+					isRefunded: !!refund,
+					refundedAmount: netRefundToCustomer,
+					remarks: s.remarks,
+					airlineCode: s.airline?.airlineCode || null,
+					airlineName: s.airline?.airlineName || null,
+					vendorName: s.vendor?.vendorName || null,
+					vendorCategory: s.vendor?.category || null,
+					vendorBalance: s.vendor?.account?.balance ?? null,
+					customerName: s.customer?.customerName || null,
+					customerPhone: s.customer?.phone || null,
+					customerBalance: s.customer?.account?.balance ?? null,
+					bank: s.bank
+						? {
+							id: s.bank.id,
+							bankName: s.bank.bankName,
+							accountNumber: s.bank.accountNumber,
+							branchName: s.bank.branchName
+						}
+						: null,
+					payments: s.payments,
+					createdAt: s.createdAt
+				};
+			})
+			// Drop any sale whose refund brought the due amount to zero or
+			// below (fully settled, or even overpaid back via refund).
+			.filter((s) => s.dueAmount > 0);
 
 		res.json({ success: true, data });
 	} catch (err) {
@@ -537,6 +612,14 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 							},
 							orderBy: { paymentDate: "asc" },
 						},
+						// Minimal selection just to detect whether this sale has
+						// already been refunded (see JS filter below) — Mongo's
+						// relation filters (e.g. `refunds: { none: {} }` inside
+						// `where`) don't reliably combine with other conditions,
+						// so we filter in JS instead of in the query itself.
+						refunds: {
+							select: { id: true },
+						},
 					},
 				},
 			},
@@ -546,9 +629,22 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 			return res.status(404).json({ success: false, error: "Invoice not found" });
 		}
 
+		// Exclude BOTH sides of any refund:
+		//  - refundRecordId != null      → this row IS the negative mirror sale
+		//  - refunds.length > 0          → this row IS the original sale that has
+		//                                   since been refunded (its own status/
+		//                                   fields are left untouched by the
+		//                                   refund route, so we filter it out here)
+		const activeSales = invoice.sales.filter(
+			(sale) => !sale.refundRecordId && (!sale.refunds || sale.refunds.length === 0)
+		);
+
 		// Enrich each sale with a normalised paymentSummary so the
 		// frontend never has to branch on paymentType itself.
-		const enrichedSales = invoice.sales.map((sale) => {
+		const enrichedSales = activeSales.map((sale) => {
+			// Drop the helper `refunds` array — it was only fetched to
+			// detect refund status above and isn't part of the public shape.
+			const { refunds, ...saleWithoutRefunds } = sale;
 			const pt = String(sale.paymentType).toUpperCase();
 			let paymentSummary;
 
@@ -609,7 +705,7 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 				paymentSummary = { type: pt, label: pt, amount: sale.paidAmount };
 			}
 
-			return { ...sale, paymentSummary };
+			return { ...saleWithoutRefunds, paymentSummary };
 		});
 
 		res.json({
@@ -1223,6 +1319,11 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 								customer: { include: { account: true } },
 							},
 						},
+						// Minimal selection just to detect whether this sale has
+						// already been refunded (see editableSales filter below).
+						refunds: {
+							select: { id: true },
+						},
 					},
 				},
 			},
@@ -1232,18 +1333,44 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			return res.status(404).json({ success: false, error: "Invoice not found" });
 		}
 
-		const saleMap = new Map(existingInvoice.sales.map(s => [s.id, s]));
+		/* ══════════════════════════════════════════════════════
+		   Exclude BOTH sides of any refund from the editable set:
+		     - refundRecordId != null  → this row IS the negative mirror sale
+		     - refunds.length > 0      → this row IS the original sale that
+		                                  has since been refunded (its own
+		                                  status/fields are left untouched by
+		                                  the refund route, so we filter it
+		                                  out here explicitly)
+		   These sales are never fetched by the GET route, so the frontend
+		   can never send them back in the payload — meaning they'd normally
+		   look "deleted" (omitted) and get destructively reversed. We treat
+		   them as untouchable: not editable, and never eligible for the
+		   deleted-sales cleanup path either.
+		══════════════════════════════════════════════════════ */
+		const editableSales = existingInvoice.sales.filter(
+			(s) => !s.refundRecordId && (!s.refunds || s.refunds.length === 0)
+		);
+
+		const saleMap = new Map(editableSales.map(s => [s.id, s]));
 
 		for (const s of sales) {
 			if (!s.id) throw new Error("Each sale must include 'id'");
-			if (!saleMap.has(s.id)) throw new Error(`Sale not found in invoice: ${s.id}`);
+			if (!saleMap.has(s.id)) {
+				throw new Error(
+					`Sale not found or not editable (it may already be refunded): ${s.id}`
+				);
+			}
 		}
 
 		/* ======================================================
 		   2️⃣  DELETED SALES (omitted from payload)
+		   Computed ONLY from editableSales — refunded sales and
+		   their negative mirrors are never included here, so they
+		   can never be deleted/reversed just because the frontend
+		   didn't (and couldn't) send them back.
 		====================================================== */
 		const payloadSaleIds = new Set(sales.map(s => s.id));
-		const deletedSales = existingInvoice.sales.filter(s => !payloadSaleIds.has(s.id));
+		const deletedSales = editableSales.filter(s => !payloadSaleIds.has(s.id));
 
 		/* ======================================================
 		   3️⃣  PRE-LOAD ALL VENDORS / CUSTOMERS / BANKS / CASH
@@ -1252,7 +1379,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		const customerIdSet = new Set();
 		const bankIdSet = new Set();
 
-		// Collect from existing sales (for reversal)
+		// Collect from existing sales (for reversal) — safe to include all
+		// sales here (even refunded ones) since this is only used to seed
+		// initial account balances; it doesn't affect what gets reversed.
 		existingInvoice.sales.forEach(s => {
 			if (s.vendorId) vendorIdSet.add(s.vendorId);
 			if (s.customerId) customerIdSet.add(s.customerId);
@@ -1569,6 +1698,8 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 			/* ══════════════════════════════════════════════════════
 			   4.1  DELETE OMITTED SALES (full reversal)
+			   `deletedSales` is already scoped to editableSales only,
+			   so refunded sales / negative mirrors never land here.
 			══════════════════════════════════════════════════════ */
 			for (const sale of deletedSales) {
 				const net = Number(sale.netPrice);
@@ -1893,13 +2024,12 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			}
 
 			/* ══════════════════════════════════════════════════════
-			   4.4  UPDATE INVOICE TOTALS
+			   4.4  UPDATE INVOICE TOTALS — computed via live aggregate over
+			   ALL sales currently belonging to this invoice (including any
+			   negative refund-mirror sales), not just the ones in this
+			   payload. Refunded pairs net to zero automatically, so this
+			   stays correct without needing to special-case them.
 			══════════════════════════════════════════════════════ */
-			/* ══════════════════════════════════════════════════════
-   4.4  UPDATE INVOICE TOTALS — computed via live aggregate over
-   ALL sales currently belonging to this invoice (including any
-   negative refund-mirror sales), not just the ones in this payload.
-══════════════════════════════════════════════════════ */
 			const totals = await tx.sale.aggregate({
 				where: { invoiceId },
 				_sum: { netPrice: true, sellPrice: true, profit: true },
