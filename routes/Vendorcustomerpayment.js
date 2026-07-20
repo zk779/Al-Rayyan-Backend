@@ -289,6 +289,16 @@ router.post("/", upload.single("attachment"), async (req, res) => {
         const partyAccount = partyType === "VENDOR" ? vendor.account : customer.account;
         const currentBalance = partyAccount.balance;
 
+        // A CUSTOMER payment against exactly ONE sale is just as unambiguous
+        // as a payment from the dedicated single-sale route — so it's safe
+        // to set saleId here too. With 2+ allocations there's no single
+        // sale to point at, so it stays null (LedgerEntry.saleId per leg
+        // remains the source of truth for the breakdown in that case).
+        const singleAllocationSaleId =
+            partyType === "CUSTOMER" && allocations.length === 1
+                ? allocations[0].saleId
+                : null;
+
         let partyLegDebit = 0;
         let partyLegCredit = 0;
         let partyBalanceDelta = 0;
@@ -372,6 +382,10 @@ router.post("/", upload.single("attachment"), async (req, res) => {
                     partyType,
                     vendorId: partyType === "VENDOR" ? vendorId : null,
                     customerId: partyType === "CUSTOMER" ? customerId : null,
+                    // Only set for an unambiguous single-sale CUSTOMER
+                    // payment — null for VENDOR payments and for multi-sale
+                    // allocation payments (2+ sales).
+                    saleId: singleAllocationSaleId,
                     method,
                     amount,
                     bankId: method === "BANK_TRANSFER" ? bankId : null,
@@ -507,6 +521,13 @@ router.post("/", upload.single("attachment"), async (req, res) => {
             include: {
                 vendor: { select: { id: true, vendorName: true, category: true } },
                 customer: { select: { id: true, customerName: true } },
+                sale: {
+                    select: {
+                        id: true,
+                        documentNo: true,
+                        invoice: { select: { id: true, invoiceNo: true } },
+                    },
+                },
                 bank: { select: { id: true, bankName: true, accountNumber: true } },
                 account: { select: { id: true, name: true, type: true, balance: true } },
                 ledgerEntries: true,
@@ -523,18 +544,111 @@ router.post("/", upload.single("attachment"), async (req, res) => {
 // ---- GET ALL ----
 router.get("/", async (req, res) => {
   try {
+    const {
+      partyType,
+      vendorId,
+      customerId,
+      saleId,
+      method,
+      dateFrom,
+      dateTo,
+      order,
+      search,
+    } = req.query;
+
+    // Each condition below is pushed into `filters` and combined with AND.
+    const filters = [];
+
+    if (partyType) {
+      filters.push({ partyType: String(partyType).toUpperCase() });
+    }
+
+    if (vendorId) {
+      filters.push({ vendorId });
+    }
+
+    if (customerId) {
+      filters.push({ customerId });
+    }
+
+    if (saleId) {
+      filters.push({ saleId });
+    }
+
+    if (method) {
+      filters.push({ method: String(method).toUpperCase() });
+    }
+
+    if (dateFrom || dateTo) {
+      const dateFilter = {};
+
+      if (dateFrom) {
+        const from = new Date(dateFrom);
+        if (!isNaN(from.getTime())) dateFilter.gte = from;
+      }
+
+      if (dateTo) {
+        const to = new Date(dateTo);
+        if (!isNaN(to.getTime())) {
+          to.setHours(23, 59, 59, 999);
+          dateFilter.lte = to;
+        }
+      }
+
+      if (Object.keys(dateFilter).length > 0) {
+        filters.push({ transactionDate: dateFilter });
+      }
+    }
+
+    // Search across: the payment's own remarks, the vendor/customer name,
+    // or the linked sale's documentNo/invoiceNo (only present for
+    // single-sale payments — walk-in or otherwise).
+    if (search) {
+      filters.push({
+        OR: [
+          { remarks: { contains: search, mode: "insensitive" } },
+          { vendor: { vendorName: { contains: search, mode: "insensitive" } } },
+          { customer: { customerName: { contains: search, mode: "insensitive" } } },
+          { sale: { documentNo: { contains: search, mode: "insensitive" } } },
+          { sale: { invoice: { invoiceNo: { contains: search, mode: "insensitive" } } } },
+        ],
+      });
+    }
+
+    const where = filters.length > 0 ? { AND: filters } : {};
+    const sortDirection = String(order || "").toLowerCase() === "asc" ? "asc" : "desc";
+
     const payments = await prisma.vendorCustomerPayment.findMany({
+      where,
       include: {
         vendor: { select: { id: true, vendorName: true, category: true } },
         customer: { select: { id: true, customerName: true } },
+        // Only ever populated for single-sale payments (walk-in or
+        // customer-linked) — null for multi-sale allocation payments.
+        sale: {
+          select: {
+            id: true,
+            documentNo: true,
+            paxName: true,
+            invoice: { select: { id: true, invoiceNo: true } },
+          },
+        },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
         ledgerEntries: true,
       },
-      orderBy: { transactionDate: "desc" },
+      orderBy: { transactionDate: sortDirection },
     });
 
-    res.status(200).json({ success: true, data: payments });
+    // A payment is "walk-in" when it's tied to exactly one sale (saleId
+    // set) but has no customer attached — as opposed to a real customer
+    // payment (customerId set) or a vendor payment (vendorId set).
+    const data = payments.map((p) => ({
+      ...p,
+      isWalkIn: !p.customerId && !p.vendorId && !!p.saleId,
+    }));
+
+    res.status(200).json({ success: true, data });
   } catch (err) {
     console.error("Error fetching payments:", err);
     res.status(500).json({ success: false, error: "Failed to fetch payments" });
@@ -552,6 +666,14 @@ router.get("/:id", async (req, res) => {
       include: {
         vendor: { select: { id: true, vendorName: true, category: true } },
         customer: { select: { id: true, customerName: true } },
+        sale: {
+          select: {
+            id: true,
+            documentNo: true,
+            paxName: true,
+            invoice: { select: { id: true, invoiceNo: true } },
+          },
+        },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
         ledgerEntries: true,
@@ -561,7 +683,13 @@ router.get("/:id", async (req, res) => {
     if (!payment)
       return res.status(404).json({ success: false, error: "Payment not found" });
 
-    res.status(200).json({ success: true, data: payment });
+    res.status(200).json({
+      success: true,
+      data: {
+        ...payment,
+        isWalkIn: !payment.customerId && !payment.vendorId && !!payment.saleId,
+      },
+    });
   } catch (err) {
     console.error("Error fetching payment:", err);
     res.status(500).json({ success: false, error: "Failed to fetch payment" });
@@ -581,11 +709,13 @@ router.put("/:id", async (req, res) => {
       transactionDate,
       method,
       bankId,
-      saleAllocations, // NEW: CUSTOMER only. JSON string or array:
-                        // [{ saleId, amount }] — the FULL new distribution
-                        // across invoices. Omit entirely to leave the
-                        // existing per-invoice allocation untouched (e.g.
-                        // when only editing remarks/date/method/bank).
+      saleAllocations, // Only applies to MULTI-SALE customer payments (JSON
+                        // string or array: [{ saleId, amount }]) — the FULL
+                        // new distribution across invoices. Omit entirely to
+                        // leave the existing per-invoice allocation untouched.
+                        // NOT applicable to single-sale payments (walk-in or
+                        // customer-linked via /api/Salepayment) — those just
+                        // use `amount` directly instead.
     } = req.body;
 
     // ---- Load existing payment ----
@@ -599,9 +729,69 @@ router.put("/:id", async (req, res) => {
 
     const partyType = existing.partyType;
 
-    // ---- Parse saleAllocations (CUSTOMER only) ----
+    // A payment is a "single-sale payment" (created via the /api/Salepayment
+    // route — walk-in OR customer-linked, doesn't matter which) whenever it
+    // has saleId set directly on the payment itself. A "multi-sale" customer
+    // payment (created via the saleAllocations route) never has saleId set
+    // on the payment — it's spread across per-sale LedgerEntry rows instead.
+    const isMultiSaleCustomer = partyType === "CUSTOMER" && !existing.saleId;
+    const isSingleSalePayment = partyType === "CUSTOMER" && !!existing.saleId;
+
+    if (isSingleSalePayment && saleAllocations !== undefined && saleAllocations !== null) {
+      return res.status(400).json({
+        success: false,
+        error: "saleAllocations does not apply to a single-sale payment — use amount instead",
+      });
+    }
+
+    // ---- Single-sale payment: also accept a single-element saleAllocations
+    //      array as an alternate way to specify `amount` for that SAME sale
+    //      (since the multi-sale POST route now also sets saleId when it's
+    //      given exactly one allocation — a frontend that always sends
+    //      saleAllocations for CUSTOMER payments shouldn't break here).
+    //      Re-pointing to a different sale, or splitting into multiple
+    //      sales via edit, is NOT supported — that would require
+    //      restructuring the payment entirely. ----
+    let singleSaleAllocationAmount = null;
+    if (isSingleSalePayment && saleAllocations !== undefined && saleAllocations !== null) {
+      let parsedAllocations;
+      if (typeof saleAllocations === "string") {
+        try {
+          parsedAllocations = JSON.parse(saleAllocations);
+        } catch {
+          return res.status(400).json({ success: false, error: "saleAllocations must be valid JSON" });
+        }
+      } else if (Array.isArray(saleAllocations)) {
+        parsedAllocations = saleAllocations;
+      }
+
+      if (!Array.isArray(parsedAllocations) || parsedAllocations.length !== 1) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "A single-sale payment only accepts a single saleAllocations entry (for its own sale) — use amount directly instead.",
+        });
+      }
+
+      const [alloc] = parsedAllocations;
+      if (!alloc.saleId || alloc.saleId !== existing.saleId) {
+        return res.status(400).json({
+          success: false,
+          error: "Cannot re-point a single-sale payment to a different sale via edit.",
+        });
+      }
+
+      const allocAmount = Number(alloc.amount);
+      if (isNaN(allocAmount) || allocAmount <= 0) {
+        return res.status(400).json({ success: false, error: `Invalid amount for sale ${alloc.saleId}` });
+      }
+
+      singleSaleAllocationAmount = allocAmount;
+    }
+
+    // ---- Parse saleAllocations (multi-sale CUSTOMER only) ----
     let allocations = null;
-    if (partyType === "CUSTOMER" && saleAllocations !== undefined && saleAllocations !== null) {
+    if (isMultiSaleCustomer && saleAllocations !== undefined && saleAllocations !== null) {
       if (typeof saleAllocations === "string") {
         try {
           allocations = JSON.parse(saleAllocations);
@@ -648,7 +838,7 @@ router.put("/:id", async (req, res) => {
     // ---- Determine newAmount ----
     let newAmount;
 
-    if (partyType === "CUSTOMER" && allocations) {
+    if (isMultiSaleCustomer && allocations) {
       const allocationTotal = allocations.reduce((sum, a) => sum + a.amount, 0);
 
       if (amount !== undefined && amount !== null && Number(amount) !== allocationTotal)
@@ -658,7 +848,7 @@ router.put("/:id", async (req, res) => {
         });
 
       newAmount = allocationTotal;
-    } else if (partyType === "CUSTOMER" && !allocations) {
+    } else if (isMultiSaleCustomer && !allocations) {
       if (amount !== undefined && amount !== null && Number(amount) !== existing.amount)
         return res.status(400).json({
           success: false,
@@ -666,6 +856,24 @@ router.put("/:id", async (req, res) => {
             "saleAllocations is required to change the amount of a customer payment linked to invoices",
         });
       newAmount = existing.amount;
+    } else if (isSingleSalePayment) {
+      if (singleSaleAllocationAmount !== null) {
+        if (amount !== undefined && amount !== null && Number(amount) !== singleSaleAllocationAmount)
+          return res.status(400).json({
+            success: false,
+            error: `amount (${Number(amount)}) must equal the saleAllocations amount (${singleSaleAllocationAmount})`,
+          });
+        newAmount = singleSaleAllocationAmount;
+      } else if (amount !== undefined && amount !== null) {
+        newAmount = Number(amount);
+        if (isNaN(newAmount) || newAmount <= 0)
+          return res.status(400).json({
+            success: false,
+            error: "amount must be a number greater than 0",
+          });
+      } else {
+        newAmount = existing.amount;
+      }
     } else {
       // VENDOR — unchanged behavior
       if (amount !== undefined && (typeof amount !== "number" || amount <= 0))
@@ -684,7 +892,11 @@ router.put("/:id", async (req, res) => {
 
     // ---- method / bankId consistency ----
     const newMethod = method ?? existing.method;
-    const newBankId = bankId !== undefined ? bankId : existing.bankId;
+
+    const newBankId =
+      newMethod === "BANK_TRANSFER"
+        ? (bankId !== undefined ? bankId : existing.bankId)
+        : null;
 
     if (newMethod === "BANK_TRANSFER" && !newBankId)
       return res.status(400).json({ success: false, error: "bankId is required when method is BANK_TRANSFER" });
@@ -695,9 +907,16 @@ router.put("/:id", async (req, res) => {
     const parsedDate = transactionDate ? new Date(transactionDate) : existing.transactionDate;
 
     // ---- Load party account ----
+    // - VENDOR: as before.
+    // - Multi-sale CUSTOMER: as before, via existing.customerId.
+    // - Single-sale payment: load the linked Sale itself (via existing.saleId)
+    //   to get its customer (if any), refund info, and current paid amount.
+    //   `partyAccount` stays null for a walk-in single-sale payment — there's
+    //   simply no customer ledger/balance to touch in that case.
     let partyAccount = null;
     let vendor = null;
     let customer = null;
+    let sale = null; // only populated for single-sale payments
 
     if (partyType === "VENDOR") {
       vendor = await prisma.vendor.findUnique({
@@ -705,12 +924,51 @@ router.put("/:id", async (req, res) => {
         include: { account: true },
       });
       partyAccount = vendor.account;
-    } else {
+    } else if (isMultiSaleCustomer) {
       customer = await prisma.customer.findUnique({
         where: { id: existing.customerId },
         include: { account: true },
       });
       partyAccount = customer.account;
+    } else if (isSingleSalePayment) {
+      sale = await prisma.sale.findUnique({
+        where: { id: existing.saleId },
+        include: {
+          invoice: { select: { invoiceNo: true } },
+          customer: { include: { account: true } },
+          refunds: { select: { netRefundToCustomer: true } },
+        },
+      });
+
+      if (!sale)
+        return res.status(404).json({ success: false, error: "Linked sale not found" });
+
+      if (sale.customerId && sale.customer) {
+        customer = sale.customer;
+        partyAccount = sale.customer.account;
+      }
+      // else: walk-in — partyAccount stays null, no customer leg at all
+    }
+
+    // ---- Single-sale payment: validate newAmount against the sale's
+    //      refund-adjusted remaining due, after reversing this payment's
+    //      OWN old contribution (so editing a payment's amount up or down
+    //      is validated against the correct baseline, not double-counting
+    //      what it already contributed). ----
+    let singleSaleCtx = null;
+    if (isSingleSalePayment) {
+      const refund = sale.refunds && sale.refunds.length > 0 ? sale.refunds[0] : null;
+      const netRefundToCustomer = refund ? Number(refund.netRefundToCustomer || 0) : 0;
+      const paidAmountAfterReversal = (sale.paidAmount || 0) - existing.amount;
+      const remainingDueAfterReversal = sale.sellPrice - paidAmountAfterReversal - netRefundToCustomer;
+
+      if (newAmount > remainingDueAfterReversal + 0.01)
+        return res.status(400).json({
+          success: false,
+          error: `Payment amount (${newAmount}) exceeds the sale's remaining due (${remainingDueAfterReversal.toFixed(2)})`,
+        });
+
+      singleSaleCtx = { netRefundToCustomer, paidAmountAfterReversal };
     }
 
     // ---- Load new bank if method is BANK_TRANSFER ----
@@ -748,7 +1006,8 @@ router.put("/:id", async (req, res) => {
 
     // ---- Find old cash account/entries (needed only to reverse the CASH leg) ----
     // Note: for CUSTOMER payments cash may be split across multiple entries
-    // (one per sale), so we sum debit-credit across all of them for reversal.
+    // (one per sale for multi-sale, or a single tagged entry for single-sale),
+    // so we sum debit-credit across all of them for reversal.
     let oldCashAccount = null;
     let oldCashDelta = 0;
     if (existing.method === "CASH" && existing.accountId) {
@@ -757,9 +1016,9 @@ router.put("/:id", async (req, res) => {
       oldCashDelta = oldCashEntries.reduce((sum, e) => sum + (e.debit - e.credit), 0);
     }
 
-    // ---- CUSTOMER: work out the per-sale reversal + reallocation plan ----
+    // ---- Multi-sale CUSTOMER: work out the per-sale reversal + reallocation plan ----
     const oldAllocationMap = new Map();
-    if (partyType === "CUSTOMER") {
+    if (isMultiSaleCustomer) {
       existing.ledgerEntries.forEach((e) => {
         // Only count the PARTY-side entries (i.e. against the customer's own
         // account), not the mirrored bank/cash-side entries, to avoid
@@ -774,11 +1033,18 @@ router.put("/:id", async (req, res) => {
       ...oldAllocationMap.keys(),
       ...(allocations ? allocations.map((a) => a.saleId) : []),
     ]);
+    let multiSaleFinalSaleId = null;
+    if (isMultiSaleCustomer) {
+      const finalSaleIds = allocations
+        ? [...new Set(allocations.map((a) => a.saleId))]
+        : [...oldAllocationMap.keys()];
+      multiSaleFinalSaleId = finalSaleIds.length === 1 ? finalSaleIds[0] : null;
+    }
 
     let salesById = new Map();
     let saleFinalUpdates = [];
 
-    if (partyType === "CUSTOMER" && unionSaleIds.size > 0) {
+    if (isMultiSaleCustomer && unionSaleIds.size > 0) {
       const saleList = await prisma.sale.findMany({
         where: { id: { in: [...unionSaleIds] } },
         include: { invoice: { select: { invoiceNo: true } } },
@@ -786,10 +1052,10 @@ router.put("/:id", async (req, res) => {
       salesById = new Map(saleList.map((s) => [s.id, s]));
 
       for (const saleId of unionSaleIds) {
-        const sale = salesById.get(saleId);
-        if (!sale)
+        const s = salesById.get(saleId);
+        if (!s)
           return res.status(404).json({ success: false, error: `Sale ${saleId} not found` });
-        if (sale.customerId !== existing.customerId)
+        if (s.customerId !== existing.customerId)
           return res.status(400).json({
             success: false,
             error: `Sale ${saleId} does not belong to this payment's customer`,
@@ -800,21 +1066,21 @@ router.put("/:id", async (req, res) => {
         const newAllocationMap = new Map(allocations.map((a) => [a.saleId, a.amount]));
 
         for (const saleId of unionSaleIds) {
-          const sale = salesById.get(saleId);
+          const s = salesById.get(saleId);
           const oldAmt = oldAllocationMap.get(saleId) || 0;
           const newAmt = newAllocationMap.get(saleId) || 0;
 
-          const working = sale.paidAmount - oldAmt + newAmt;
+          const working = s.paidAmount - oldAmt + newAmt;
 
-          if (working > sale.sellPrice + 0.01)
+          if (working > s.sellPrice + 0.01)
             return res.status(400).json({
               success: false,
-              error: `Allocation (${newAmt}) for sale ${saleId} would exceed its sell price (remaining after reversing this payment's old contribution: ${(sale.sellPrice - (sale.paidAmount - oldAmt)).toFixed(2)})`,
+              error: `Allocation (${newAmt}) for sale ${saleId} would exceed its sell price (remaining after reversing this payment's old contribution: ${(s.sellPrice - (s.paidAmount - oldAmt)).toFixed(2)})`,
             });
 
           const clamped = Math.max(0, working);
           const newStatus =
-            clamped <= 0 ? "DUE" : clamped >= sale.sellPrice ? "PAID" : "PARTIAL";
+            clamped <= 0 ? "DUE" : clamped >= s.sellPrice ? "PAID" : "PARTIAL";
 
           saleFinalUpdates.push({ saleId, newPaidAmount: clamped, newStatus });
         }
@@ -839,7 +1105,19 @@ router.put("/:id", async (req, res) => {
     } else if (partyType === "VENDOR" && vendor.category === "CREDIT") {
       partyLegDebit = newAmount;
       partyBalanceDelta = newAmount - existing.amount;
-    } else if (partyType === "CUSTOMER") {
+    } else if (isMultiSaleCustomer) {
+      const restoredBalance = partyAccount.balance + existing.amount;
+      if (newAmount > restoredBalance)
+        return res.status(400).json({
+          success: false,
+          error: `Payment amount (${newAmount}) exceeds customer's outstanding balance (${restoredBalance}).`,
+        });
+
+      partyLegCredit = newAmount;
+      partyBalanceDelta = -(newAmount - existing.amount);
+    } else if (isSingleSalePayment && partyAccount) {
+      // Single-sale payment WITH a customer attached — same direction as
+      // the multi-sale case, just for exactly one sale.
       const restoredBalance = partyAccount.balance + existing.amount;
       if (newAmount > restoredBalance)
         return res.status(400).json({
@@ -850,6 +1128,8 @@ router.put("/:id", async (req, res) => {
       partyLegCredit = newAmount;
       partyBalanceDelta = -(newAmount - existing.amount);
     }
+    // else: isSingleSalePayment && !partyAccount (walk-in) — no party leg at
+    // all, all three values correctly stay at their 0 defaults.
 
     // ---- Bank leg ----
     let bankLegDebit = 0;
@@ -876,7 +1156,7 @@ router.put("/:id", async (req, res) => {
 
     // ---- Cash leg ----
     // VENDOR + CASH -> debit cash (money out), single combined entry
-    // CUSTOMER + CASH -> credit cash (money in), per-sale entries
+    // CUSTOMER (any flavor) + CASH -> credit cash (money in)
     let cashLegDebit = 0;
     let cashLegCredit = 0;
 
@@ -939,7 +1219,11 @@ router.put("/:id", async (req, res) => {
       // 2. Delete old ledger entries
       await tx.ledgerEntry.deleteMany({ where: { vendorCustomerPaymentId: id } });
 
-      // 3. Update the payment record
+      // 3. Update the payment record. `saleId` is normally fixed at creation
+      //    and never touched here — EXCEPT for the multi-sale CUSTOMER
+      //    branch, where it may need to be set (or reset to null) if the
+      //    allocation collapsed to/expanded from exactly one sale this edit
+      //    (see multiSaleFinalSaleId above).
       const updated = await tx.vendorCustomerPayment.update({
         where: { id },
         data: {
@@ -950,14 +1234,15 @@ router.put("/:id", async (req, res) => {
           attachmentUrl: attachmentUrl ?? existing.attachmentUrl,
           remarks: remarks ?? existing.remarks,
           transactionDate: parsedDate,
+          ...(isMultiSaleCustomer ? { saleId: multiSaleFinalSaleId } : {}),
         },
       });
 
       // 4. Party leg(s) + sale status updates
-      if (partyType === "CUSTOMER" && allocations) {
+      if (isMultiSaleCustomer && allocations) {
         for (const a of allocations) {
-          const sale = salesById.get(a.saleId);
-          const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
+          const s = salesById.get(a.saleId);
+          const invoiceNo = s.invoice?.invoiceNo ?? "N/A";
           const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${a.saleId})${
             (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
           }`;
@@ -1000,11 +1285,11 @@ router.put("/:id", async (req, res) => {
             data: { paidAmount: u.newPaidAmount, paymentStatus: u.newStatus },
           });
         }
-      } else if (partyType === "CUSTOMER" && !allocations) {
+      } else if (isMultiSaleCustomer && !allocations) {
         // No change to the split — recreate the same per-sale entries
         for (const [saleId, oldAmt] of oldAllocationMap.entries()) {
-          const sale = salesById.get(saleId);
-          const invoiceNo = sale?.invoice?.invoiceNo ?? "N/A";
+          const s = salesById.get(saleId);
+          const invoiceNo = s?.invoice?.invoiceNo ?? "N/A";
           const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${saleId})${
             (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
           }`;
@@ -1040,6 +1325,76 @@ router.put("/:id", async (req, res) => {
             });
           }
         }
+      } else if (isSingleSalePayment) {
+        // Single-sale payment (walk-in OR customer-linked) — exactly one
+        // sale, so both the customer leg (if any) and the cash/bank leg
+        // get created here directly, each tagged with saleId. This means
+        // the GENERIC bank-ledger-entry creation further below (originally
+        // shared with VENDOR) must be SKIPPED for this branch — otherwise
+        // the bank leg would be booked twice for the same payment.
+        const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
+        const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${sale.id})${
+          (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+        }`;
+
+        if (partyAccount) {
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: partyAccount.id,
+              entryType: "PAYMENT",
+              debit: 0,
+              credit: newAmount,
+              saleId: sale.id,
+              vendorCustomerPaymentId: id,
+              transactionDate: parsedDate,
+              remarks: entryRemarks,
+            },
+          });
+        }
+
+        if (newMethod === "CASH") {
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: cash.id,
+              entryType: "PAYMENT",
+              debit: 0,
+              credit: newAmount,
+              saleId: sale.id,
+              vendorCustomerPaymentId: id,
+              transactionDate: parsedDate,
+              remarks: `Cash received against Invoice ${invoiceNo} (Sale ${sale.id})${
+                (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+              }`,
+            },
+          });
+        } else {
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: newBank.account.id,
+              entryType: "PAYMENT",
+              debit: 0,
+              credit: newAmount,
+              saleId: sale.id,
+              vendorCustomerPaymentId: id,
+              transactionDate: parsedDate,
+              remarks: `Bank transfer received against Invoice ${invoiceNo} (Sale ${sale.id})${
+                (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+              }`,
+            },
+          });
+        }
+
+        // ---- Update the sale's paid amount + status ----
+        const { netRefundToCustomer, paidAmountAfterReversal } = singleSaleCtx;
+        const clamped = Math.max(0, paidAmountAfterReversal + newAmount);
+        const fullyPaidThreshold = sale.sellPrice - netRefundToCustomer;
+        const newSaleStatus =
+          clamped <= 0 ? "DUE" : clamped >= fullyPaidThreshold ? "PAID" : "PARTIAL";
+
+        await tx.sale.update({
+          where: { id: sale.id },
+          data: { paidAmount: clamped, paymentStatus: newSaleStatus },
+        });
       } else {
         // VENDOR — single combined leg, unchanged behavior
         await tx.ledgerEntry.create({
@@ -1071,12 +1426,18 @@ router.put("/:id", async (req, res) => {
       }
 
       // 5. Apply party balance delta (net shift from old amount -> new amount)
-      await tx.account.update({
-        where: { id: partyAccount.id },
-        data: { balance: { increment: partyBalanceDelta } },
-      });
+      //    Guarded — a walk-in single-sale payment has no partyAccount at all.
+      if (partyAccount) {
+        await tx.account.update({
+          where: { id: partyAccount.id },
+          data: { balance: { increment: partyBalanceDelta } },
+        });
+      }
 
-      // 6. Apply new bank balance + ledger entry
+      // 6. Apply new bank balance (+ generic ledger entry for VENDOR/multi-
+      //    sale CUSTOMER only — single-sale payments already created their
+      //    own saleId-tagged bank entry above in step 4, so creating another
+      //    one here would double-book the same money).
       if (newMethod === "BANK_TRANSFER") {
         const bankBalanceDelta = partyType === "VENDOR" ? -newAmount : newAmount;
         await tx.account.update({
@@ -1084,20 +1445,23 @@ router.put("/:id", async (req, res) => {
           data: { balance: { increment: bankBalanceDelta } },
         });
 
-        await tx.ledgerEntry.create({
-          data: {
-            accountId: newBank.account.id,
-            entryType: "PAYMENT",
-            debit: bankLegDebit,
-            credit: bankLegCredit,
-            vendorCustomerPaymentId: id,
-            transactionDate: parsedDate,
-            remarks: remarks ?? existing.remarks ?? null,
-          },
-        });
+        if (!isSingleSalePayment) {
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: newBank.account.id,
+              entryType: "PAYMENT",
+              debit: bankLegDebit,
+              credit: bankLegCredit,
+              vendorCustomerPaymentId: id,
+              transactionDate: parsedDate,
+              remarks: remarks ?? existing.remarks ?? null,
+            },
+          });
+        }
       }
 
-      // 7. Apply new cash balance (only for CASH)
+      // 7. Apply new cash balance (only for CASH) — balance only, no entry
+      //    here; the entry was already created per-branch above in step 4.
       if (newMethod === "CASH") {
         const cashBalanceDelta = partyType === "VENDOR" ? -newAmount : newAmount;
         await tx.account.update({
@@ -1114,19 +1478,31 @@ router.put("/:id", async (req, res) => {
       include: {
         vendor: { select: { id: true, vendorName: true, category: true } },
         customer: { select: { id: true, customerName: true } },
+        sale: {
+          select: {
+            id: true,
+            documentNo: true,
+            invoice: { select: { id: true, invoiceNo: true } },
+          },
+        },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
         ledgerEntries: true,
       },
     });
 
-    res.status(200).json({ success: true, data: fullPayment });
+    res.status(200).json({
+      success: true,
+      data: {
+        ...fullPayment,
+        isWalkIn: !fullPayment.customerId && !fullPayment.vendorId && !!fullPayment.saleId,
+      },
+    });
   } catch (err) {
     console.error("Error updating payment:", err);
     res.status(500).json({ success: false, error: "Failed to update payment" });
   }
 });
-
 // ---- DELETE ----
 router.delete("/:id", async (req, res) => {
   try {
@@ -1140,7 +1516,6 @@ router.delete("/:id", async (req, res) => {
     if (!existing)
       return res.status(404).json({ success: false, error: "Payment not found" });
 
-    // ---- Load party account (+ vendor category, needed to know reversal direction) ----
     let partyAccount = null;
     let vendorCategory = null;
 
@@ -1151,13 +1526,14 @@ router.delete("/:id", async (req, res) => {
       });
       partyAccount = vendor.account;
       vendorCategory = vendor.category; // "DEBIT" | "CREDIT"
-    } else {
+    } else if (existing.customerId) {
       const customer = await prisma.customer.findUnique({
         where: { id: existing.customerId },
         include: { account: true },
       });
-      partyAccount = customer.account;
+      partyAccount = customer?.account ?? null;
     }
+    // else: partyType === "CUSTOMER" && !customerId (walk-in) — partyAccount stays null
 
     let bankAccount = null;
     if (existing.method === "BANK_TRANSFER" && existing.bankId) {
@@ -1173,14 +1549,6 @@ router.delete("/:id", async (req, res) => {
     if (existing.method === "CASH" && existing.accountId) {
       cashAccount = await prisma.account.findUnique({ where: { id: existing.accountId } });
     }
-
-    // ---- Compute the correct reversal for the party leg ----
-    // This must mirror the ORIGINAL balance effect (from the POST route), negated.
-    // We can't safely derive this from (debit - credit) on the ledger entry, because
-    // that convention only lines up as the true negative of the balance effect for
-    // the bank/cash leg — not for the party leg (CUSTOMER / VENDOR-CREDIT have the same
-    // sign as debit-credit, so using it directly would double the change instead of
-    // undoing it).
     let partyReverseDelta = 0;
     if (existing.partyType === "VENDOR" && vendorCategory === "DEBIT") {
       // Original effect was -amount (payment reduced balance owed). Reverse = +amount.
@@ -1188,29 +1556,29 @@ router.delete("/:id", async (req, res) => {
     } else if (existing.partyType === "VENDOR" && vendorCategory === "CREDIT") {
       // Original effect was +amount. Reverse = -amount.
       partyReverseDelta = -existing.amount;
-    } else if (existing.partyType === "CUSTOMER") {
-      // Original effect was -amount. Reverse = +amount.
+    } else if (existing.partyType === "CUSTOMER" && partyAccount) {
+
       partyReverseDelta = existing.amount;
     }
-
-    // ---- CUSTOMER: work out per-sale reversal for paidAmount / paymentStatus ----
-    // Only count the PARTY-side entries (against the customer's own account),
-    // not the mirrored bank/cash-side entries, to avoid double-counting.
     let saleReversals = []; // [{ saleId, amountToReverse }]
     let salesById = new Map();
 
     if (existing.partyType === "CUSTOMER") {
-      const perSaleMap = new Map();
-      existing.ledgerEntries.forEach((e) => {
-        if (e.saleId && e.accountId === partyAccount.id) {
-          perSaleMap.set(e.saleId, (perSaleMap.get(e.saleId) || 0) + e.credit);
-        }
-      });
+      if (existing.saleId) {
+        saleReversals = [{ saleId: existing.saleId, amountToReverse: existing.amount }];
+      } else if (partyAccount) {
+        const perSaleMap = new Map();
+        existing.ledgerEntries.forEach((e) => {
+          if (e.saleId && e.accountId === partyAccount.id) {
+            perSaleMap.set(e.saleId, (perSaleMap.get(e.saleId) || 0) + e.credit);
+          }
+        });
 
-      saleReversals = [...perSaleMap.entries()].map(([saleId, amountToReverse]) => ({
-        saleId,
-        amountToReverse,
-      }));
+        saleReversals = [...perSaleMap.entries()].map(([saleId, amountToReverse]) => ({
+          saleId,
+          amountToReverse,
+        }));
+      }
 
       if (saleReversals.length > 0) {
         const saleIds = saleReversals.map((s) => s.saleId);
@@ -1220,11 +1588,12 @@ router.delete("/:id", async (req, res) => {
     }
 
     await prisma.$transaction(async (tx) => {
-      // Reverse party account balance
-      await tx.account.update({
-        where: { id: partyAccount.id },
-        data: { balance: { increment: partyReverseDelta } },
-      });
+      if (partyAccount) {
+        await tx.account.update({
+          where: { id: partyAccount.id },
+          data: { balance: { increment: partyReverseDelta } },
+        });
+      }
 
       // Reverse bank account balance (debit - credit is the correct reversal here)
       if (bankAccount) {
@@ -1246,8 +1615,6 @@ router.delete("/:id", async (req, res) => {
           data: { balance: { increment: cashReverseDelta } },
         });
       }
-
-      // ---- Reverse each affected sale's paidAmount + paymentStatus ----
       for (const { saleId, amountToReverse } of saleReversals) {
         const sale = salesById.get(saleId);
         if (!sale) continue;
@@ -1277,5 +1644,4 @@ router.delete("/:id", async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to delete payment" });
   }
 });
-
 export default router;
