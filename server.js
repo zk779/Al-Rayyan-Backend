@@ -22,6 +22,7 @@ import bankRoutes from "./routes/bankRoutes.js";
 import vendorCustomerPaymentRoutes from "./routes/Vendorcustomerpayment.js";
 import expenseRoutes from "./routes/expenseRoutes.js";
 import salePaymentRoutes from "./routes/SalePayment.js";
+import ReportRoutes from "./routes/reports.js";
 
 dotenv.config();
 
@@ -87,7 +88,7 @@ app.use("/api/banks", bankRoutes);
 app.use("/api/payments/vendor-customer", vendorCustomerPaymentRoutes);
 app.use("/api/salePayment", salePaymentRoutes);
 app.use("/api/expenses", expenseRoutes);
-
+app.use("/api/reports", ReportRoutes);
 // Root Route
 app.get("/", (req, res) => {
 	res.send(
