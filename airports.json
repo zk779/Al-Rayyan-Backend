@@ -4769,6 +4769,51 @@
 			"timeZoneDesc": "Asia/Karachi"
 		}
 	},
+	"HESG": {
+		"airportCodeIata": "HMB",
+		"airportName": "Sohag International Airport",
+		"cityName": "Sohag",
+		"cityType": "International",
+		"countryCode": "EG",
+		"region": "Egypt",
+		"meta": {
+			"icaoCode": "HESN",
+			"iataCode": "HMB",
+			"latitudeDegreeNum": 26.335800,
+			"longitudeDegreeNum": 31.737200,
+			"timeZoneDesc": "Africa/Cairo"
+		}
+	},
+	"OMSJ": {
+		"airportCodeIata": "SHJ",
+		"airportName": "Sharjah International Airport",
+		"cityName": "Sharjah",
+		"cityType": "International",
+		"countryCode": "AE",
+		"region": "United Arab Emirates",
+		"meta": {
+			"icaoCode": "OMSJ",
+			"iataCode": "SHJ",
+			"latitudeDegreeNum": 25.328600,
+			"longitudeDegreeNum": 55.517200,
+			"timeZoneDesc": "Asia/Dubai"
+		}
+	},
+	"HAMK": {
+		"airportCodeIata": "MQX",
+		"airportName": "Alula Aba Nega Airport",
+		"cityName": "Mekelle",
+		"cityType": "Domestic",
+		"countryCode": "ET",
+		"region": "Ethiopia",
+		"meta": {
+			"icaoCode": "HAMK",
+			"iataCode": "MQX",
+			"latitudeDegreeNum": 13.468300,
+			"longitudeDegreeNum": 39.533800,
+			"timeZoneDesc": "Africa/Addis_Ababa"
+		}
+	},
 	"SCAR": {
 		"airportCodeIata": "ARI",
 		"airportName": "Chacalluta Intl Arpt",
@@ -11534,7 +11579,7 @@
 			"timeZoneDesc": "Europe/Moscow"
 		}
 	},
-	"OPFA":{
+	"OPFA": {
 		"airportCodeIata": "LYP",
 		"airportName": "Faisalabad Intl Arpt",
 		"cityName": "Faisalabad",
