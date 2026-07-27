@@ -401,6 +401,37 @@ router.get("/search", authenticate, async (req, res) => {
 });
 
 
+/* ======================= CHECK DUPLICATE DOCUMENT NO ======================= */
+router.get("/check-document", authenticate, async (req, res) => {
+	try {
+		const { documentNo, excludeSaleId } = req.query;
+
+		if (!documentNo || !documentNo.trim()) {
+			return res.status(400).json({ success: false, error: "documentNo is required" });
+		}
+
+		const existing = await prisma.sale.findFirst({
+			where: {
+				documentNo: { equals: documentNo.trim(), mode: "insensitive" },
+				...(excludeSaleId ? { id: { not: excludeSaleId } } : {}),
+			},
+			select: { id: true },
+		});
+
+		const exists = !!existing;
+
+		res.json({
+			success: true,
+			exists,
+			message: exists ? "Document already exists" : "Document does not exist",
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({ success: false, error: "Failed to check document number" });
+	}
+});
+
+
 /* ======================= GET CUSTOMER SALES (DUE / PARTIAL) ======================= */
 router.get("/customerSales", authenticate, async (req, res) => {
 	try {
