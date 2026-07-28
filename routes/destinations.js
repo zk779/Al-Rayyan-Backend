@@ -21,9 +21,7 @@ router.get("/search", (req, res) => {
 
 	const results = AIRPORTS.filter((a) =>
 		a.iata?.toLowerCase() === query || // exact IATA
-		a.iata?.toLowerCase().startsWith(query) || // partial IATA
-		a.city?.toLowerCase().includes(query) || // city match
-		a.name?.toLowerCase().includes(query) // airport name
+		a.iata?.toLowerCase().startsWith(query)
 	).slice(0, Number(limit));
 
 	res.json({
