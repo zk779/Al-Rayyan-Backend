@@ -2,6 +2,7 @@ import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import { generateNextSalesInvoiceNo } from "../utils/invoiceNo.js";
+import { localDayRangeToUtc } from "../utils/dateRange.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -32,7 +33,7 @@ async function authenticate(req, res, next) {
 /* ======================= GET ALL INVOICES ======================= */
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search, dateFrom, dateTo, order, createdById } = req.query;
+		const { search, dateFrom, dateTo, order, createdById, tz } = req.query;
 
 		// Each condition below is pushed into `filters` and combined with AND,
 		// so search + date range + createdBy can all be applied together.
@@ -64,22 +65,21 @@ router.get("/", authenticate, async (req, res) => {
 		}
 
 		// Date range filter on saleDate — either bound is optional.
-		// dateTo is treated as inclusive of the entire day.
+		// dateFrom/dateTo are local calendar dates (e.g. "2026-07-27") picked
+		// in the requesting client's own timezone, passed in via `tz` (IANA
+		// name, e.g. "Asia/Riyadh"). We convert each to the UTC instant range
+		// covering that local day rather than naively parsing as UTC midnight
+		// — see localDayRangeToUtc. No single timezone is assumed here since
+		// this runs across multiple regions; it falls back to UTC if `tz` is
+		// missing or invalid.
 		if (dateFrom || dateTo) {
 			const saleDateFilter = {};
 
-			if (dateFrom) {
-				const from = new Date(dateFrom);
-				if (!isNaN(from.getTime())) saleDateFilter.gte = from;
-			}
+			const fromRange = localDayRangeToUtc(dateFrom, tz);
+			if (fromRange) saleDateFilter.gte = fromRange.start;
 
-			if (dateTo) {
-				const to = new Date(dateTo);
-				if (!isNaN(to.getTime())) {
-					to.setHours(23, 59, 59, 999);
-					saleDateFilter.lte = to;
-				}
-			}
+			const toRange = localDayRangeToUtc(dateTo, tz);
+			if (toRange) saleDateFilter.lte = toRange.end;
 
 			if (Object.keys(saleDateFilter).length > 0) {
 				filters.push({ saleDate: saleDateFilter });
