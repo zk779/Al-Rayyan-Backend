@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "al-rayyan-travels-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "D:\\GitHub\\Al-Rayyan-Travels"],
+      "port": 5173,
+      "autoPort": true
+    }
+  ]
+}

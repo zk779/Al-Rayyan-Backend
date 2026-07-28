@@ -30,237 +30,223 @@ async function authenticate(req, res, next) {
 /* ------------------------------------------------------------------------ */
 /* ✅ CREATE SALES (Invoice + Multiple Sales + Vendor Ledger Entries) */
 /* ------------------------------------------------------------------------ */
-/* ======================= GET ALL INVOICES ======================= */
+/* ======================= GET SALES (PAGINATED) =======================
+   Paginates at the Sale level (one row per table row on the frontend),
+   not per-invoice, so `limit` always matches rows-per-page exactly. */
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search, dateFrom, dateTo, order, createdById, tz } = req.query;
+		const { search, dateFrom, dateTo, order, createdById, tz, page = 1, limit = 20 } = req.query;
 
-		// Each condition below is pushed into `filters` and combined with AND,
-		// so search + date range + createdBy can all be applied together.
 		const filters = [];
 
-		// Search across invoiceNo (on the invoice itself) OR documentNo/remarks
-		// (on any of its sales).
+		// Search across invoiceNo (on the parent invoice) OR documentNo/remarks
 		if (search) {
 			filters.push({
 				OR: [
-					{ invoiceNo: { contains: search, mode: "insensitive" } },
-					{
-						sales: {
-							some: {
-								OR: [
-									{ documentNo: { contains: search, mode: "insensitive" } },
-									{ remarks: { contains: search, mode: "insensitive" } }
-								]
-							}
-						}
-					}
+					{ invoice: { invoiceNo: { contains: search, mode: "insensitive" } } },
+					{ documentNo: { contains: search, mode: "insensitive" } },
+					{ remarks: { contains: search, mode: "insensitive" } }
 				]
 			});
 		}
 
-		// Filter by who created the invoice
-		if (createdById) {
-			filters.push({ userId: createdById });
-		}
+		if (createdById) filters.push({ invoice: { userId: createdById } });
 
-		// Date range filter on saleDate — either bound is optional.
-		// dateFrom/dateTo are local calendar dates (e.g. "2026-07-27") picked
-		// in the requesting client's own timezone, passed in via `tz` (IANA
-		// name, e.g. "Asia/Riyadh"). We convert each to the UTC instant range
-		// covering that local day rather than naively parsing as UTC midnight
-		// — see localDayRangeToUtc. No single timezone is assumed here since
-		// this runs across multiple regions; it falls back to UTC if `tz` is
-		// missing or invalid.
+		// dateFrom/dateTo are local calendar dates (e.g. "2026-07-27") picked in
+		// the requesting client's own timezone, passed via `tz` (IANA name).
+		// Converted to the UTC instant range for that local day — see
+		// localDayRangeToUtc. No single timezone is assumed (multi-region).
 		if (dateFrom || dateTo) {
 			const saleDateFilter = {};
-
 			const fromRange = localDayRangeToUtc(dateFrom, tz);
 			if (fromRange) saleDateFilter.gte = fromRange.start;
-
 			const toRange = localDayRangeToUtc(dateTo, tz);
 			if (toRange) saleDateFilter.lte = toRange.end;
-
 			if (Object.keys(saleDateFilter).length > 0) {
-				filters.push({ saleDate: saleDateFilter });
+				filters.push({ invoice: { saleDate: saleDateFilter } });
 			}
 		}
 
-		const whereClause = filters.length > 0 ? { AND: filters } : {};
-
-		// Sort direction — defaults to newest first, same as before.
+		const where = filters.length > 0 ? { AND: filters } : {};
 		const sortDirection = String(order || "").toLowerCase() === "asc" ? "asc" : "desc";
+		const take = Math.min(Math.max(Number(limit) || 20, 1), 200);
+		const skip = (Math.max(Number(page) || 1, 1) - 1) * take;
 
-		const invoices = await prisma.salesInvoice.findMany({
-			where: whereClause,
-			// Sort invoices by saleDate (full date+time), not createdAt — the
-			// most recently DATED invoice comes first (or last, if ascending),
-			// not just the most recently inserted row.
-			orderBy: { saleDate: sortDirection },
-			include: {
-				user: { select: { id: true, fullName: true, email: true } },
-				sales: {
-					// Within each invoice, its sales are ordered by their own
-					// createdAt in the SAME direction as the invoice sort — so
-					// if an invoice has 5 sales and we're sorting newest-first,
-					// that invoice's most recently created sale appears first
-					// among its own sales too.
-					orderBy: { createdAt: sortDirection },
-					select: {
-						id: true,
-						netPrice: true,
-						sellPrice: true,
-						profit: true,
-						status: true,
-						documentNo: true,
-						paymentType: true,
-						paymentStatus: true,
-						paidAmount: true,
-						customerId: true,
-						remarks: true,
-						pnr: true,
-						paxName: true,
-						vendor: {
-							select: {
-								vendorName: true,
-								category: true,
-								account: { select: { balance: true } }
-							}
-						},
-						airline: { select: { airlineCode: true, airlineName: true } },
-						customer: {
-							select: {
-								customerName: true,
-								phone: true,
-								account: { select: { balance: true } }
-							}
-						},
-						// Cash account (populated when paymentType = CASH)
-						account: { select: { balance: true } },
-						// Bank account (populated when paymentType = BANK_TRANSFER)
-						bank: {
-							select: {
-								bankName: true,
-								account: { select: { balance: true } }
-							}
-						},
-						// Payment legs for PARTIAL sales — breakdown of how it was split
-						payments: {
-							select: {
-								id: true,
-								method: true,
-								amount: true,
-								remarks: true,
-								paymentDate: true,
-								bank: { select: { bankName: true } },
-								customer: { select: { customerName: true } },
-								account: { select: { balance: true } }
-							}
-						},
-						// Refund created FROM this sale (original sale side)
-						refunds: {
-							select: {
-								id: true,
-								status: true,
-								refundDate: true,
-								netRefundToCustomer: true,
-								vendorRefundAmount: true,
-								refundFee: true,
-								cancellationCharges: true,
-								refundReason: true,
-								remarks: true,
-							}
-						},
-						// Refund that CREATED this sale (negative mirror sale side)
-						refundRecord: {
-							select: {
-								id: true,
-								status: true,
-								refundDate: true,
-								netRefundToCustomer: true,
-								vendorRefundAmount: true,
-								refundFee: true,
-								cancellationCharges: true,
-								refundReason: true,
-								remarks: true,
-							}
+		const [sales, total, summary] = await prisma.$transaction([
+			prisma.sale.findMany({
+				where,
+				skip,
+				take,
+				orderBy: { invoice: { saleDate: sortDirection } },
+				select: {
+					id: true,
+					netPrice: true,
+					sellPrice: true,
+					profit: true,
+					status: true,
+					documentNo: true,
+					paymentType: true,
+					paymentStatus: true,
+					paidAmount: true,
+					customerId: true,
+					remarks: true,
+					pnr: true,
+					paxName: true,
+					invoice: {
+						select: {
+							id: true,
+							invoiceNo: true,
+							saleDate: true,
+							createdAt: true,
+							user: { select: { id: true, fullName: true, email: true } }
+						}
+					},
+					vendor: {
+						select: {
+							vendorName: true,
+							category: true,
+							account: { select: { balance: true } }
+						}
+					},
+					airline: { select: { airlineCode: true, airlineName: true } },
+					customer: {
+						select: {
+							customerName: true,
+							phone: true,
+							account: { select: { balance: true } }
+						}
+					},
+					// Cash account (populated when paymentType = CASH)
+					account: { select: { balance: true } },
+					// Bank account (populated when paymentType = BANK_TRANSFER)
+					bank: {
+						select: {
+							bankName: true,
+							account: { select: { balance: true } }
+						}
+					},
+					// Payment legs for PARTIAL sales — breakdown of how it was split
+					payments: {
+						select: {
+							id: true,
+							method: true,
+							amount: true,
+							remarks: true,
+							paymentDate: true,
+							bank: { select: { bankName: true } },
+							customer: { select: { customerName: true } },
+							account: { select: { balance: true } }
+						}
+					},
+					// Refund created FROM this sale (original sale side)
+					refunds: {
+						select: {
+							id: true,
+							status: true,
+							refundDate: true,
+							netRefundToCustomer: true,
+							vendorRefundAmount: true,
+							refundFee: true,
+							cancellationCharges: true,
+							refundReason: true,
+							remarks: true,
+						}
+					},
+					// Refund that CREATED this sale (negative mirror sale side)
+					refundRecord: {
+						select: {
+							id: true,
+							status: true,
+							refundDate: true,
+							netRefundToCustomer: true,
+							vendorRefundAmount: true,
+							refundFee: true,
+							cancellationCharges: true,
+							refundReason: true,
+							remarks: true,
 						}
 					}
 				}
-			}
+			}),
+			prisma.sale.count({ where }),
+			// Grand totals across the WHOLE filtered set, not just this page.
+			prisma.sale.aggregate({ where, _sum: { netPrice: true, sellPrice: true, profit: true } })
+		]);
+
+		const data = sales.map(s => {
+			const sellPrice = Number(s.sellPrice || 0);
+			const paidAmount = Number(s.paidAmount || 0);
+			const dueAmount = Math.max(sellPrice - paidAmount, 0);
+
+			// Original sale (has its own refunds[0]) OR negative mirror
+			// sale (has refundRecord instead) — whichever is present.
+			const refundDetails =
+				(s.refunds && s.refunds.length > 0 ? s.refunds[0] : null) ||
+				s.refundRecord ||
+				null;
+
+			return {
+				id: s.id,
+				invoiceId: s.invoice?.id || null,
+				invoiceNo: s.invoice?.invoiceNo || null,
+				saleDate: s.invoice?.saleDate || null,
+				createdAt: s.invoice?.createdAt || null,
+				createdById: s.invoice?.user?.id || null,
+				createdByName: s.invoice?.user?.fullName || null,
+				createdByEmail: s.invoice?.user?.email || null,
+				documentNo: s.documentNo,
+				pnr: s.pnr,
+				paxName: s.paxName,
+				vendorName: s.vendor?.vendorName || null,
+				vendorCategory: s.vendor?.category || null,
+				vendorBalance: s.vendor?.account?.balance ?? null,
+				airlineCode: s.airline?.airlineCode || null,
+				airlineName: s.airline?.airlineName || null,
+				paymentType: s.paymentType,
+				paymentStatus: s.paymentStatus,
+				// Money breakdown
+				sellPrice,
+				paidAmount,
+				dueAmount,
+				customerId: s.customerId || null,
+				customerName: s.customer?.customerName || null,
+				customerPhone: s.customer?.phone || null,
+				customerBalance: s.customer?.account?.balance ?? null,
+				// Cash / bank account context (whichever applies)
+				cashAccountBalance: s.account?.balance ?? null,
+				bankName: s.bank?.bankName || null,
+				bankAccountBalance: s.bank?.account?.balance ?? null,
+				// Split payment breakdown, if PARTIAL
+				paymentLegs: (s.payments || []).map(p => ({
+					id: p.id,
+					method: p.method,
+					amount: p.amount,
+					remarks: p.remarks,
+					paymentDate: p.paymentDate,
+					bankName: p.bank?.bankName || null,
+					customerName: p.customer?.customerName || null,
+					cashAccountBalance: p.account?.balance ?? null
+				})),
+				netPrice: s.netPrice,
+				profit: s.profit,
+				remarks: s.remarks,
+				status: s.status,
+				// Works for both the original sale (via refunds[]) and the
+				// negative mirror sale (via refundRecord) — whichever applies.
+				refund: refundDetails
+			};
 		});
 
-		const data = invoices.map(inv => ({
-			id: inv.id,
-			invoiceNo: inv.invoiceNo,
-			saleDate: inv.saleDate,
-			createdById: inv.user?.id || null,
-			createdByName: inv.user?.fullName || null,
-			createdByEmail: inv.user?.email || null,
-			totalNet: inv.totalNet,
-			totalSell: inv.totalSell,
-			totalProfit: inv.totalProfit,
-			salesCount: inv.sales.length,
-			sales: inv.sales.map(s => {
-				const sellPrice = Number(s.sellPrice || 0);
-				const paidAmount = Number(s.paidAmount || 0);
-				const dueAmount = Math.max(sellPrice - paidAmount, 0);
-
-				// Original sale (has its own refunds[0]) OR negative mirror
-				// sale (has refundRecord instead) — whichever is present.
-				const refundDetails =
-					(s.refunds && s.refunds.length > 0 ? s.refunds[0] : null) ||
-					s.refundRecord ||
-					null;
-
-				return {
-					id: s.id,
-					documentNo: s.documentNo,
-					pnr: s.pnr,
-					paxName: s.paxName,
-					vendorName: s.vendor?.vendorName || null,
-					vendorCategory: s.vendor?.category || null,
-					vendorBalance: s.vendor?.account?.balance ?? null,
-					airlineCode: s.airline?.airlineCode || null,
-					airlineName: s.airline?.airlineName || null,
-					paymentType: s.paymentType,
-					paymentStatus: s.paymentStatus,
-					// Money breakdown
-					sellPrice,
-					paidAmount,
-					dueAmount,
-					customerId: s.customerId || null,
-					customerName: s.customer?.customerName || null,
-					customerPhone: s.customer?.phone || null,
-					customerBalance: s.customer?.account?.balance ?? null,
-					// Cash / bank account context (whichever applies)
-					cashAccountBalance: s.account?.balance ?? null,
-					bankName: s.bank?.bankName || null,
-					bankAccountBalance: s.bank?.account?.balance ?? null,
-					// Split payment breakdown, if PARTIAL
-					paymentLegs: (s.payments || []).map(p => ({
-						id: p.id,
-						method: p.method,
-						amount: p.amount,
-						remarks: p.remarks,
-						paymentDate: p.paymentDate,
-						bankName: p.bank?.bankName || null,
-						customerName: p.customer?.customerName || null,
-						cashAccountBalance: p.account?.balance ?? null
-					})),
-					netPrice: s.netPrice,
-					profit: s.profit,
-					remarks: s.remarks,
-					status: s.status,
-					// Works for both the original sale (via refunds[]) and the
-					// negative mirror sale (via refundRecord) — whichever applies.
-					refund: refundDetails
-				};
-			}),
-			createdAt: inv.createdAt
-		}));
-
-		res.json({ success: true, data });
+		res.json({
+			success: true,
+			data,
+			pagination: { page: Math.max(Number(page) || 1, 1), limit: take, total, pages: Math.max(Math.ceil(total / take), 1) },
+			summary: {
+				totalNet: summary._sum.netPrice || 0,
+				totalSell: summary._sum.sellPrice || 0,
+				totalProfit: summary._sum.profit || 0
+			}
+		});
 	} catch (err) {
 		console.error(err);
 		res.status(500).json({ success: false, error: "Failed to fetch sales invoices" });
