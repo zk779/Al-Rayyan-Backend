@@ -16,11 +16,21 @@ async function authenticate(req, res, next) {
 	const token = authHeader.split(" ")[1];
 	try {
 		const decoded = jwt.verify(token, process.env.JWT_SECRET);
-		const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+		const user = await prisma.user.findUnique({
+			where: { id: decoded.id },
+			include: {
+				role: {
+					include: { permissionLinks: { include: { permission: true } } },
+				},
+			},
+		});
 		if (!user || !user.isActive)
 			return res.status(401).json({ error: "User inactive or removed" });
 
-		req.user = decoded;
+		req.user = {
+			...decoded,
+			permissions: user.role?.permissionLinks.map((link) => link.permission.name) || [],
+		};
 		next();
 	} catch (err) {
 		return res.status(401).json({ error: "Invalid or expired token" });
@@ -50,11 +60,27 @@ router.get("/", authenticate, async (req, res) => {
 			});
 		}
 
-		if (createdById) filters.push({ invoice: { userId: createdById } });
+		// ── Visibility scope, driven by the requesting user's role permissions
+		// (resolved server-side in `authenticate`, never trusted from the client) ──
+		//   SALE_VIEW_ALL    → no forced restriction; optional createdById/branchId
+		//                      query filters behave exactly as before.
+		//   SALE_VIEW_BRANCH → forced to the user's own branch, regardless of
+		//                      any createdById/branchId passed in the query.
+		//   otherwise        → forced to the user's own invoices only
+		//                      (SALE_VIEW_OWN, or no sales-visibility permission).
+		const permissions = req.user.permissions || [];
 
-		// Filter to a single branch when requested — otherwise no branch
-		// restriction is applied and invoices from all branches are returned.
-		if (branchId) filters.push({ invoice: { branchId } });
+		if (permissions.includes("SALE_VIEW_ALL")) {
+			if (createdById) filters.push({ invoice: { userId: createdById } });
+
+			// Filter to a single branch when requested — otherwise no branch
+			// restriction is applied and invoices from all branches are returned.
+			if (branchId) filters.push({ invoice: { branchId } });
+		} else if (permissions.includes("SALE_VIEW_BRANCH")) {
+			filters.push({ invoice: { branchId: req.user.branchId || null } });
+		} else {
+			filters.push({ invoice: { userId: req.user.id } });
+		}
 
 		// dateFrom/dateTo are local calendar dates (e.g. "2026-07-27") picked in
 		// the requesting client's own timezone, passed via `tz` (IANA name).
