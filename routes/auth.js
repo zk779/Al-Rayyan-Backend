@@ -80,7 +80,9 @@ router.post("/login", async (req, res) => {
       email: user.email,
       fullName: user.fullName,
       role: user.role?.name || "USER",
-      branch: user.branch?.name || null,
+
+      branchId: user.branchId,
+      branchName: user.branch?.name || null,
     };
 
     // 🔐 Generate JWT (Note: Changed your comment to match the actual '1d' expiration)
@@ -189,7 +191,8 @@ router.get("/me", authenticateToken, async (req, res) => {
         email: userProfile.email,
         fullName: userProfile.fullName,
         role: userProfile.role?.name || "USER",
-        branch: userProfile.branch?.name || null,
+        branchId: userProfile.branchId,
+        branchName: userProfile.branch?.name || null,
       },
       process.env.JWT_SECRET,
       { expiresIn: "1d" } // match /login's expiry exactly

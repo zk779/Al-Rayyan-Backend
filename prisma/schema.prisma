@@ -141,6 +141,7 @@ model Branch {
     updatedAt DateTime  @updatedAt
     expenses  Expense[]
     users     User[]
+    salesInvoices SalesInvoice[]
 }
 
 model User {
@@ -362,10 +363,14 @@ model SalesInvoice {
     createdAt   DateTime @default(now())
     updatedAt   DateTime @updatedAt
 
+    branchId String? @db.ObjectId
+    branch   Branch? @relation(fields: [branchId], references: [id])
+
     sales Sale[]
 
     @@index([saleDate])
     @@index([createdAt])
+    @@index([branchId])
 }
 
 // ===========================

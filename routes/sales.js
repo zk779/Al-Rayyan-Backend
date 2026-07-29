@@ -35,7 +35,7 @@ async function authenticate(req, res, next) {
    not per-invoice, so `limit` always matches rows-per-page exactly. */
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search, dateFrom, dateTo, order, createdById, tz, page = 1, limit = 20 } = req.query;
+		const { search, dateFrom, dateTo, order, createdById, branchId, tz, page = 1, limit = 20 } = req.query;
 
 		const filters = [];
 
@@ -51,6 +51,10 @@ router.get("/", authenticate, async (req, res) => {
 		}
 
 		if (createdById) filters.push({ invoice: { userId: createdById } });
+
+		// Filter to a single branch when requested — otherwise no branch
+		// restriction is applied and invoices from all branches are returned.
+		if (branchId) filters.push({ invoice: { branchId } });
 
 		// dateFrom/dateTo are local calendar dates (e.g. "2026-07-27") picked in
 		// the requesting client's own timezone, passed via `tz` (IANA name).
@@ -98,7 +102,8 @@ router.get("/", authenticate, async (req, res) => {
 							invoiceNo: true,
 							saleDate: true,
 							createdAt: true,
-							user: { select: { id: true, fullName: true, email: true } }
+							user: { select: { id: true, fullName: true, email: true } },
+							branch: { select: { id: true, name: true, code: true } }
 						}
 					},
 					vendor: {
@@ -194,6 +199,9 @@ router.get("/", authenticate, async (req, res) => {
 				createdById: s.invoice?.user?.id || null,
 				createdByName: s.invoice?.user?.fullName || null,
 				createdByEmail: s.invoice?.user?.email || null,
+				branchId: s.invoice?.branch?.id || null,
+				branchName: s.invoice?.branch?.name || null,
+				branchCode: s.invoice?.branch?.code || null,
 				documentNo: s.documentNo,
 				pnr: s.pnr,
 				paxName: s.paxName,
@@ -572,6 +580,9 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 				user: {
 					select: { id: true, fullName: true, email: true }
 				},
+				branch: {
+					select: { id: true, name: true, code: true }
+				},
 				sales: {
 					include: {
 						vendor: {
@@ -743,6 +754,9 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 				createdById: invoice.user?.id || null,
 				createdByName: invoice.user?.fullName || null,
 				createdByEmail: invoice.user?.email || null,
+				branchId: invoice.branch?.id || null,
+				branchName: invoice.branch?.name || null,
+				branchCode: invoice.branch?.code || null,
 			},
 		});
 	} catch (err) {
@@ -976,6 +990,7 @@ router.post("/", authenticate, async (req, res) => {
 					invoiceNo,
 					saleDate: businessDate,
 					userId: req.user.id,
+					branchId: req.user.branchId || null,
 				},
 			});
 
