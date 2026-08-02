@@ -514,7 +514,7 @@ router.post("/", upload.single("attachment"), async (req, res) => {
             }
 
             return payment;
-        });
+        }, { timeout: 30000, maxWait: 10000 });
 
         const fullPayment = await prisma.vendorCustomerPayment.findUnique({
             where: { id: result.id },
