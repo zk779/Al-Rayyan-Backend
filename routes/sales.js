@@ -59,15 +59,6 @@ router.get("/", authenticate, async (req, res) => {
 				]
 			});
 		}
-
-		// ── Visibility scope, driven by the requesting user's role permissions
-		// (resolved server-side in `authenticate`, never trusted from the client) ──
-		//   SALE_VIEW_ALL    → no forced restriction; optional createdById/branchId
-		//                      query filters behave exactly as before.
-		//   SALE_VIEW_BRANCH → forced to the user's own branch, regardless of
-		//                      any createdById/branchId passed in the query.
-		//   otherwise        → forced to the user's own invoices only
-		//                      (SALE_VIEW_OWN, or no sales-visibility permission).
 		const permissions = req.user.permissions || [];
 
 		if (permissions.includes("SALE_VIEW_ALL")) {
@@ -81,11 +72,6 @@ router.get("/", authenticate, async (req, res) => {
 		} else {
 			filters.push({ invoice: { userId: req.user.id } });
 		}
-
-		// dateFrom/dateTo are local calendar dates (e.g. "2026-07-27") picked in
-		// the requesting client's own timezone, passed via `tz` (IANA name).
-		// Converted to the UTC instant range for that local day — see
-		// localDayRangeToUtc. No single timezone is assumed (multi-region).
 		if (dateFrom || dateTo) {
 			const saleDateFilter = {};
 			const fromRange = localDayRangeToUtc(dateFrom, tz);
@@ -1518,6 +1504,19 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 		const businessDate = saleDate ? new Date(saleDate) : new Date();
 
+		/* ══════════════════════════════════════════════════════
+		   Did the invoice's business date actually change?
+		   Compared once, at invoice level, against the value
+		   currently stored on the invoice — NOT recomputed per
+		   sale, since businessDate applies to the whole invoice.
+		   Only when this is true do we touch existing ledger
+		   entries' transactionDate / SalePayment.paymentDate;
+		   otherwise they're left exactly as they were, even if
+		   other fields on a sale changed.
+		══════════════════════════════════════════════════════ */
+		const dateChanged =
+			new Date(existingInvoice.saleDate).getTime() !== businessDate.getTime();
+
 		/* ======================================================
 		   4️⃣  TRANSACTION
 		====================================================== */
@@ -1946,6 +1945,20 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						},
 					});
 					adjBal(vendor.account.id, isDebit ? (newNet - oldNet) : -(newNet - oldNet));
+
+				} else if (dateChanged) {
+					// Nothing about the vendor leg changed except the invoice
+					// date — the branches above only stamp transactionDate
+					// when they're rewriting/recreating the row for some
+					// other reason, so this is the only place a pure date
+					// edit on an otherwise-untouched vendor entry gets synced.
+					const vendor = vendorMap.get(current.vendorId);
+					if (vendor?.account) {
+						await tx.ledgerEntry.updateMany({
+							where: { saleId: current.id, accountId: vendor.account.id, entryType: "SALE" },
+							data: { transactionDate: businessDate },
+						});
+					}
 				}
 
 				/* ── PAYMENT-SIDE: fully reverse old, fully apply new ──────────
@@ -2054,6 +2067,24 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 							}
 						}
 					}
+				} else if (dateChanged) {
+					/* ══════════════════════════════════════════════════════
+					   Payment side is otherwise untouched (paymentSideChanged
+					   was false) but the invoice date changed — sync the
+					   transactionDate on every existing ledger row for this
+					   sale, and the paymentDate on every SalePayment leg
+					   (relevant for PARTIAL sales, whose legs carry their
+					   own date shown in the UI), without reversing/reapplying
+					   any amounts.
+					══════════════════════════════════════════════════════ */
+					await tx.ledgerEntry.updateMany({
+						where: { saleId: current.id },
+						data: { transactionDate: businessDate },
+					});
+					await tx.salePayment.updateMany({
+						where: { saleId: current.id },
+						data: { paymentDate: businessDate },
+					});
 				}
 
 				/* ── Track who edited this sale ── */
@@ -2140,7 +2171,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				},
 			});
 
-			return { invoiceId, deletedSalesCount: deletedSales.length };
+			return { invoiceId, deletedSalesCount: deletedSales.length, dateChanged };
 
 		}, { timeout: 30000, maxWait: 10000 });
 

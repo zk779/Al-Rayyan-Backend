@@ -196,6 +196,11 @@ router.put("/:id", authenticate, async (req, res) => {
 			const categoryChanged = category && category !== vendor.category;
 			const openingChanged = openingBalance !== undefined && Number(openingBalance) !== vendor.openingBalance;
 
+			// Did the vendor's date actually change? Compared once here so
+			// both branches below (amount-changing and date-only) can use it.
+			const dateChanged =
+				vendorDate && new Date(vendorDate).getTime() !== new Date(vendor.vendorDate).getTime();
+
 			if (categoryChanged || openingChanged) {
 				const accountId = vendor.accountId;
 
@@ -264,6 +269,30 @@ router.put("/:id", authenticate, async (req, res) => {
 					where: { id: vendor.id },
 					data: { openingBalance: newOpening },
 				});
+
+			} else if (dateChanged) {
+				/* ══════════════════════════════════════════════════════
+				   Nothing about the amount/category changed — only the
+				   vendor's date did. Sync the OPENING_BALANCE ledger
+				   entry's transactionDate to match, WITHOUT touching any
+				   debit/credit amount or the account balance, and
+				   WITHOUT going through the hasOtherTx lock above: a pure
+				   date correction has no financial impact, so it should
+				   never be blocked just because other transactions exist
+				   on this account.
+				   If there's no opening entry yet (e.g. openingBalance is
+				   0 and was never created), there's nothing to sync.
+				══════════════════════════════════════════════════════ */
+				const openingEntry = await tx.ledgerEntry.findFirst({
+					where: { accountId: vendor.accountId, entryType: "OPENING_BALANCE" },
+				});
+
+				if (openingEntry) {
+					await tx.ledgerEntry.update({
+						where: { id: openingEntry.id },
+						data: { transactionDate: new Date(vendorDate) },
+					});
+				}
 			}
 
 			return tx.vendor.findUnique({

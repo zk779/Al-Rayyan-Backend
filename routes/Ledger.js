@@ -68,7 +68,6 @@ async function attachRelatedDetails(entries) {
             status: true,
             remarks: true,
             createdAt: true,
-            // Nested relations useful for display
             invoice: {
               select: { invoiceNo: true, saleDate: true },
             },
@@ -184,28 +183,86 @@ async function attachRelatedDetails(entries) {
       invoice: entry.invoiceId ? (invoiceMap[entry.invoiceId] ?? null) : null,
       payment: entry.paymentId ? (paymentMap[entry.paymentId] ?? null) : null,
       refund:  entry.refundId  ? (refundMap[entry.refundId]   ?? null) : null,
-      // expenseId surfaced as-is until an Expense model is added
       expenseId: entry.expenseId ?? null,
     },
   }));
 }
+async function computeAccountTotals(where) {
+  // Lightweight query — only the fields needed to sum, no relations,
+  // so this stays cheap even though it scans the whole filtered set.
+  const rows = await prisma.ledgerEntry.findMany({
+    where,
+    select: { accountId: true, debit: true, credit: true },
+  });
 
-/* ===============================================================
-   GET /api/ledger
-   ===============================================================
-   Query params (all optional):
-     accountType=VENDOR
-     accountTypes=VENDOR,CUSTOMER,EXPENSE   (comma-separated)
-     entryType=SALE
-     entryTypes=SALE,PAYMENT               (comma-separated)
-     vendorId=<objectId>
-     customerId=<objectId>
-     from=2025-01-01
-     to=2025-01-31
-     page=1
-     limit=50
-     includeDetails=true                   ← NEW: attach related records
-   =============================================================== */
+  const byAccountMap = new Map();
+  let overallDebit = 0;
+  let overallCredit = 0;
+
+  for (const row of rows) {
+    overallDebit += row.debit ?? 0;
+    overallCredit += row.credit ?? 0;
+
+    if (!row.accountId) continue; // entries with no linked account are excluded from the breakdown
+
+    const bucket = byAccountMap.get(row.accountId) ?? {
+      accountId: row.accountId,
+      totalDebit: 0,
+      totalCredit: 0,
+      entryCount: 0,
+    };
+    bucket.totalDebit += row.debit ?? 0;
+    bucket.totalCredit += row.credit ?? 0;
+    bucket.entryCount += 1;
+    byAccountMap.set(row.accountId, bucket);
+  }
+
+  const accountIds = [...byAccountMap.keys()];
+
+  const accounts = accountIds.length
+    ? await prisma.account.findMany({
+        where: { id: { in: accountIds } },
+        select: {
+          id: true,
+          name: true,
+          type: true,
+          referenceId: true,
+          balance: true,
+        },
+      })
+    : [];
+
+  const accountMeta = Object.fromEntries(accounts.map(a => [a.id, a]));
+
+  const byAccount = accountIds.map(accountId => {
+    const bucket = byAccountMap.get(accountId);
+    const meta = accountMeta[accountId] ?? null;
+    return {
+      accountId,
+      name: meta?.name ?? null,
+      type: meta?.type ?? null,
+      referenceId: meta?.referenceId ?? null,
+      currentBalance: meta?.balance ?? null,
+      totalDebit: bucket.totalDebit,
+      totalCredit: bucket.totalCredit,
+      netMovement: bucket.totalDebit - bucket.totalCredit,
+      entryCount: bucket.entryCount,
+    };
+  });
+
+  // Sort so the largest-activity accounts show up first
+  byAccount.sort((a, b) => (b.totalDebit + b.totalCredit) - (a.totalDebit + a.totalCredit));
+
+  return {
+    overall: {
+      totalDebit: overallDebit,
+      totalCredit: overallCredit,
+      netMovement: overallDebit - overallCredit,
+      entryCount: rows.length,
+    },
+    byAccount,
+  };
+}
 router.get("/", authenticate, async (req, res) => {
   try {
     const {
@@ -219,7 +276,8 @@ router.get("/", authenticate, async (req, res) => {
       to,
       page = 1,
       limit = 50,
-      includeDetails = "true", // default ON; pass false to skip the extra lookups
+      includeDetails = "true",
+      includeSummary = "true", // default ON; pass false to skip the extra scan
     } = req.query;
 
     const take = Math.min(100, Math.max(1, Number(limit)));
@@ -254,7 +312,6 @@ router.get("/", authenticate, async (req, res) => {
             transactionDate: {
               ...(from && { gte: new Date(from) }),
               ...(to && {
-                // include the full "to" day
                 lte: new Date(new Date(to).setHours(23, 59, 59, 999)),
               }),
             },
@@ -266,8 +323,8 @@ router.get("/", authenticate, async (req, res) => {
       },
     };
 
-    /* ---------- Query ---------- */
-    const [rawEntries, total] = await Promise.all([
+    /* ---------- Query (paginated entries + total count + full-set totals) ---------- */
+    const [rawEntries, total, summary] = await Promise.all([
       prisma.ledgerEntry.findMany({
         where,
         include: {
@@ -286,6 +343,7 @@ router.get("/", authenticate, async (req, res) => {
         take,
       }),
       prisma.ledgerEntry.count({ where }),
+      includeSummary !== "false" ? computeAccountTotals(where) : null,
     ]);
 
     /* ---------- Attach related details (one extra round-trip, batched) ---------- */
@@ -304,6 +362,7 @@ router.get("/", authenticate, async (req, res) => {
         total,
         totalPages: Math.ceil(total / take),
       },
+      ...(summary && { summary }), // omitted entirely when includeSummary=false
     });
   } catch (err) {
     console.error(err);
