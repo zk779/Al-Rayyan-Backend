@@ -1,6 +1,7 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
+import { localDayRangeToUtc } from "../utils/dateRange.js"; // adjust path to wherever you saved this helper
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -187,9 +188,8 @@ async function attachRelatedDetails(entries) {
     },
   }));
 }
+
 async function computeAccountTotals(where) {
-  // Lightweight query — only the fields needed to sum, no relations,
-  // so this stays cheap even though it scans the whole filtered set.
   const rows = await prisma.ledgerEntry.findMany({
     where,
     select: { accountId: true, debit: true, credit: true },
@@ -263,6 +263,7 @@ async function computeAccountTotals(where) {
     byAccount,
   };
 }
+
 router.get("/", authenticate, async (req, res) => {
   try {
     const {
@@ -274,6 +275,7 @@ router.get("/", authenticate, async (req, res) => {
       customerId,
       from,
       to,
+      timezone, // IANA tz from the client, e.g. "Asia/Karachi" — falls back to UTC if omitted/invalid
       page = 1,
       limit = 50,
       includeDetails = "true",
@@ -303,20 +305,23 @@ router.get("/", authenticate, async (req, res) => {
     let referenceId;
     if (vendorId)   referenceId = vendorId;
     if (customerId) referenceId = customerId;
+    let transactionDateFilter;
+    if (from || to) {
+      transactionDateFilter = {};
 
-    /* ---------- WHERE CLAUSE ---------- */
+      if (from) {
+        const fromRange = localDayRangeToUtc(from, timezone);
+        if (fromRange) transactionDateFilter.gte = fromRange.start;
+      }
+
+      if (to) {
+        const toRange = localDayRangeToUtc(to, timezone);
+        if (toRange) transactionDateFilter.lte = toRange.end;
+      }
+    }
     const where = {
       ...(entryTypeFilter && { entryType: { in: entryTypeFilter } }),
-      ...(from || to
-        ? {
-            transactionDate: {
-              ...(from && { gte: new Date(from) }),
-              ...(to && {
-                lte: new Date(new Date(to).setHours(23, 59, 59, 999)),
-              }),
-            },
-          }
-        : {}),
+      ...(transactionDateFilter && { transactionDate: transactionDateFilter }),
       account: {
         ...(accountTypeFilter && { type: { in: accountTypeFilter } }),
         ...(referenceId && { referenceId }),

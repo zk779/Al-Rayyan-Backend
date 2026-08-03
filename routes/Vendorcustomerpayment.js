@@ -1470,8 +1470,8 @@ router.put("/:id", async (req, res) => {
         });
       }
 
-      return updated;
-    });
+    return updated;
+}, { timeout: 30000, maxWait: 10000 });
 
     const fullPayment = await prisma.vendorCustomerPayment.findUnique({
       where: { id: result.id },

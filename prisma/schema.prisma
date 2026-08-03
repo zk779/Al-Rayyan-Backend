@@ -128,20 +128,21 @@ model RolePermission {
 // ===========================
 
 model Branch {
-    id        String    @id @default(auto()) @map("_id") @db.ObjectId
-    name      String
-    code      String    @unique
-    address   String?
-    city      String?
-    country   String?
-    phone     String?
-    email     String?
-    isActive  Boolean   @default(true)
-    createdAt DateTime  @default(now())
-    updatedAt DateTime  @updatedAt
-    expenses  Expense[]
-    users     User[]
-    salesInvoices SalesInvoice[]
+    id                     String                  @id @default(auto()) @map("_id") @db.ObjectId
+    name                   String
+    code                   String                  @unique
+    address                String?
+    city                   String?
+    country                String?
+    phone                  String?
+    email                  String?
+    isActive               Boolean                 @default(true)
+    createdAt              DateTime                @default(now())
+    updatedAt              DateTime                @updatedAt
+    expenses               Expense[]
+    users                  User[]
+    salesInvoices          SalesInvoice[]
+    vendorCustomerPayments VendorCustomerPayment[]
 }
 
 model User {
@@ -160,9 +161,10 @@ model User {
     role   Role?   @relation(fields: [roleId], references: [id])
     branch Branch? @relation(fields: [branchId], references: [id])
 
-    salesInvoices SalesInvoice[]
-    refunds       Refund[]
-    expenses      Expense[]
+    salesInvoices          SalesInvoice[]
+    refunds                Refund[]
+    expenses               Expense[]
+    vendorCustomerPayments VendorCustomerPayment[]
 }
 
 // ===========================
@@ -529,12 +531,20 @@ model Refund {
 // Exactly one of vendorId / customerId must be populated (driven by partyType).
 // ===========================
 
+model PaymentVoucherCounter {
+    id            String   @id @default(auto()) @map("_id") @db.ObjectId
+    key           String   @unique
+    currentNumber Int      @default(0)
+    updatedAt     DateTime @updatedAt
+}
+
 model VendorCustomerPayment {
     id String @id @default(auto()) @map("_id") @db.ObjectId
 
     partyType PartyType // VENDOR | CUSTOMER — tells you which relation below is populated
 
     // Populated when partyType = VENDOR
+    pvNo          String? @unique
     vendorId String? @db.ObjectId
     vendor   Vendor? @relation(fields: [vendorId], references: [id])
 
@@ -549,19 +559,18 @@ model VendorCustomerPayment {
     amount Float
 
     // Populated only when method = BANK_TRANSFER
-    bankId String? @db.ObjectId
-    bank   Bank?   @relation(fields: [bankId], references: [id])
-
-    // Cloudinary URL only — actual file lives on Cloudinary, not in Mongo
+    bankId        String? @db.ObjectId
+    bank          Bank?   @relation(fields: [bankId], references: [id])
+    bankSlipNo    String?
     attachmentUrl String?
 
-    remarks String?
-
-    // Business / accounting date — user-selected on the payment form
+    remarks         String?
     transactionDate DateTime
-
-    // System date — auto, immutable
-    createdAt DateTime @default(now())
+    createdAt       DateTime @default(now())
+    createdById     String?  @db.ObjectId
+    createdBy       User?    @relation(fields: [createdById], references: [id])
+    branchId        String?  @db.ObjectId
+    branch          Branch?  @relation(fields: [branchId], references: [id])
 
     // Resulting ledger rows (1 for CASH, 2 for BANK_TRANSFER) — handy for audits/reversals
     ledgerEntries LedgerEntry[]
@@ -576,6 +585,8 @@ model VendorCustomerPayment {
     @@index([transactionDate])
     @@index([createdAt])
     @@index([accountId])
+    @@index([createdById])
+    @@index([branchId])
 }
 
 model Expense {
