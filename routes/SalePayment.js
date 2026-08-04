@@ -1,8 +1,8 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
-import {upload} from "../middleware/cloudinary.js";
-
+import { upload } from "../middleware/cloudinary.js";
+import { generateNextPvNo } from "../utils/paymentCounter.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -30,7 +30,7 @@ async function authenticate(req, res, next) {
 router.post("/:saleId", authenticate, upload.single("attachment"), async (req, res) => {
     try {
         const { saleId } = req.params;
-        let { method, bankId, amount, remarks, transactionDate } = req.body;
+        let { method, bankId, bankSlipNo, amount, remarks, transactionDate } = req.body; // NEW: bankSlipNo
 
         const attachmentUrl = req.file ? req.file.path : null;
 
@@ -73,9 +73,6 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
                 error: "amount must be a number greater than 0",
             });
 
-        // ---- Load the sale, its invoice (for remarks), customer (if any),
-        //      and any refund (to compute the refund-adjusted due amount,
-        //      same as GET /saleId/:saleId and /customerSales) ----
         const sale = await prisma.sale.findUnique({
             where: { id: saleId },
             include: {
@@ -97,8 +94,6 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
         const refund = sale.refunds && sale.refunds.length > 0 ? sale.refunds[0] : null;
         const netRefundToCustomer = refund ? Number(refund.netRefundToCustomer || 0) : 0;
 
-        // Effective amount this sale still owes, after subtracting whatever
-        // was already paid AND whatever was refunded back to the customer.
         const remainingDue = sale.sellPrice - (sale.paidAmount || 0) - netRefundToCustomer;
 
         if (amount > remainingDue)
@@ -115,7 +110,6 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
                 error: `Payment amount (${amount}) exceeds customer's outstanding balance (${sale.customer.account.balance})`,
             });
 
-        // ---- Load the bank if relevant ----
         let bank = null;
         if (method === "BANK_TRANSFER") {
             bank = await prisma.bank.findUnique({
@@ -135,9 +129,7 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
             remarks ? ` — ${remarks}` : ""
         }`;
 
-        // ---- Persist everything atomically ----
         const result = await prisma.$transaction(async (tx) => {
-            // Get-or-create the singleton cash account inside the transaction.
             const getCashAccount = async () => {
                 let cash = await tx.account.findFirst({ where: { type: "CASH" } });
                 if (!cash) {
@@ -149,6 +141,9 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
             };
 
             const cash = method === "CASH" ? await getCashAccount() : null;
+
+            // NEW — sequential PV number, scoped to the user's branch + year
+            const pvNo = await generateNextPvNo(tx, req.user.branchCode, parsedDate);
 
             const payment = await tx.vendorCustomerPayment.create({
                 data: {
@@ -162,11 +157,13 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
                     attachmentUrl,
                     remarks: remarks ?? null,
                     transactionDate: parsedDate,
+                    pvNo,                          // NEW
+                    bankSlipNo: bankSlipNo ?? null, // NEW
+                    createdById: req.user.id,       // NEW
+                    branchId: req.user.branchId,    // NEW
                 },
             });
 
-            // ---- Customer ledger leg — ONLY if this sale actually has a
-            //      customer attached. Walk-in sales skip this entirely. ----
             if (hasCustomer) {
                 await tx.ledgerEntry.create({
                     data: {
@@ -187,7 +184,6 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
                 });
             }
 
-            // ---- Cash/bank leg — always happens regardless of customer ----
             if (method === "CASH") {
                 await tx.ledgerEntry.create({
                     data: {
@@ -226,9 +222,6 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
                 });
             }
 
-            // ---- Update the sale's paid amount + status ----
-            // "Fully paid" means paidAmount covers sellPrice minus whatever
-            // was already refunded back to the customer.
             const newPaidAmount = (sale.paidAmount || 0) + amount;
             const fullyPaidThreshold = sale.sellPrice - netRefundToCustomer;
             const newStatus = newPaidAmount >= fullyPaidThreshold ? "PAID" : "PARTIAL";
@@ -242,7 +235,7 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
             });
 
             return { payment, sale: updatedSale };
-        });
+        }, { timeout: 30000, maxWait: 10000 }); // added, matches the other routes' timeout fix
 
         const fullPayment = await prisma.vendorCustomerPayment.findUnique({
             where: { id: result.payment.id },
@@ -257,6 +250,8 @@ router.post("/:saleId", authenticate, upload.single("attachment"), async (req, r
                         invoice: { select: { id: true, invoiceNo: true } },
                     },
                 },
+                createdBy: { select: { id: true, fullName: true } }, // NEW
+                branch: { select: { id: true, name: true, code: true } }, // NEW
                 ledgerEntries: true,
             },
         });

@@ -1,544 +1,390 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
-import {upload} from "../middleware/cloudinary.js";
-
+import jwt from "jsonwebtoken";
+import { upload } from "../middleware/cloudinary.js";
+import { generateNextPvNo } from "../utils/paymentCounter.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
 
 async function authenticate(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader)
-        return res.status(401).json({ error: "Missing Authorization header" });
+  const authHeader = req.headers.authorization;
+  if (!authHeader)
+    return res.status(401).json({ error: "Missing Authorization header" });
 
-    const token = authHeader.split(" ")[1];
-    try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await prisma.user.findUnique({ where: { id: decoded.id } });
-        if (!user || !user.isActive)
-            return res.status(401).json({ error: "User inactive or removed" });
+  const token = authHeader.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+    if (!user || !user.isActive)
+      return res.status(401).json({ error: "User inactive or removed" });
 
-        req.user = decoded;
-        next();
-    } catch (err) {
-        return res.status(401).json({ error: "Invalid or expired token" });
-    }
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
 }
 
+router.post("/", authenticate, upload.single("attachment"), async (req, res) => {
+  try {
+    let {
+      partyType,
+      vendorId,
+      customerId,
+      method,
+      bankId,
+      bankSlipNo, // NEW — from bank receipt, optional, frontend-supplied
+      amount,
+      remarks,
+      transactionDate,
+      saleAllocations,
+    } = req.body;
 
-// Inject upload.single("attachment") into the POST route
-router.post("/", upload.single("attachment"), async (req, res) => {
-    try {
-        let {
-            partyType,
-            vendorId,
-            customerId,
-            method,
-            bankId,
-            amount,
-            remarks,
-            transactionDate,
-            saleAllocations, // NEW: only used for CUSTOMER payments. JSON string or array:
-                             // [{ saleId: "...", amount: 500 }, { saleId: "...", amount: 200 }]
-        } = req.body;
+    const attachmentUrl = req.file ? req.file.path : null;
 
-        // 1. Capture the Cloudinary URL if a file was uploaded
-        const attachmentUrl = req.file ? req.file.path : null;
+    if (!partyType || !method || !transactionDate)
+      return res.status(400).json({ success: false, error: "partyType, method and transactionDate are required" });
 
-        // ---- Basic required-field checks ----
-        if (!partyType || !method || !transactionDate)
-            return res.status(400).json({
-                success: false,
-                error: "partyType, method and transactionDate are required",
-            });
+    if (!["VENDOR", "CUSTOMER"].includes(partyType))
+      return res.status(400).json({ success: false, error: "partyType must be either VENDOR or CUSTOMER" });
 
-        if (!["VENDOR", "CUSTOMER"].includes(partyType))
-            return res.status(400).json({
-                success: false,
-                error: "partyType must be either VENDOR or CUSTOMER",
-            });
+    if (!["CASH", "BANK_TRANSFER"].includes(method))
+      return res.status(400).json({ success: false, error: "method must be either CASH or BANK_TRANSFER" });
 
-        if (!["CASH", "BANK_TRANSFER"].includes(method))
-            return res.status(400).json({
-                success: false,
-                error: "method must be either CASH or BANK_TRANSFER",
-            });
+    if (partyType === "VENDOR" && !vendorId)
+      return res.status(400).json({ success: false, error: "vendorId is required when partyType is VENDOR" });
 
-        // ---- partyType / id consistency checks ----
-        if (partyType === "VENDOR" && !vendorId)
-            return res.status(400).json({
-                success: false,
-                error: "vendorId is required when partyType is VENDOR",
-            });
+    if (partyType === "VENDOR" && customerId)
+      return res.status(400).json({ success: false, error: "customerId must not be set when partyType is VENDOR" });
 
-        if (partyType === "VENDOR" && customerId)
-            return res.status(400).json({
-                success: false,
-                error: "customerId must not be set when partyType is VENDOR",
-            });
+    if (partyType === "CUSTOMER" && !customerId)
+      return res.status(400).json({ success: false, error: "customerId is required when partyType is CUSTOMER" });
 
-        if (partyType === "CUSTOMER" && !customerId)
-            return res.status(400).json({
-                success: false,
-                error: "customerId is required when partyType is CUSTOMER",
-            });
+    if (partyType === "CUSTOMER" && vendorId)
+      return res.status(400).json({ success: false, error: "vendorId must not be set when partyType is CUSTOMER" });
 
-        if (partyType === "CUSTOMER" && vendorId)
-            return res.status(400).json({
-                success: false,
-                error: "vendorId must not be set when partyType is CUSTOMER",
-            });
+    if (method === "BANK_TRANSFER" && !bankId)
+      return res.status(400).json({ success: false, error: "bankId is required when method is BANK_TRANSFER" });
 
-        // ---- method / bankId consistency checks ----
-        if (method === "BANK_TRANSFER" && !bankId)
-            return res.status(400).json({
-                success: false,
-                error: "bankId is required when method is BANK_TRANSFER",
-            });
+    if (method === "CASH" && bankId)
+      return res.status(400).json({ success: false, error: "bankId must not be set when method is CASH" });
 
-        if (method === "CASH" && bankId)
-            return res.status(400).json({
-                success: false,
-                error: "bankId must not be set when method is CASH",
-            });
+    const parsedDate = new Date(transactionDate);
+    if (isNaN(parsedDate.getTime()))
+      return res.status(400).json({ success: false, error: "transactionDate must be a valid date" });
 
-        // ---- Validate transactionDate ----
-        const parsedDate = new Date(transactionDate);
-        if (isNaN(parsedDate.getTime()))
-            return res.status(400).json({
-                success: false,
-                error: "transactionDate must be a valid date",
-            });
-
-        // ---- Parse & validate saleAllocations (CUSTOMER only) ----
-        let allocations = [];
-        if (partyType === "CUSTOMER") {
-            if (typeof saleAllocations === "string") {
-                try {
-                    allocations = JSON.parse(saleAllocations);
-                } catch {
-                    return res.status(400).json({
-                        success: false,
-                        error: "saleAllocations must be valid JSON",
-                    });
-                }
-            } else if (Array.isArray(saleAllocations)) {
-                allocations = saleAllocations;
-            }
-
-            if (!Array.isArray(allocations) || allocations.length === 0)
-                return res.status(400).json({
-                    success: false,
-                    error: "saleAllocations must be a non-empty array of { saleId, amount } for customer payments",
-                });
-
-            const seen = new Set();
-            for (const a of allocations) {
-                if (!a.saleId || a.amount === undefined)
-                    return res.status(400).json({
-                        success: false,
-                        error: "Each saleAllocations entry requires saleId and amount",
-                    });
-
-                a.amount = Number(a.amount);
-                if (isNaN(a.amount) || a.amount <= 0)
-                    return res.status(400).json({
-                        success: false,
-                        error: `Invalid amount for sale ${a.saleId}`,
-                    });
-
-                if (seen.has(a.saleId))
-                    return res.status(400).json({
-                        success: false,
-                        error: `Duplicate saleId ${a.saleId} in saleAllocations`,
-                    });
-                seen.add(a.saleId);
-            }
-
-            // amount is derived from allocations for CUSTOMER payments
-            const allocationTotal = allocations.reduce((sum, a) => sum + a.amount, 0);
-
-            if (amount !== undefined && amount !== null && amount !== "") {
-                if (Number(amount) !== allocationTotal)
-                    return res.status(400).json({
-                        success: false,
-                        error: `amount (${Number(amount)}) must equal the sum of saleAllocations (${allocationTotal})`,
-                    });
-            }
-
-            amount = allocationTotal;
-        } else {
-            // VENDOR flow — amount is required as before
-            if (amount === undefined)
-                return res.status(400).json({
-                    success: false,
-                    error: "amount is required",
-                });
-            amount = Number(amount);
+    let allocations = [];
+    if (partyType === "CUSTOMER") {
+      if (typeof saleAllocations === "string") {
+        try {
+          allocations = JSON.parse(saleAllocations);
+        } catch {
+          return res.status(400).json({ success: false, error: "saleAllocations must be valid JSON" });
         }
+      } else if (Array.isArray(saleAllocations)) {
+        allocations = saleAllocations;
+      }
 
-        if (isNaN(amount) || amount <= 0)
-            return res.status(400).json({
-                success: false,
-                error: "amount must be a number greater than 0",
-            });
+      if (!Array.isArray(allocations) || allocations.length === 0)
+        return res.status(400).json({ success: false, error: "saleAllocations must be a non-empty array of { saleId, amount } for customer payments" });
 
-        // ---- Load the party + its account ----
-        let vendor = null;
-        let customer = null;
+      const seen = new Set();
+      for (const a of allocations) {
+        if (!a.saleId || a.amount === undefined)
+          return res.status(400).json({ success: false, error: "Each saleAllocations entry requires saleId and amount" });
 
-        if (partyType === "VENDOR") {
-            vendor = await prisma.vendor.findUnique({
-                where: { id: vendorId },
-                include: { account: true },
-            });
+        a.amount = Number(a.amount);
+        if (isNaN(a.amount) || a.amount <= 0)
+          return res.status(400).json({ success: false, error: `Invalid amount for sale ${a.saleId}` });
 
-            if (!vendor)
-                return res.status(404).json({ success: false, error: "Vendor not found" });
+        if (seen.has(a.saleId))
+          return res.status(400).json({ success: false, error: `Duplicate saleId ${a.saleId} in saleAllocations` });
+        seen.add(a.saleId);
+      }
 
-            if (!vendor.status)
-                return res.status(400).json({ success: false, error: "Vendor is inactive" });
-        } else {
-            customer = await prisma.customer.findUnique({
-                where: { id: customerId },
-                include: { account: true },
-            });
+      const allocationTotal = allocations.reduce((sum, a) => sum + a.amount, 0);
 
-            if (!customer)
-                return res.status(404).json({ success: false, error: "Customer not found" });
+      if (amount !== undefined && amount !== null && amount !== "") {
+        if (Number(amount) !== allocationTotal)
+          return res.status(400).json({ success: false, error: `amount (${Number(amount)}) must equal the sum of saleAllocations (${allocationTotal})` });
+      }
 
-            if (!customer.isActive)
-                return res.status(400).json({ success: false, error: "Customer is inactive" });
+      amount = allocationTotal;
+    } else {
+      if (amount === undefined)
+        return res.status(400).json({ success: false, error: "amount is required" });
+      amount = Number(amount);
+    }
+
+    if (isNaN(amount) || amount <= 0)
+      return res.status(400).json({ success: false, error: "amount must be a number greater than 0" });
+
+    let vendor = null;
+    let customer = null;
+
+    if (partyType === "VENDOR") {
+      vendor = await prisma.vendor.findUnique({ where: { id: vendorId }, include: { account: true } });
+      if (!vendor) return res.status(404).json({ success: false, error: "Vendor not found" });
+      if (!vendor.status) return res.status(400).json({ success: false, error: "Vendor is inactive" });
+    } else {
+      customer = await prisma.customer.findUnique({ where: { id: customerId }, include: { account: true } });
+      if (!customer) return res.status(404).json({ success: false, error: "Customer not found" });
+      if (!customer.isActive) return res.status(400).json({ success: false, error: "Customer is inactive" });
+    }
+
+    let salesById = new Map();
+    if (partyType === "CUSTOMER") {
+      const saleIds = allocations.map((a) => a.saleId);
+      const sales = await prisma.sale.findMany({
+        where: { id: { in: saleIds } },
+        include: { invoice: { select: { invoiceNo: true } } },
+      });
+
+      salesById = new Map(sales.map((s) => [s.id, s]));
+
+      for (const a of allocations) {
+        const sale = salesById.get(a.saleId);
+
+        if (!sale) return res.status(404).json({ success: false, error: `Sale ${a.saleId} not found` });
+        if (sale.customerId !== customerId)
+          return res.status(400).json({ success: false, error: `Sale ${a.saleId} does not belong to customer ${customerId}` });
+        if (!["DUE", "PARTIAL"].includes(sale.paymentStatus))
+          return res.status(400).json({ success: false, error: `Sale ${a.saleId} is already ${sale.paymentStatus} and cannot accept further payment` });
+
+        const remainingDue = sale.sellPrice - sale.paidAmount;
+        if (a.amount > remainingDue)
+          return res.status(400).json({ success: false, error: `Payment amount (${a.amount}) for sale ${a.saleId} exceeds its remaining due (${remainingDue})` });
+      }
+    }
+
+    let bank = null;
+    if (method === "BANK_TRANSFER") {
+      bank = await prisma.bank.findUnique({ where: { id: bankId }, include: { account: true } });
+      if (!bank) return res.status(404).json({ success: false, error: "Bank not found" });
+      if (!bank.isActive) return res.status(400).json({ success: false, error: "Bank account is inactive" });
+      if (partyType === "VENDOR" && amount > bank.account.balance)
+        return res.status(400).json({ success: false, error: `Insufficient bank balance. Trying to pay ${amount} but bank only has ${bank.account.balance} available.` });
+    }
+
+    let cashAccount = null;
+    if (method === "CASH") {
+      cashAccount = await prisma.account.findFirst({ where: { type: "CASH" } });
+      if (partyType === "VENDOR" && cashAccount && amount > cashAccount.balance)
+        return res.status(400).json({ success: false, error: `Insufficient cash balance. Trying to pay ${amount} but cash account only has ${cashAccount.balance} available.` });
+    }
+
+    const partyAccount = partyType === "VENDOR" ? vendor.account : customer.account;
+    const currentBalance = partyAccount.balance;
+
+    const singleAllocationSaleId =
+      partyType === "CUSTOMER" && allocations.length === 1 ? allocations[0].saleId : null;
+
+    let partyLegDebit = 0;
+    let partyLegCredit = 0;
+    let partyBalanceDelta = 0;
+
+    if (partyType === "VENDOR" && vendor.category === "DEBIT") {
+      if (amount > currentBalance)
+        return res.status(400).json({ success: false, error: `Payment amount (${amount}) exceeds vendor's outstanding balance (${currentBalance}).` });
+      partyLegDebit = amount;
+      partyBalanceDelta = -amount;
+    } else if (partyType === "VENDOR" && vendor.category === "CREDIT") {
+      partyLegDebit = amount;
+      partyBalanceDelta = amount;
+    } else if (partyType === "CUSTOMER") {
+      if (amount > currentBalance)
+        return res.status(400).json({ success: false, error: `Payment amount (${amount}) exceeds customer's outstanding balance (${currentBalance}).` });
+      partyLegCredit = amount;
+      partyBalanceDelta = -amount;
+    }
+
+    let bankLegDebit = 0;
+    let bankLegCredit = 0;
+    let bankBalanceDelta = 0;
+
+    if (method === "BANK_TRANSFER") {
+      if (partyType === "VENDOR") {
+        bankLegDebit = amount;
+        bankBalanceDelta = -amount;
+      } else {
+        bankLegCredit = amount;
+        bankBalanceDelta = amount;
+      }
+    }
+
+    let cashLegDebit = 0;
+    let cashLegCredit = 0;
+    let cashBalanceDelta = 0;
+
+    if (method === "CASH") {
+      if (partyType === "VENDOR") {
+        cashLegDebit = amount;
+        cashBalanceDelta = -amount;
+      } else {
+        cashLegCredit = amount;
+        cashBalanceDelta = amount;
+      }
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const getCashAccount = async () => {
+        if (cashAccount) return cashAccount;
+        cashAccount = await tx.account.findFirst({ where: { type: "CASH" } });
+        if (!cashAccount) {
+          cashAccount = await tx.account.create({ data: { name: "Cash Account", type: "CASH", balance: 0 } });
         }
+        return cashAccount;
+      };
 
-        // ---- Load & validate the sales referenced in saleAllocations (CUSTOMER only) ----
-        let salesById = new Map();
-        if (partyType === "CUSTOMER") {
-            const saleIds = allocations.map((a) => a.saleId);
-            const sales = await prisma.sale.findMany({
-                where: { id: { in: saleIds } },
-                include: { invoice: { select: { invoiceNo: true } } },
-            });
+      const cash = method === "CASH" ? await getCashAccount() : null;
 
-            salesById = new Map(sales.map((s) => [s.id, s]));
+      // NEW — sequential PV number, scoped to the user's branch + year
+      const pvNo = await generateNextPvNo(tx, req.user.branchCode, parsedDate);
 
-            for (const a of allocations) {
-                const sale = salesById.get(a.saleId);
+      const payment = await tx.vendorCustomerPayment.create({
+        data: {
+          partyType,
+          vendorId: partyType === "VENDOR" ? vendorId : null,
+          customerId: partyType === "CUSTOMER" ? customerId : null,
+          saleId: singleAllocationSaleId,
+          method,
+          amount,
+          bankId: method === "BANK_TRANSFER" ? bankId : null,
+          accountId: method === "CASH" ? cash.id : null,
+          attachmentUrl: attachmentUrl,
+          remarks: remarks ?? null,
+          transactionDate: parsedDate,
+          pvNo,                          // NEW
+          bankSlipNo: bankSlipNo ?? null, // NEW
+          createdById: req.user.id,       // NEW
+          branchId: req.user.branchId,    // NEW
+        },
+      });
 
-                if (!sale)
-                    return res.status(404).json({
-                        success: false,
-                        error: `Sale ${a.saleId} not found`,
-                    });
+      if (partyType === "CUSTOMER") {
+        for (const a of allocations) {
+          const sale = salesById.get(a.saleId);
+          const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
+          const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${a.saleId})${remarks ? ` — ${remarks}` : ""}`;
 
-                if (sale.customerId !== customerId)
-                    return res.status(400).json({
-                        success: false,
-                        error: `Sale ${a.saleId} does not belong to customer ${customerId}`,
-                    });
-
-                if (!["DUE", "PARTIAL"].includes(sale.paymentStatus))
-                    return res.status(400).json({
-                        success: false,
-                        error: `Sale ${a.saleId} is already ${sale.paymentStatus} and cannot accept further payment`,
-                    });
-
-                const remainingDue = sale.sellPrice - sale.paidAmount;
-                if (a.amount > remainingDue)
-                    return res.status(400).json({
-                        success: false,
-                        error: `Payment amount (${a.amount}) for sale ${a.saleId} exceeds its remaining due (${remainingDue})`,
-                    });
-            }
-        }
-
-        // ---- Load the bank if relevant ----
-        let bank = null;
-        if (method === "BANK_TRANSFER") {
-            bank = await prisma.bank.findUnique({
-                where: { id: bankId },
-                include: { account: true },
-            });
-
-            if (!bank)
-                return res.status(404).json({ success: false, error: "Bank not found" });
-
-            if (!bank.isActive)
-                return res.status(400).json({ success: false, error: "Bank account is inactive" });
-
-            if (partyType === "VENDOR" && amount > bank.account.balance)
-                return res.status(400).json({
-                    success: false,
-                    error: `Insufficient bank balance. Trying to pay ${amount} but bank only has ${bank.account.balance} available.`,
-                });
-        }
-
-        // ---- Load (or lazily create) the singleton CASH account if relevant ----
-        let cashAccount = null;
-        if (method === "CASH") {
-            cashAccount = await prisma.account.findFirst({ where: { type: "CASH" } });
-
-            if (partyType === "VENDOR" && cashAccount && amount > cashAccount.balance)
-                return res.status(400).json({
-                    success: false,
-                    error: `Insufficient cash balance. Trying to pay ${amount} but cash account only has ${cashAccount.balance} available.`,
-                });
-        }
-
-        // ---- Determine ledger direction + enforce balance cap rules ----
-        const partyAccount = partyType === "VENDOR" ? vendor.account : customer.account;
-        const currentBalance = partyAccount.balance;
-
-        // A CUSTOMER payment against exactly ONE sale is just as unambiguous
-        // as a payment from the dedicated single-sale route — so it's safe
-        // to set saleId here too. With 2+ allocations there's no single
-        // sale to point at, so it stays null (LedgerEntry.saleId per leg
-        // remains the source of truth for the breakdown in that case).
-        const singleAllocationSaleId =
-            partyType === "CUSTOMER" && allocations.length === 1
-                ? allocations[0].saleId
-                : null;
-
-        let partyLegDebit = 0;
-        let partyLegCredit = 0;
-        let partyBalanceDelta = 0;
-
-        if (partyType === "VENDOR" && vendor.category === "DEBIT") {
-            if (amount > currentBalance)
-                return res.status(400).json({
-                    success: false,
-                    error: `Payment amount (${amount}) exceeds vendor's outstanding balance (${currentBalance}).`,
-                });
-
-            partyLegDebit = amount;
-            partyBalanceDelta = -amount;
-        } else if (partyType === "VENDOR" && vendor.category === "CREDIT") {
-            partyLegDebit = amount;
-            partyBalanceDelta = amount;
-        } else if (partyType === "CUSTOMER") {
-            if (amount > currentBalance)
-                return res.status(400).json({
-                    success: false,
-                    error: `Payment amount (${amount}) exceeds customer's outstanding balance (${currentBalance}).`,
-                });
-
-            partyLegCredit = amount;
-            partyBalanceDelta = -amount;
-        }
-
-        let bankLegDebit = 0;
-        let bankLegCredit = 0;
-        let bankBalanceDelta = 0;
-
-        if (method === "BANK_TRANSFER") {
-            if (partyType === "VENDOR") {
-                bankLegDebit = amount;
-                bankBalanceDelta = -amount;
-            } else {
-                bankLegCredit = amount;
-                bankBalanceDelta = amount;
-            }
-        }
-
-        // ---- Cash leg direction ----
-        // VENDOR payment (money going out)  -> debit cash, balance decreases
-        // CUSTOMER payment (money coming in) -> credit cash, balance increases
-        let cashLegDebit = 0;
-        let cashLegCredit = 0;
-        let cashBalanceDelta = 0;
-
-        if (method === "CASH") {
-            if (partyType === "VENDOR") {
-                cashLegDebit = amount;
-                cashBalanceDelta = -amount;
-            } else {
-                cashLegCredit = amount;
-                cashBalanceDelta = amount;
-            }
-        }
-
-        // ---- Persist everything atomically ----
-        const result = await prisma.$transaction(async (tx) => {
-            // Get-or-create the singleton cash account inside the transaction
-            // so we always have a fresh, lockable reference to update.
-            const getCashAccount = async () => {
-                if (cashAccount) return cashAccount;
-
-                cashAccount = await tx.account.findFirst({ where: { type: "CASH" } });
-
-                if (!cashAccount) {
-                    cashAccount = await tx.account.create({
-                        data: { name: "Cash Account", type: "CASH", balance: 0 },
-                    });
-                }
-
-                return cashAccount;
-            };
-
-            const cash = method === "CASH" ? await getCashAccount() : null;
-
-            const payment = await tx.vendorCustomerPayment.create({
-                data: {
-                    partyType,
-                    vendorId: partyType === "VENDOR" ? vendorId : null,
-                    customerId: partyType === "CUSTOMER" ? customerId : null,
-                    // Only set for an unambiguous single-sale CUSTOMER
-                    // payment — null for VENDOR payments and for multi-sale
-                    // allocation payments (2+ sales).
-                    saleId: singleAllocationSaleId,
-                    method,
-                    amount,
-                    bankId: method === "BANK_TRANSFER" ? bankId : null,
-                    accountId: method === "CASH" ? cash.id : null,
-                    attachmentUrl: attachmentUrl,
-                    remarks: remarks ?? null,
-                    transactionDate: parsedDate,
-                },
-            });
-
-            // ---- Party leg(s) ----
-            if (partyType === "CUSTOMER") {
-                // One LedgerEntry per sale allocation, referencing the sale + its invoice number
-                for (const a of allocations) {
-                    const sale = salesById.get(a.saleId);
-                    const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
-                    const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${a.saleId})${
-                        remarks ? ` — ${remarks}` : ""
-                    }`;
-
-                    await tx.ledgerEntry.create({
-                        data: {
-                            accountId: partyAccount.id,
-                            entryType: "PAYMENT",
-                            debit: 0,
-                            credit: a.amount,
-                            saleId: a.saleId,
-                            vendorCustomerPaymentId: payment.id,
-                            transactionDate: parsedDate,
-                            remarks: entryRemarks,
-                        },
-                    });
-
-                    // ---- Cash leg per allocation (CUSTOMER + CASH only) ----
-                    if (method === "CASH") {
-                        await tx.ledgerEntry.create({
-                            data: {
-                                accountId: cash.id,
-                                entryType: "PAYMENT",
-                                debit: 0,
-                                credit: a.amount,
-                                saleId: a.saleId,
-                                vendorCustomerPaymentId: payment.id,
-                                transactionDate: parsedDate,
-                                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${a.saleId})${
-                                    remarks ? ` — ${remarks}` : ""
-                                }`,
-                            },
-                        });
-                    }
-
-                    // Update the sale's paid amount + status
-                    const newPaidAmount = sale.paidAmount + a.amount;
-                    const newStatus =
-                        newPaidAmount >= sale.sellPrice ? "PAID" : "PARTIAL";
-
-                    await tx.sale.update({
-                        where: { id: a.saleId },
-                        data: {
-                            paidAmount: newPaidAmount,
-                            paymentStatus: newStatus,
-                        },
-                    });
-                }
-            } else {
-                // VENDOR — single combined leg, same as before
-                await tx.ledgerEntry.create({
-                    data: {
-                        accountId: partyAccount.id,
-                        entryType: "PAYMENT",
-                        debit: partyLegDebit,
-                        credit: partyLegCredit,
-                        vendorCustomerPaymentId: payment.id,
-                        transactionDate: parsedDate,
-                        remarks: remarks ?? null,
-                    },
-                });
-
-                // ---- Cash leg (VENDOR + CASH) — single combined entry ----
-                if (method === "CASH") {
-                    await tx.ledgerEntry.create({
-                        data: {
-                            accountId: cash.id,
-                            entryType: "PAYMENT",
-                            debit: cashLegDebit,
-                            credit: cashLegCredit,
-                            vendorCustomerPaymentId: payment.id,
-                            transactionDate: parsedDate,
-                            remarks: remarks ?? null,
-                        },
-                    });
-                }
-            }
-
-            await tx.account.update({
-                where: { id: partyAccount.id },
-                data: { balance: { increment: partyBalanceDelta } },
-            });
-
-            // ---- Bank leg (only for BANK_TRANSFER) — single combined entry ----
-            if (method === "BANK_TRANSFER") {
-                await tx.account.update({
-                    where: { id: bank.account.id },
-                    data: { balance: { increment: bankBalanceDelta } },
-                });
-
-                await tx.ledgerEntry.create({
-                    data: {
-                        accountId: bank.account.id,
-                        entryType: "PAYMENT",
-                        debit: bankLegDebit,
-                        credit: bankLegCredit,
-                        vendorCustomerPaymentId: payment.id,
-                        transactionDate: parsedDate,
-                        remarks: remarks ?? null,
-                    },
-                });
-            }
-
-            // ---- Cash account balance update (only for CASH) ----
-            if (method === "CASH") {
-                await tx.account.update({
-                    where: { id: cash.id },
-                    data: { balance: { increment: cashBalanceDelta } },
-                });
-            }
-
-            return payment;
-        }, { timeout: 30000, maxWait: 10000 });
-
-        const fullPayment = await prisma.vendorCustomerPayment.findUnique({
-            where: { id: result.id },
-            include: {
-                vendor: { select: { id: true, vendorName: true, category: true } },
-                customer: { select: { id: true, customerName: true } },
-                sale: {
-                    select: {
-                        id: true,
-                        documentNo: true,
-                        invoice: { select: { id: true, invoiceNo: true } },
-                    },
-                },
-                bank: { select: { id: true, bankName: true, accountNumber: true } },
-                account: { select: { id: true, name: true, type: true, balance: true } },
-                ledgerEntries: true,
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: partyAccount.id,
+              entryType: "PAYMENT",
+              debit: 0,
+              credit: a.amount,
+              saleId: a.saleId,
+              vendorCustomerPaymentId: payment.id,
+              transactionDate: parsedDate,
+              remarks: entryRemarks,
             },
+          });
+
+          if (method === "CASH") {
+            await tx.ledgerEntry.create({
+              data: {
+                accountId: cash.id,
+                entryType: "PAYMENT",
+                debit: 0,
+                credit: a.amount,
+                saleId: a.saleId,
+                vendorCustomerPaymentId: payment.id,
+                transactionDate: parsedDate,
+                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${a.saleId})${remarks ? ` — ${remarks}` : ""}`,
+              },
+            });
+          }
+
+          const newPaidAmount = sale.paidAmount + a.amount;
+          const newStatus = newPaidAmount >= sale.sellPrice ? "PAID" : "PARTIAL";
+
+          await tx.sale.update({
+            where: { id: a.saleId },
+            data: { paidAmount: newPaidAmount, paymentStatus: newStatus },
+          });
+        }
+      } else {
+        await tx.ledgerEntry.create({
+          data: {
+            accountId: partyAccount.id,
+            entryType: "PAYMENT",
+            debit: partyLegDebit,
+            credit: partyLegCredit,
+            vendorCustomerPaymentId: payment.id,
+            transactionDate: parsedDate,
+            remarks: remarks ?? null,
+          },
         });
 
-        res.status(201).json({ success: true, data: fullPayment });
-    } catch (err) {
-        console.error("Error creating vendor/customer payment:", err);
-        res.status(500).json({ success: false, error: "Failed to create payment" });
-    }
+        if (method === "CASH") {
+          await tx.ledgerEntry.create({
+            data: {
+              accountId: cash.id,
+              entryType: "PAYMENT",
+              debit: cashLegDebit,
+              credit: cashLegCredit,
+              vendorCustomerPaymentId: payment.id,
+              transactionDate: parsedDate,
+              remarks: remarks ?? null,
+            },
+          });
+        }
+      }
+
+      await tx.account.update({
+        where: { id: partyAccount.id },
+        data: { balance: { increment: partyBalanceDelta } },
+      });
+
+      if (method === "BANK_TRANSFER") {
+        await tx.account.update({
+          where: { id: bank.account.id },
+          data: { balance: { increment: bankBalanceDelta } },
+        });
+
+        await tx.ledgerEntry.create({
+          data: {
+            accountId: bank.account.id,
+            entryType: "PAYMENT",
+            debit: bankLegDebit,
+            credit: bankLegCredit,
+            vendorCustomerPaymentId: payment.id,
+            transactionDate: parsedDate,
+            remarks: remarks ?? null,
+          },
+        });
+      }
+
+      if (method === "CASH") {
+        await tx.account.update({
+          where: { id: cash.id },
+          data: { balance: { increment: cashBalanceDelta } },
+        });
+      }
+
+      return payment;
+    }, { timeout: 30000, maxWait: 10000 });
+
+    const fullPayment = await prisma.vendorCustomerPayment.findUnique({
+      where: { id: result.id },
+      include: {
+        vendor: { select: { id: true, vendorName: true, category: true } },
+        customer: { select: { id: true, customerName: true } },
+        sale: { select: { id: true, documentNo: true, invoice: { select: { id: true, invoiceNo: true } } } },
+        bank: { select: { id: true, bankName: true, accountNumber: true } },
+        account: { select: { id: true, name: true, type: true, balance: true } },
+        createdBy: { select: { id: true, fullName: true } }, // NEW
+        branch: { select: { id: true, name: true, code: true } }, // NEW
+        ledgerEntries: true,
+      },
+    });
+
+    res.status(201).json({ success: true, data: fullPayment });
+  } catch (err) {
+    console.error("Error creating vendor/customer payment:", err);
+    res.status(500).json({ success: false, error: "Failed to create payment" });
+  }
 });
 
 // ---- GET ALL ----
@@ -550,13 +396,13 @@ router.get("/", async (req, res) => {
       customerId,
       saleId,
       method,
+      branchId, // NEW
       dateFrom,
       dateTo,
       order,
       search,
     } = req.query;
 
-    // Each condition below is pushed into `filters` and combined with AND.
     const filters = [];
 
     if (partyType) {
@@ -577,6 +423,10 @@ router.get("/", async (req, res) => {
 
     if (method) {
       filters.push({ method: String(method).toUpperCase() });
+    }
+
+    if (branchId) { // NEW
+      filters.push({ branchId });
     }
 
     if (dateFrom || dateTo) {
@@ -600,13 +450,15 @@ router.get("/", async (req, res) => {
       }
     }
 
-    // Search across: the payment's own remarks, the vendor/customer name,
-    // or the linked sale's documentNo/invoiceNo (only present for
-    // single-sale payments — walk-in or otherwise).
+    // Search across: the payment's own remarks/pvNo/bankSlipNo, the
+    // vendor/customer name, or the linked sale's documentNo/invoiceNo (only
+    // present for single-sale payments — walk-in or otherwise).
     if (search) {
       filters.push({
         OR: [
           { remarks: { contains: search, mode: "insensitive" } },
+          { pvNo: { contains: search, mode: "insensitive" } }, // NEW
+          { bankSlipNo: { contains: search, mode: "insensitive" } }, // NEW
           { vendor: { vendorName: { contains: search, mode: "insensitive" } } },
           { customer: { customerName: { contains: search, mode: "insensitive" } } },
           { sale: { documentNo: { contains: search, mode: "insensitive" } } },
@@ -623,8 +475,6 @@ router.get("/", async (req, res) => {
       include: {
         vendor: { select: { id: true, vendorName: true, category: true } },
         customer: { select: { id: true, customerName: true } },
-        // Only ever populated for single-sale payments (walk-in or
-        // customer-linked) — null for multi-sale allocation payments.
         sale: {
           select: {
             id: true,
@@ -635,14 +485,13 @@ router.get("/", async (req, res) => {
         },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
+        createdBy: { select: { id: true, fullName: true } }, // NEW
+        branch: { select: { id: true, name: true, code: true } }, // NEW
         ledgerEntries: true,
       },
       orderBy: { transactionDate: sortDirection },
     });
 
-    // A payment is "walk-in" when it's tied to exactly one sale (saleId
-    // set) but has no customer attached — as opposed to a real customer
-    // payment (customerId set) or a vendor payment (vendorId set).
     const data = payments.map((p) => ({
       ...p,
       isWalkIn: !p.customerId && !p.vendorId && !!p.saleId,
@@ -676,6 +525,8 @@ router.get("/:id", async (req, res) => {
         },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
+        createdBy: { select: { id: true, fullName: true } }, // NEW
+        branch: { select: { id: true, name: true, code: true } }, // NEW
         ledgerEntries: true,
       },
     });
@@ -697,8 +548,6 @@ router.get("/:id", async (req, res) => {
 });
 
 
-// ---- PUT (UPDATE) ----
-// ---- PUT (UPDATE) ----
 router.put("/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -709,13 +558,8 @@ router.put("/:id", async (req, res) => {
       transactionDate,
       method,
       bankId,
+      bankSlipNo,
       saleAllocations, // Only applies to MULTI-SALE customer payments (JSON
-                        // string or array: [{ saleId, amount }]) — the FULL
-                        // new distribution across invoices. Omit entirely to
-                        // leave the existing per-invoice allocation untouched.
-                        // NOT applicable to single-sale payments (walk-in or
-                        // customer-linked via /api/Salepayment) — those just
-                        // use `amount` directly instead.
     } = req.body;
 
     // ---- Load existing payment ----
@@ -729,11 +573,6 @@ router.put("/:id", async (req, res) => {
 
     const partyType = existing.partyType;
 
-    // A payment is a "single-sale payment" (created via the /api/Salepayment
-    // route — walk-in OR customer-linked, doesn't matter which) whenever it
-    // has saleId set directly on the payment itself. A "multi-sale" customer
-    // payment (created via the saleAllocations route) never has saleId set
-    // on the payment — it's spread across per-sale LedgerEntry rows instead.
     const isMultiSaleCustomer = partyType === "CUSTOMER" && !existing.saleId;
     const isSingleSalePayment = partyType === "CUSTOMER" && !!existing.saleId;
 
@@ -743,15 +582,6 @@ router.put("/:id", async (req, res) => {
         error: "saleAllocations does not apply to a single-sale payment — use amount instead",
       });
     }
-
-    // ---- Single-sale payment: also accept a single-element saleAllocations
-    //      array as an alternate way to specify `amount` for that SAME sale
-    //      (since the multi-sale POST route now also sets saleId when it's
-    //      given exactly one allocation — a frontend that always sends
-    //      saleAllocations for CUSTOMER payments shouldn't break here).
-    //      Re-pointing to a different sale, or splitting into multiple
-    //      sales via edit, is NOT supported — that would require
-    //      restructuring the payment entirely. ----
     let singleSaleAllocationAmount = null;
     if (isSingleSalePayment && saleAllocations !== undefined && saleAllocations !== null) {
       let parsedAllocations;
@@ -905,14 +735,6 @@ router.put("/:id", async (req, res) => {
       return res.status(400).json({ success: false, error: "bankId must not be set when method is CASH" });
 
     const parsedDate = transactionDate ? new Date(transactionDate) : existing.transactionDate;
-
-    // ---- Load party account ----
-    // - VENDOR: as before.
-    // - Multi-sale CUSTOMER: as before, via existing.customerId.
-    // - Single-sale payment: load the linked Sale itself (via existing.saleId)
-    //   to get its customer (if any), refund info, and current paid amount.
-    //   `partyAccount` stays null for a walk-in single-sale payment — there's
-    //   simply no customer ledger/balance to touch in that case.
     let partyAccount = null;
     let vendor = null;
     let customer = null;
@@ -950,11 +772,6 @@ router.put("/:id", async (req, res) => {
       // else: walk-in — partyAccount stays null, no customer leg at all
     }
 
-    // ---- Single-sale payment: validate newAmount against the sale's
-    //      refund-adjusted remaining due, after reversing this payment's
-    //      OWN old contribution (so editing a payment's amount up or down
-    //      is validated against the correct baseline, not double-counting
-    //      what it already contributed). ----
     let singleSaleCtx = null;
     if (isSingleSalePayment) {
       const refund = sale.refunds && sale.refunds.length > 0 ? sale.refunds[0] : null;
@@ -1164,8 +981,8 @@ router.put("/:id", async (req, res) => {
       if (partyType === "VENDOR") {
         const restoredCashBalance = newCashAccount
           ? (oldCashAccount?.id === newCashAccount.id
-              ? newCashAccount.balance + existing.amount
-              : newCashAccount.balance)
+            ? newCashAccount.balance + existing.amount
+            : newCashAccount.balance)
           : 0;
 
         if (newAmount > restoredCashBalance)
@@ -1218,12 +1035,6 @@ router.put("/:id", async (req, res) => {
 
       // 2. Delete old ledger entries
       await tx.ledgerEntry.deleteMany({ where: { vendorCustomerPaymentId: id } });
-
-      // 3. Update the payment record. `saleId` is normally fixed at creation
-      //    and never touched here — EXCEPT for the multi-sale CUSTOMER
-      //    branch, where it may need to be set (or reset to null) if the
-      //    allocation collapsed to/expanded from exactly one sale this edit
-      //    (see multiSaleFinalSaleId above).
       const updated = await tx.vendorCustomerPayment.update({
         where: { id },
         data: {
@@ -1233,6 +1044,7 @@ router.put("/:id", async (req, res) => {
           accountId: newMethod === "CASH" ? cash.id : null,
           attachmentUrl: attachmentUrl ?? existing.attachmentUrl,
           remarks: remarks ?? existing.remarks,
+          bankSlipNo: bankSlipNo ?? existing.bankSlipNo,
           transactionDate: parsedDate,
           ...(isMultiSaleCustomer ? { saleId: multiSaleFinalSaleId } : {}),
         },
@@ -1243,9 +1055,8 @@ router.put("/:id", async (req, res) => {
         for (const a of allocations) {
           const s = salesById.get(a.saleId);
           const invoiceNo = s.invoice?.invoiceNo ?? "N/A";
-          const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${a.saleId})${
-            (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
-          }`;
+          const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${a.saleId})${(remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+            }`;
 
           await tx.ledgerEntry.create({
             data: {
@@ -1271,9 +1082,8 @@ router.put("/:id", async (req, res) => {
                 saleId: a.saleId,
                 vendorCustomerPaymentId: id,
                 transactionDate: parsedDate,
-                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${a.saleId})${
-                  (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
-                }`,
+                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${a.saleId})${(remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+                  }`,
               },
             });
           }
@@ -1290,9 +1100,8 @@ router.put("/:id", async (req, res) => {
         for (const [saleId, oldAmt] of oldAllocationMap.entries()) {
           const s = salesById.get(saleId);
           const invoiceNo = s?.invoice?.invoiceNo ?? "N/A";
-          const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${saleId})${
-            (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
-          }`;
+          const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${saleId})${(remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+            }`;
 
           await tx.ledgerEntry.create({
             data: {
@@ -1318,24 +1127,16 @@ router.put("/:id", async (req, res) => {
                 saleId,
                 vendorCustomerPaymentId: id,
                 transactionDate: parsedDate,
-                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${saleId})${
-                  (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
-                }`,
+                remarks: `Cash received against Invoice ${invoiceNo} (Sale ${saleId})${(remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+                  }`,
               },
             });
           }
         }
       } else if (isSingleSalePayment) {
-        // Single-sale payment (walk-in OR customer-linked) — exactly one
-        // sale, so both the customer leg (if any) and the cash/bank leg
-        // get created here directly, each tagged with saleId. This means
-        // the GENERIC bank-ledger-entry creation further below (originally
-        // shared with VENDOR) must be SKIPPED for this branch — otherwise
-        // the bank leg would be booked twice for the same payment.
         const invoiceNo = sale.invoice?.invoiceNo ?? "N/A";
-        const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${sale.id})${
-          (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
-        }`;
+        const entryRemarks = `Payment against Invoice ${invoiceNo} (Sale ${sale.id})${(remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+          }`;
 
         if (partyAccount) {
           await tx.ledgerEntry.create({
@@ -1362,9 +1163,8 @@ router.put("/:id", async (req, res) => {
               saleId: sale.id,
               vendorCustomerPaymentId: id,
               transactionDate: parsedDate,
-              remarks: `Cash received against Invoice ${invoiceNo} (Sale ${sale.id})${
-                (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
-              }`,
+              remarks: `Cash received against Invoice ${invoiceNo} (Sale ${sale.id})${(remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+                }`,
             },
           });
         } else {
@@ -1377,9 +1177,8 @@ router.put("/:id", async (req, res) => {
               saleId: sale.id,
               vendorCustomerPaymentId: id,
               transactionDate: parsedDate,
-              remarks: `Bank transfer received against Invoice ${invoiceNo} (Sale ${sale.id})${
-                (remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
-              }`,
+              remarks: `Bank transfer received against Invoice ${invoiceNo} (Sale ${sale.id})${(remarks ?? existing.remarks) ? ` — ${remarks ?? existing.remarks}` : ""
+                }`,
             },
           });
         }
@@ -1470,8 +1269,8 @@ router.put("/:id", async (req, res) => {
         });
       }
 
-    return updated;
-}, { timeout: 30000, maxWait: 10000 });
+      return updated;
+    }, { timeout: 30000, maxWait: 10000 });
 
     const fullPayment = await prisma.vendorCustomerPayment.findUnique({
       where: { id: result.id },
@@ -1487,6 +1286,8 @@ router.put("/:id", async (req, res) => {
         },
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
+        createdBy: { select: { id: true, fullName: true } }, // NEW
+        branch: { select: { id: true, name: true, code: true } }, // NEW
         ledgerEntries: true,
       },
     });
@@ -1624,8 +1425,8 @@ router.delete("/:id", async (req, res) => {
           newPaidAmount <= 0
             ? "DUE"
             : newPaidAmount >= Number(sale.sellPrice || 0)
-            ? "PAID"
-            : "PARTIAL";
+              ? "PAID"
+              : "PARTIAL";
 
         await tx.sale.update({
           where: { id: saleId },

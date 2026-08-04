@@ -36,13 +36,6 @@ async function authenticate(req, res, next) {
 		return res.status(401).json({ error: "Invalid or expired token" });
 	}
 }
-
-/* ------------------------------------------------------------------------ */
-/* ✅ CREATE SALES (Invoice + Multiple Sales + Vendor Ledger Entries) */
-/* ------------------------------------------------------------------------ */
-/* ======================= GET SALES (PAGINATED) =======================
-   Paginates at the Sale level (one row per table row on the frontend),
-   not per-invoice, so `limit` always matches rows-per-page exactly. */
 router.get("/", authenticate, async (req, res) => {
 	try {
 		const { search, dateFrom, dateTo, order, createdById, branchId, tz, page = 1, limit = 20 } = req.query;
@@ -446,10 +439,6 @@ router.get("/customerSales", authenticate, async (req, res) => {
 		if (!customerId) {
 			return res.status(400).json({ success: false, error: "customerId is required" });
 		}
-
-		// paymentStatus can be a single value ("DUE") or comma-separated ("DUE,PARTIAL").
-		// Defaults to DUE + PARTIAL if not provided, since that's the common use case
-		// (showing a customer's outstanding sales).
 		const statusList = paymentStatus
 			? paymentStatus.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
 			: ["DUE", "PARTIAL"];
@@ -501,8 +490,6 @@ router.get("/customerSales", authenticate, async (req, res) => {
 					},
 					orderBy: { paymentDate: "asc" }
 				},
-				// Minimal selection to check if this sale has since been refunded,
-				// and by how much — needed to adjust the due amount below.
 				refunds: {
 					select: {
 						id: true,
@@ -514,21 +501,11 @@ router.get("/customerSales", authenticate, async (req, res) => {
 		});
 
 		const data = sales
-			// Exclude the negative mirror sale (identified by refundRecordId
-			// being set) in JS rather than in the Prisma `where` clause —
-			// combining that scalar filter with the `refunds` relation include
-			// was causing the query to return zero rows entirely on Mongo.
 			.filter((s) => !s.refundRecordId)
 			.map((s) => {
-				// A sale can have at most one refund (enforced when the refund is
-				// created), so just take the first one if present.
 				const refund = s.refunds && s.refunds.length > 0 ? s.refunds[0] : null;
 
 				const originalDueAmount = s.sellPrice - (s.paidAmount || 0);
-
-				// If this sale was refunded, whatever was refunded to the customer
-				// reduces what they still owe on it. e.g. sale 2000, paid 500 →
-				// due 1500; refund of 1350 to the customer → remaining due 150.
 				const netRefundToCustomer = refund ? Number(refund.netRefundToCustomer || 0) : 0;
 				const dueAmount = originalDueAmount - netRefundToCustomer;
 
@@ -571,8 +548,6 @@ router.get("/customerSales", authenticate, async (req, res) => {
 					createdAt: s.createdAt
 				};
 			})
-			// Drop any sale whose refund brought the due amount to zero or
-			// below (fully settled, or even overpaid back via refund).
 			.filter((s) => s.dueAmount > 0);
 
 		res.json({ success: true, data });
@@ -661,11 +636,6 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 							},
 							orderBy: { paymentDate: "asc" },
 						},
-						// Minimal selection just to detect whether this sale has
-						// already been refunded (see JS filter below) — Mongo's
-						// relation filters (e.g. `refunds: { none: {} }` inside
-						// `where`) don't reliably combine with other conditions,
-						// so we filter in JS instead of in the query itself.
 						refunds: {
 							select: { id: true },
 						},
@@ -678,21 +648,10 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 			return res.status(404).json({ success: false, error: "Invoice not found" });
 		}
 
-		// Exclude BOTH sides of any refund:
-		//  - refundRecordId != null      → this row IS the negative mirror sale
-		//  - refunds.length > 0          → this row IS the original sale that has
-		//                                   since been refunded (its own status/
-		//                                   fields are left untouched by the
-		//                                   refund route, so we filter it out here)
 		const activeSales = invoice.sales.filter(
 			(sale) => !sale.refundRecordId && (!sale.refunds || sale.refunds.length === 0)
 		);
-
-		// Enrich each sale with a normalised paymentSummary so the
-		// frontend never has to branch on paymentType itself.
 		const enrichedSales = activeSales.map((sale) => {
-			// Drop the helper `refunds` array — it was only fetched to
-			// detect refund status above and isn't part of the public shape.
 			const { refunds, ...saleWithoutRefunds } = sale;
 			const pt = String(sale.paymentType).toUpperCase();
 			let paymentSummary;
@@ -795,8 +754,6 @@ router.get("/saleId/:saleId", authenticate, async (req, res) => {
 						account: { select: { balance: true } }
 					}
 				},
-				// Minimal selection to check if this sale has since been
-				// refunded, and by how much — same logic as /customerSales.
 				refunds: {
 					select: {
 						id: true,
@@ -810,16 +767,9 @@ router.get("/saleId/:saleId", authenticate, async (req, res) => {
 		if (!sale) {
 			return res.status(404).json({ success: false, error: "Sale not found" });
 		}
-
-		// A sale can have at most one refund (enforced when the refund is
-		// created), so just take the first one if present.
 		const refund = sale.refunds && sale.refunds.length > 0 ? sale.refunds[0] : null;
 
 		const originalDueAmount = sale.sellPrice - (sale.paidAmount || 0);
-
-		// If this sale was refunded, whatever was refunded to the customer
-		// reduces what they still owe on it. e.g. sale 2000, paid 500 →
-		// due 1500; refund of 1350 to the customer → remaining due 150.
 		const netRefundToCustomer = refund ? Number(refund.netRefundToCustomer || 0) : 0;
 		const dueAmount = originalDueAmount - netRefundToCustomer;
 
@@ -861,15 +811,6 @@ router.get("/invoice-no", authenticate, async (req, res) => {
 	}
 });
 
-
-
-
-/* ===========================
-	CREATE SALES (INVOICE HAS userId)
-=========================== */
-/* ===========================
-	CREATE SALES (INVOICE HAS userId)
-=========================== */
 router.post("/", authenticate, async (req, res) => {
 	const { saleDate, sales = [] } = req.body;
 
@@ -901,9 +842,6 @@ router.post("/", authenticate, async (req, res) => {
 
 			if (pt === "BANK_TRANSFER" && !s.bankId)
 				throw new Error("bankId required for BANK_TRANSFER sales");
-
-			// if (pt === "BANK_TRANSFER" && paid < sell && !s.customerId)
-			//     throw new Error("customerId required for BANK_TRANSFER sales when paidAmount is less than sellPrice");
 
 			if (pt === "PARTIAL") {
 				if (!Array.isArray(s.paymentLegs) || s.paymentLegs.length === 0)
@@ -987,10 +925,6 @@ router.post("/", authenticate, async (req, res) => {
 				}
 			}
 		}
-
-		/* ======================================================
-		   2️⃣  TRANSACTION PHASE
-		====================================================== */
 		const businessDate = saleDate ? new Date(saleDate) : new Date();
 
 		const result = await prisma.$transaction(async (tx) => {
@@ -1006,9 +940,6 @@ router.post("/", authenticate, async (req, res) => {
 				},
 			});
 
-			/* ──────────────────────────────────────────────────────
-			   HELPER: get-or-create the singleton CASH account
-			   ────────────────────────────────────────────────────── */
 			let cashAccount = null;
 			const getCashAccount = async () => {
 				if (cashAccount) return cashAccount;
@@ -1029,10 +960,6 @@ router.post("/", authenticate, async (req, res) => {
 
 				return cashAccount;
 			};
-
-			/* ──────────────────────────────────────────────────────
-			   HELPER: record money received into bank account
-			   ────────────────────────────────────────────────────── */
 			const creditBank = async (bankId, amount, saleId, label) => {
 				const bank = bankMap[bankId];
 				if (!bank) throw new Error(`Bank not found: ${bankId}`);
@@ -1055,10 +982,6 @@ router.post("/", authenticate, async (req, res) => {
 					data: { balance: { increment: amount } },
 				});
 			};
-
-			/* ──────────────────────────────────────────────────────
-			   HELPER: record money received into cash account
-			   ────────────────────────────────────────────────────── */
 			const creditCash = async (amount, saleId, label) => {
 				const cash = await getCashAccount();
 
@@ -1081,9 +1004,6 @@ router.post("/", authenticate, async (req, res) => {
 				});
 			};
 
-			/* ──────────────────────────────────────────────────────
-			   HELPER: record a credit sale against a customer
-			   ────────────────────────────────────────────────────── */
 			const creditCustomer = async (customerId, saleAmount, paidNow, saleId, label) => {
 				const cust = customerMap[customerId];
 				if (!cust) throw new Error(`Customer not found: ${customerId}`);
@@ -1124,14 +1044,6 @@ router.post("/", authenticate, async (req, res) => {
 				});
 			};
 
-			/* ──────────────────────────────────────────────────────
-			   HELPER: record a PARTIAL sale that includes a CREDIT leg.
-			   Books the FULL sellPrice as one SALE debit on the credit
-			   customer's ledger, then books every CASH/BANK_TRANSFER
-			   leg both into its own account AND as a PAYMENT credit on
-			   that same customer's ledger (so the customer's ledger
-			   shows the whole invoice picture, not just the unpaid part).
-			   ────────────────────────────────────────────────────── */
 			const processPartialWithCredit = async (s, sale, sell, creditLeg) => {
 				const cust = customerMap[creditLeg.customerId];
 				if (!cust) throw new Error(`Customer not found: ${creditLeg.customerId}`);
@@ -1204,12 +1116,7 @@ router.post("/", authenticate, async (req, res) => {
 
 						totalPaidNow += legAmount;
 					}
-					// CREDIT leg(s): no extra ledger entry needed here —
-					// already covered by the full SALE debit booked above.
 				}
-
-				// 2) Net the customer's balance: full sell price minus whatever
-				//    was actually paid via cash/bank legs right now.
 				await tx.account.update({
 					where: { id: cust.account.id },
 					data: { balance: { increment: sell - totalPaidNow } },
@@ -1225,11 +1132,6 @@ router.post("/", authenticate, async (req, res) => {
 				const vatAmt = Number(s.vatAmount || 0);
 				const profit = sell - net - vatAmt;
 				const pt = String(s.paymentType).toUpperCase();
-
-				// For PARTIAL sales, the customer (if any) only comes from the
-				// CREDIT leg inside paymentLegs — s.customerId isn't set at the
-				// top level for this payment type, so fall back to that leg's
-				// customerId instead of defaulting to null/WALKIN.
 				const partialCreditLeg = pt === "PARTIAL"
 					? s.paymentLegs.find(l => String(l.method).toUpperCase() === "CREDIT")
 					: null;
@@ -1304,13 +1206,8 @@ router.post("/", authenticate, async (req, res) => {
 					const creditLeg = partialCreditLeg;
 
 					if (creditLeg) {
-						// New flow: CASH+CREDIT or BANK_TRANSFER+CREDIT (or any mix
-						// that includes a CREDIT leg) — full sellPrice booked to
-						// customer, cash/bank legs booked in both places.
 						await processPartialWithCredit(s, sale, sell, creditLeg);
 					} else {
-						// Unchanged flow: e.g. CASH + BANK_TRANSFER, no credit leg
-						// involved, so no customer ledger entries at all.
 						for (const leg of s.paymentLegs) {
 							const legMethod = String(leg.method).toUpperCase();
 							const legAmount = Number(leg.amount);
@@ -1343,10 +1240,6 @@ router.post("/", authenticate, async (req, res) => {
 				}
 
 			}
-
-			/* ── Update invoice totals — computed via live aggregate, not manual
-	   accumulation, so this stays correct even if other routes (edit,
-	   refund) touch this invoice's sales later ── */
 			const totals = await tx.sale.aggregate({
 				where: { invoiceId: invoice.id },
 				_sum: { netPrice: true, sellPrice: true, profit: true },
@@ -1414,21 +1307,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		if (!existingInvoice) {
 			return res.status(404).json({ success: false, error: "Invoice not found" });
 		}
-
-		/* ══════════════════════════════════════════════════════
-		   Exclude BOTH sides of any refund from the editable set:
-		     - refundRecordId != null  → this row IS the negative mirror sale
-		     - refunds.length > 0      → this row IS the original sale that
-		                                  has since been refunded (its own
-		                                  status/fields are left untouched by
-		                                  the refund route, so we filter it
-		                                  out here explicitly)
-		   These sales are never fetched by the GET route, so the frontend
-		   can never send them back in the payload — meaning they'd normally
-		   look "deleted" (omitted) and get destructively reversed. We treat
-		   them as untouchable: not editable, and never eligible for the
-		   deleted-sales cleanup path either.
-		══════════════════════════════════════════════════════ */
 		const editableSales = existingInvoice.sales.filter(
 			(s) => !s.refundRecordId && (!s.refunds || s.refunds.length === 0)
 		);
@@ -1443,14 +1321,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				);
 			}
 		}
-
-		/* ======================================================
-		   2️⃣  DELETED SALES (omitted from payload)
-		   Computed ONLY from editableSales — refunded sales and
-		   their negative mirrors are never included here, so they
-		   can never be deleted/reversed just because the frontend
-		   didn't (and couldn't) send them back.
-		====================================================== */
 		const payloadSaleIds = new Set(sales.map(s => s.id));
 		const deletedSales = editableSales.filter(s => !payloadSaleIds.has(s.id));
 
@@ -1460,10 +1330,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		const vendorIdSet = new Set();
 		const customerIdSet = new Set();
 		const bankIdSet = new Set();
-
-		// Collect from existing sales (for reversal) — safe to include all
-		// sales here (even refunded ones) since this is only used to seed
-		// initial account balances; it doesn't affect what gets reversed.
 		existingInvoice.sales.forEach(s => {
 			if (s.vendorId) vendorIdSet.add(s.vendorId);
 			if (s.customerId) customerIdSet.add(s.customerId);
@@ -1503,17 +1369,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		const bankMap = new Map(banks.map(b => [b.id, b]));
 
 		const businessDate = saleDate ? new Date(saleDate) : new Date();
-
-		/* ══════════════════════════════════════════════════════
-		   Did the invoice's business date actually change?
-		   Compared once, at invoice level, against the value
-		   currently stored on the invoice — NOT recomputed per
-		   sale, since businessDate applies to the whole invoice.
-		   Only when this is true do we touch existing ledger
-		   entries' transactionDate / SalePayment.paymentDate;
-		   otherwise they're left exactly as they were, even if
-		   other fields on a sale changed.
-		══════════════════════════════════════════════════════ */
 		const dateChanged =
 			new Date(existingInvoice.saleDate).getTime() !== businessDate.getTime();
 
@@ -1560,9 +1415,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			const setBal = (id, v) => { balances.set(id, Number(v)); touchedAccounts.add(id); };
 			const adjBal = (id, d) => setBal(id, getBal(id) + d);
 
-			/* ──────────────────────────────────────────────────────
-			   HELPER: get-or-create the singleton CASH account
-			   ────────────────────────────────────────────────────── */
 			const getCashAccount = async () => {
 				if (cashAccount) return cashAccount;
 
@@ -1573,12 +1425,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 				return cashAccount;
 			};
-
-			/* ══════════════════════════════════════════════════════
-			   HELPERS — mirror the POST helpers exactly
-			══════════════════════════════════════════════════════ */
-
-			/** Apply a bank-received-payment ledger entry (money in) */
 			const applyBankPayment = async (bankId, amount, saleId) => {
 				const bank = bankMap.get(bankId);
 				if (!bank) throw new Error(`Bank not found: ${bankId}`);
@@ -1666,15 +1512,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				});
 				adjBal(cust.account.id, -(oldSell - oldPaid));
 			};
-
-			/* ──────────────────────────────────────────────────────
-			   HELPER: apply a PARTIAL sale that includes a CREDIT leg.
-			   Mirrors the POST route's processPartialWithCredit:
-			   books the FULL sellPrice as one SALE debit on the credit
-			   customer's ledger, then books every CASH/BANK_TRANSFER
-			   leg both into its own account AND as a PAYMENT credit on
-			   that same customer's ledger.
-			   ────────────────────────────────────────────────────── */
 			const applyPartialWithCredit = async (payload, saleId, creditLeg) => {
 				const cust = customerMap.get(creditLeg.customerId);
 				if (!cust) throw new Error(`Customer not found: ${creditLeg.customerId}`);
@@ -1746,26 +1583,13 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 						totalPaidNow += legAmount;
 					}
-					// CREDIT leg(s): no extra ledger entry — already covered
-					// by the full SALE debit booked above.
 				}
 
 				adjBal(cust.account.id, sell - totalPaidNow);
 			};
-
-			/* ──────────────────────────────────────────────────────
-			   HELPER: reverse a PARTIAL sale that included a CREDIT leg
-			   (i.e. undo exactly what applyPartialWithCredit created).
-			   `sale` can be either an existingInvoice.sales row (for
-			   deleted sales) or `current` from saleMap (for edited
-			   sales) — both carry `.payments`, `.id`, `.sellPrice`.
-			   ────────────────────────────────────────────────────── */
 			const reversePartialWithCredit = async (sale, creditLeg) => {
 				const cust = customerMap.get(creditLeg.customerId);
 				if (!cust) return;
-
-				// Delete the consolidated SALE debit + all PAYMENT credits
-				// booked on the customer's ledger for this sale.
 				await tx.ledgerEntry.deleteMany({
 					where: { saleId: sale.id, accountId: cust.account.id, entryType: { in: ["SALE", "PAYMENT"] } },
 				});
@@ -1783,19 +1607,12 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						await reverseBankPayment(leg.bankId, legAmount, sale.id);
 						oldTotalPaidNow += legAmount;
 					}
-					// CREDIT leg(s): no separate account to reverse here —
-					// it was folded into the consolidated customer entries above.
 				}
 
 				const oldSell = Number(sale.sellPrice);
 				adjBal(cust.account.id, -(oldSell - oldTotalPaidNow));
 			};
 
-			/* ══════════════════════════════════════════════════════
-			   4.1  DELETE OMITTED SALES (full reversal)
-			   `deletedSales` is already scoped to editableSales only,
-			   so refunded sales / negative mirrors never land here.
-			══════════════════════════════════════════════════════ */
 			for (const sale of deletedSales) {
 				const net = Number(sale.netPrice);
 				const sell = Number(sale.sellPrice);
@@ -1947,11 +1764,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					adjBal(vendor.account.id, isDebit ? (newNet - oldNet) : -(newNet - oldNet));
 
 				} else if (dateChanged) {
-					// Nothing about the vendor leg changed except the invoice
-					// date — the branches above only stamp transactionDate
-					// when they're rewriting/recreating the row for some
-					// other reason, so this is the only place a pure date
-					// edit on an otherwise-untouched vendor entry gets synced.
 					const vendor = vendorMap.get(current.vendorId);
 					if (vendor?.account) {
 						await tx.ledgerEntry.updateMany({
@@ -1960,16 +1772,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						});
 					}
 				}
-
-				/* ── PAYMENT-SIDE: fully reverse old, fully apply new ──────────
-				   Trigger full reversal+reapply whenever:
-				   - payment type changed
-				   - bank changed (BANK_TRANSFER)
-				   - customer changed (CREDIT)
-				   - sell price changed (affects bank/credit amount)
-				   - paid amount changed (affects credit balance)
-				   - payment legs changed (PARTIAL)
-				   ─────────────────────────────────────────────────────────────── */
 				const paymentSideChanged =
 					paymentTypeChanged || sellChanged || paidChanged || customerChanged || bankChanged ||
 					(newPt === "PARTIAL"); // always re-sync partial legs
@@ -2068,15 +1870,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						}
 					}
 				} else if (dateChanged) {
-					/* ══════════════════════════════════════════════════════
-					   Payment side is otherwise untouched (paymentSideChanged
-					   was false) but the invoice date changed — sync the
-					   transactionDate on every existing ledger row for this
-					   sale, and the paymentDate on every SalePayment leg
-					   (relevant for PARTIAL sales, whose legs carry their
-					   own date shown in the UI), without reversing/reapplying
-					   any amounts.
-					══════════════════════════════════════════════════════ */
 					await tx.ledgerEntry.updateMany({
 						where: { saleId: current.id },
 						data: { transactionDate: businessDate },
@@ -2098,11 +1891,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						updatedAt: new Date().toISOString(),
 					},
 				];
-
-				// For PARTIAL sales, the customer (if any) only comes from the
-				// CREDIT leg inside paymentLegs — payload.customerId isn't set
-				// at the top level for this payment type, so fall back to that
-				// leg's customerId instead of defaulting to null/WALKIN.
 				const saleCustomerId = newPt === "PARTIAL"
 					? (payload.paymentLegs.find(l => String(l.method).toUpperCase() === "CREDIT")?.customerId || null)
 					: ((newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null);
@@ -2149,14 +1937,6 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					data: { balance: getBal(accId) },
 				});
 			}
-
-			/* ══════════════════════════════════════════════════════
-			   4.4  UPDATE INVOICE TOTALS — computed via live aggregate over
-			   ALL sales currently belonging to this invoice (including any
-			   negative refund-mirror sales), not just the ones in this
-			   payload. Refunded pairs net to zero automatically, so this
-			   stays correct without needing to special-case them.
-			══════════════════════════════════════════════════════ */
 			const totals = await tx.sale.aggregate({
 				where: { invoiceId },
 				_sum: { netPrice: true, sellPrice: true, profit: true },
@@ -2464,11 +2244,6 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 					},
 				});
 			}
-
-			/* ══════════════════════════════════════════════════════
-			   STEP 2 — REVERSE PAYMENT SIDE
-			══════════════════════════════════════════════════════ */
-
 			if (pt === "CASH") {
 				/* Cash received full paid amount in create/update API */
 				if (sale.account) {
@@ -2529,11 +2304,6 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 			}
 
 			else if (pt === "CREDIT") {
-				/* creditCustomer(s.customerId, sell, paid, sale.id, ...) was used in create API
-				   => customer balance incremented by (sell - paid)
-				   => SALE ledger created for sell
-				   => PAYMENT ledger created only if paid > 0
-				*/
 				if (!sale.customer?.account) {
 					throw new Error("Related customer account not found for credit sale");
 				}
@@ -2557,17 +2327,6 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 			}
 
 			else if (pt === "PARTIAL") {
-				/* ── Detect whether this PARTIAL sale used a CREDIT leg ──
-				   New booking model (CASH+CREDIT / BANK_TRANSFER+CREDIT):
-				     - ONE consolidated SALE debit for the full sellPrice
-				       on the credit customer's ledger
-				     - ONE PAYMENT credit on that SAME customer's ledger
-				       for every CASH/BANK_TRANSFER leg (in addition to
-				       that leg's own cash/bank account entry)
-				   So reversal must delete the customer's SALE+PAYMENT
-				   entries as a single block, not per-leg. Cash/bank
-				   account entries are still reversed per leg exactly
-				   as before. */
 				const creditLeg = sale.payments.find(
 					l => String(l.method || "").toUpperCase() === "CREDIT"
 				);
@@ -2634,20 +2393,13 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 
 							totalPaidNow += legAmount;
 						}
-						// CREDIT leg(s): no separate per-leg account action —
-						// already covered by the consolidated block deleted above.
 					}
-
-					// Restore customer balance: undo (sell - totalPaidNow) that
-					// was added when this PARTIAL+CREDIT sale was created/edited.
 					await tx.account.update({
 						where: { id: custAccId },
 						data: { balance: { decrement: sell - totalPaidNow } },
 					});
 
 				} else {
-					/* Pure CASH + BANK_TRANSFER combo — no customer involved,
-					   unchanged from the original per-leg reversal. */
 					for (const leg of sale.payments) {
 						const legMethod = String(leg.method || "").toUpperCase();
 						const legAmount = Number(leg.amount || 0);
@@ -2696,10 +2448,6 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 				});
 			}
 
-			/* ══════════════════════════════════════════════════════
-			   STEP 3 — SAFETY CLEANUP
-			   Delete any remaining ledger entries attached to this sale
-			══════════════════════════════════════════════════════ */
 			await tx.ledgerEntry.deleteMany({
 				where: { saleId: sale.id },
 			});
@@ -2710,10 +2458,6 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 			await tx.sale.delete({
 				where: { id: sale.id },
 			});
-
-			/* ══════════════════════════════════════════════════════
-			   STEP 5 — UPDATE OR DELETE PARENT INVOICE
-			══════════════════════════════════════════════════════ */
 			const remainingSales = sale.invoice.sales.filter((s) => s.id !== sale.id);
 
 			if (remainingSales.length === 0) {

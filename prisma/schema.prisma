@@ -7,10 +7,6 @@ datasource db {
     url      = env("DATABASE_URL")
 }
 
-// ===========================
-// ENUMS
-// ===========================
-
 enum VendorCategory {
     CREDIT
     DEBIT
@@ -86,9 +82,6 @@ enum ExpenseStatus {
     REJECTED
 }
 
-// ===========================
-// AUTH / RBAC
-// ===========================
 
 model Permission {
     id          String   @id @default(auto()) @map("_id") @db.ObjectId
@@ -123,9 +116,6 @@ model RolePermission {
     @@unique([roleId, permissionId])
 }
 
-// ===========================
-// BRANCHES & USERS
-// ===========================
 
 model Branch {
     id                     String                  @id @default(auto()) @map("_id") @db.ObjectId
@@ -167,9 +157,6 @@ model User {
     vendorCustomerPayments VendorCustomerPayment[]
 }
 
-// ===========================
-// AIRLINES
-// ===========================
 
 model AirlineCode {
     id                String   @id @default(auto()) @map("_id") @db.ObjectId
@@ -184,10 +171,6 @@ model AirlineCode {
 
     sales Sale[]
 }
-
-// ===========================
-// ACCOUNTS (CORE LEDGER)
-// ===========================
 
 model Account {
     id          String      @id @default(auto()) @map("_id") @db.ObjectId
@@ -212,10 +195,6 @@ model Account {
     @@index([type])
     @@index([referenceId])
 }
-
-// ===========================
-// LEDGER ENTRIES
-// ===========================
 
 model LedgerEntry {
     id        String   @id @default(auto()) @map("_id") @db.ObjectId
@@ -257,9 +236,6 @@ model LedgerEntry {
     @@index([createdAt])
 }
 
-// ===========================
-// VENDORS
-// ===========================
 
 model Vendor {
     id             String         @id @default(auto()) @map("_id") @db.ObjectId
@@ -283,10 +259,6 @@ model Vendor {
     @@index([vendorDate])
     @@index([createdAt])
 }
-
-// ===========================
-// CUSTOMERS
-// ===========================
 
 model Customer {
     id             String       @id @default(auto()) @map("_id") @db.ObjectId
@@ -315,9 +287,6 @@ model Customer {
     @@index([createdAt])
 }
 
-// ===========================
-// BANKS
-// ===========================
 
 model Bank {
     id             String   @id @default(auto()) @map("_id") @db.ObjectId
@@ -341,10 +310,6 @@ model Bank {
     @@index([bankDate])
     @@index([createdAt])
 }
-
-// ===========================
-// SALES & INVOICES
-// ===========================
 
 model InvoiceCounter {
     id            String   @id @default(auto()) @map("_id") @db.ObjectId
@@ -375,9 +340,6 @@ model SalesInvoice {
     @@index([branchId])
 }
 
-// ===========================
-// SALE
-// ===========================
 
 model Sale {
     id         String  @id @default(auto()) @map("_id") @db.ObjectId
@@ -393,9 +355,6 @@ model Sale {
     tripType      String?   @default("Oneway")
     departureDate DateTime?
     returnDate    DateTime?
-
-    // Bank — populated when paymentType is BANK_TRANSFER (single payment)
-    // For PARTIAL payments the legs live in SalePayment; leave this null
     bankId String? @db.ObjectId
     bank   Bank?   @relation(fields: [bankId], references: [id])
 
@@ -416,10 +375,6 @@ model Sale {
     status       SaleStatus @default(PENDING)
     paxName      String?
     destinations Json?
-
-    // Edit history — array of { userId, userName, userEmail, updatedAt, changes }
-    // Each entry logs who edited this sale and a snapshot of what changed.
-    // Newest entries are appended (push), oldest first.
     updatedBy Json?
 
     // Relations
@@ -444,13 +399,6 @@ model Sale {
     @@index([createdAt])
     @@index([accountId])
 }
-
-// ===========================
-// SALE PAYMENT
-// One row per payment leg.
-// Single payments → 1 row.
-// Partial/split    → 2 rows (one per method).
-// ===========================
 
 model SalePayment {
     id     String @id @default(auto()) @map("_id") @db.ObjectId
@@ -480,10 +428,6 @@ model SalePayment {
     @@index([paymentDate])
     @@index([accountId])
 }
-
-// ===========================
-// REFUND
-// ===========================
 
 model Refund {
     id     String @id @default(auto()) @map("_id") @db.ObjectId
@@ -522,15 +466,6 @@ model Refund {
     @@index([refundDate])
     @@index([createdAt])
 }
-
-// ===========================
-// VENDOR / CUSTOMER PAYMENT
-// One row per payment transaction (NOT per leg, unlike SalePayment).
-// - method = CASH          -> only the vendor/customer account leg posts (1 LedgerEntry)
-// - method = BANK_TRANSFER -> vendor/customer leg AND bank leg both post (2 LedgerEntry rows)
-// Exactly one of vendorId / customerId must be populated (driven by partyType).
-// ===========================
-
 model PaymentVoucherCounter {
     id            String   @id @default(auto()) @map("_id") @db.ObjectId
     key           String   @unique
@@ -541,14 +476,12 @@ model PaymentVoucherCounter {
 model VendorCustomerPayment {
     id String @id @default(auto()) @map("_id") @db.ObjectId
 
-    partyType PartyType // VENDOR | CUSTOMER — tells you which relation below is populated
-
-    // Populated when partyType = VENDOR
+    partyType PartyType 
     pvNo          String? @unique
+
     vendorId String? @db.ObjectId
     vendor   Vendor? @relation(fields: [vendorId], references: [id])
-
-    // Populated when partyType = CUSTOMER
+    
     customerId String?   @db.ObjectId
     customer   Customer? @relation(fields: [customerId], references: [id])
 
@@ -558,21 +491,22 @@ model VendorCustomerPayment {
     method PaymentType // CASH | BANK_TRANSFER only (never CREDIT / PARTIAL here)
     amount Float
 
-    // Populated only when method = BANK_TRANSFER
-    bankId        String? @db.ObjectId
-    bank          Bank?   @relation(fields: [bankId], references: [id])
     bankSlipNo    String?
     attachmentUrl String?
 
     remarks         String?
     transactionDate DateTime
     createdAt       DateTime @default(now())
+
+    bankId        String? @db.ObjectId
+    bank          Bank?   @relation(fields: [bankId], references: [id])
+    
     createdById     String?  @db.ObjectId
     createdBy       User?    @relation(fields: [createdById], references: [id])
+
     branchId        String?  @db.ObjectId
     branch          Branch?  @relation(fields: [branchId], references: [id])
-
-    // Resulting ledger rows (1 for CASH, 2 for BANK_TRANSFER) — handy for audits/reversals
+    
     ledgerEntries LedgerEntry[]
     account       Account?      @relation(fields: [accountId], references: [id])
     accountId     String?       @db.ObjectId
@@ -591,38 +525,20 @@ model VendorCustomerPayment {
 
 model Expense {
     id String @id @default(auto()) @map("_id") @db.ObjectId
-
-    // When the expense record itself was logged/created
     date DateTime @default(now())
-
-    // Business/accounting date — this is what drives LedgerEntry.transactionDate
     expenseDate DateTime
-
     category ExpenseCategory
-
-    // Plain reference for reporting/aggregation only — no Account is tied to this.
     branchId String @db.ObjectId
     branch   Branch @relation(fields: [branchId], references: [id])
-
     amount Float
-
-    // Default APPROVED — REJECTED expenses are recorded but never post to the ledger
     status ExpenseStatus @default(APPROVED)
-
-    // CASH | BANK_TRANSFER only
     paymentMode PaymentType
-
-    // Populated only when paymentMode = BANK_TRANSFER — this is the ONLY
-    // account ever affected by an expense.
     bankId String? @db.ObjectId
     bank   Bank?   @relation(fields: [bankId], references: [id])
     userId String? @db.ObjectId
     user   User?   @relation(fields: [userId], references: [id])
-
     description String?
-
     ledgerEntries LedgerEntry[]
-
     createdAt DateTime @default(now())
     updatedAt DateTime @updatedAt
     account   Account? @relation(fields: [accountId], references: [id])

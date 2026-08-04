@@ -13,9 +13,14 @@ const ALLOWED_FORMATS = ["jpg", "jpeg", "png", "webp", "pdf"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB — matches the "max 10MB" copy in the UI
 
 // Cloudinary storage engine for Multer.
-// `params` is a function so we can branch on file type: images get the
-// resize transform, PDFs go up as `raw` (transforms don't apply to raw files
-// and will error if you try).
+// `params` is a function so we can branch on file type. PDFs are uploaded as
+// `image` resource_type (NOT `raw`) — Cloudinary blocks delivery of `raw`
+// files (PDF/ZIP) by default for security reasons unless you explicitly flip
+// a setting in the dashboard (Settings > Security > "Allow delivery of PDF
+// and ZIP files"). Uploading as `image` avoids that entirely, and gives you
+// page-preview / thumbnail generation as a bonus. The only downside is
+// password-protected PDFs aren't supported as `image` — if you need those,
+// see the raw-upload note at the bottom of this file.
 const storage = new CloudinaryStorage({
   cloudinary,
   params: async (req, file) => {
@@ -23,7 +28,9 @@ const storage = new CloudinaryStorage({
     return {
       folder: "travel_agency_uploads",
       allowed_formats: ALLOWED_FORMATS,
-      resource_type: isPdf ? "raw" : "image",
+      resource_type: "image",
+      // Only apply the resize/crop transform to actual images —
+      // it doesn't make sense (and can behave oddly) on a PDF page render.
       transformation: isPdf
         ? undefined
         : [{ width: 800, height: 800, crop: "limit" }],
