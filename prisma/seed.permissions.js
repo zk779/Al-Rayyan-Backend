@@ -67,6 +67,17 @@ const PERMISSIONS = [
 
   // --- Report (Read Only) ---
   { name: "REPORT_READ", description: "Can view reports (read-only)" },
+
+  //---- Banks ---
+  { name: "BANK_CREATE", description: "Can create banks" },
+  { name: "BANK_READ", description: "Can view banks" },
+  { name: "BANK_EDIT", description: "Can edit banks" },
+  { name: "BANK_DELETE", description: "Can delete banks" },
+
+  //--- Sales View Permissions 
+  { name: "SALE_VIEW_ALL", description: "Can view all sales" },
+  { name: "SALE_VIEW_BRANCH", description: "Can view sales for their branch" },
+  { name: "SALE_VIEW_OWN", description: "Can view only their own sales" },
 ];
 
 async function main() {

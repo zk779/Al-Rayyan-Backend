@@ -1130,7 +1130,7 @@ router.post("/", authenticate, async (req, res) => {
 				const sell = Number(s.sellPrice);
 				const paid = Number(s.paidAmount || 0);
 				const vatAmt = Number(s.vatAmount || 0);
-				const profit = sell - net - vatAmt;
+				const profit = sell - net ;
 				const pt = String(s.paymentType).toUpperCase();
 				const partialCreditLeg = pt === "PARTIAL"
 					? s.paymentLegs.find(l => String(l.method).toUpperCase() === "CREDIT")
@@ -1914,7 +1914,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						destinations: payload.destinations ?? current.destinations,
 						netPrice: newNet,
 						sellPrice: newSell,
-						profit: newSell - newNet - Number(payload.vatAmount || 0),
+						profit: newSell - newNet ,
 						vatAmount: Number(payload.vatAmount || 0),
 						paxVat: Number(payload.paxVat || 0),
 						miscCharges: Number(payload.miscCharges || 0),

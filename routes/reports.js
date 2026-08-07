@@ -291,10 +291,13 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
   const totalVatAmount = flatSales.reduce((s, r) => s + (r.vatAmount || 0), 0);
   const totalVat = totalPaxVat + totalVatAmount;
 
-  // Profit — as stored, no VAT subtraction. Already includes negative sale
-  // rows from refunds (business rule #2), so refunds are NOT subtracted
-  // again below.
-  const totalProfit = flatSales.reduce((s, r) => s + (r.profit || 0), 0);
+  // Profit — as stored, no VAT subtraction. Excludes REFUNDED sales (their
+  // profit is no longer real revenue), but still includes negative sale
+  // rows created by refunds' reversal entries (business rule #2), so
+  // refunds are NOT subtracted again below.
+  const totalProfit = flatSales
+    .filter((r) => r.status !== "REFUNDED")
+    .reduce((s, r) => s + (r.profit || 0), 0);
 
   // Cancellation charges are profit kept by the business — add on top.
   const totalCancellationCharges = flatRefunds.reduce(
@@ -383,18 +386,24 @@ router.get("/summary", authenticate, async (req, res) => {
       ...(customerId ? { customerId } : {}),
     };
 
-    const [salesAgg, refundsAgg, expensesAgg] = await Promise.all([
+    const [salesAgg, profitAgg, refundsAgg, expensesAgg] = await Promise.all([
       prisma.sale.aggregate({
         where: saleWhere,
         _sum: {
           sellPrice: true,
-          profit: true,
           netPrice: true,
           paidAmount: true,
           paxVat: true,
           vatAmount: true,
         },
         _count: true,
+      }),
+      // Profit only — exclude REFUNDED sales so their profit isn't double
+      // counted (the refund's own negative reversal Sale row already
+      // reflects the reversal; the original REFUNDED sale should not).
+      prisma.sale.aggregate({
+        where: { ...saleWhere, status: { not: "REFUNDED" } },
+        _sum: { profit: true },
       }),
       prisma.refund.aggregate({
         where: {
@@ -416,8 +425,8 @@ router.get("/summary", authenticate, async (req, res) => {
     ]);
 
     const totalSellPrice = salesAgg._sum.sellPrice || 0;
-    // ✅ Profit as stored — no VAT subtraction.
-    const totalProfit = salesAgg._sum.profit || 0;
+    // ✅ Profit as stored, REFUNDED sales excluded — no VAT subtraction.
+    const totalProfit = profitAgg._sum.profit || 0;
     const totalPaxVat = salesAgg._sum.paxVat || 0;
     const totalVatAmount = salesAgg._sum.vatAmount || 0;
     const totalVat = totalPaxVat + totalVatAmount; // informational only
