@@ -1,24 +1,3 @@
-// Converts a "YYYY-MM-DD" LOCAL calendar date (as picked in a date picker)
-// into the UTC instant range that covers that day — in whatever IANA
-// timezone the request specifies (e.g. "Asia/Riyadh", "Asia/Karachi",
-// "America/New_York"). No timezone is assumed by default: callers should
-// pass the requesting client's own timezone so this works correctly across
-// regions instead of baking in one office's offset.
-// Falls back to UTC when no timezone is given or it's invalid.
-//
-// ─────────────────────────────────────────────────────────────────────────
-// IMPORTANT: this uses `moment-timezone` (which bundles the full IANA tz
-// database as plain data) instead of the native Intl API. The previous
-// Intl-based version depended on the ICU timezone data compiled into the
-// Node runtime — this worked locally but silently fell back to UTC in
-// production, because the deployed Node runtime resolved/validated
-// "Asia/Karachi" differently than local Node did (no error was thrown,
-// so it went unnoticed and just returned wrong day boundaries).
-// moment-timezone ships its own tz rules, so behavior is now guaranteed
-// identical regardless of the host's ICU build, Node version, or
-// serverless runtime — local and production will always agree.
-// ─────────────────────────────────────────────────────────────────────────
-
 import moment from "moment-timezone";
 
 const FALLBACK_TIMEZONE = "UTC";

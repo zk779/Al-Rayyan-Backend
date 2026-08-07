@@ -1,6 +1,7 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
+import { localDayRangeToUtc } from "../utils/dateRange.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -25,11 +26,39 @@ async function authenticate(req, res, next) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Resolve a { gte, lte } date filter from optional dateFrom/dateTo
+// query params, using the caller's local timezone.
+//
+//  - Both given  -> full inclusive range across local calendar days
+//  - Only "from" -> open-ended upward (from that local day's start onward)
+//  - Only "to"   -> open-ended downward (up to that local day's end)
+//  - Neither     -> null (no filter at all -> "complete" / all-time report)
+// ─────────────────────────────────────────────────────────────
+function resolveDateFilter(dateFrom, dateTo, timeZone) {
+    if (!dateFrom && !dateTo) return null;
+
+    const filter = {};
+
+    if (dateFrom) {
+        const range = localDayRangeToUtc(dateFrom, timeZone);
+        if (range) filter.gte = range.start;
+    }
+
+    if (dateTo) {
+        const range = localDayRangeToUtc(dateTo, timeZone);
+        if (range) filter.lte = range.end;
+    }
+
+    return Object.keys(filter).length ? filter : null;
+}
+
 router.get("/", authenticate, async (req, res) => {
   try {
     const {
       dateFrom,
       dateTo,
+      timeZone,
       branchId,
       vendorId,
       customerId,
@@ -40,11 +69,8 @@ router.get("/", authenticate, async (req, res) => {
       paymentMethod,
     } = req.query;
 
-    // ── Parse date range (default: last 30 days if not provided) ──────
-    const rangeStart = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const rangeEnd = dateTo ? new Date(dateTo) : new Date();
-    // Push end-of-day so "dateTo" is inclusive
-    rangeEnd.setHours(23, 59, 59, 999);
+    // ── Resolve local-timezone-aware date filter (null = complete/all-time) ──
+    const dateFilter = resolveDateFilter(dateFrom, dateTo, timeZone);
 
     // ── Resolve airlineCode -> airlineId (Sale stores airlineId, not code) ──
     let airlineId;
@@ -63,6 +89,7 @@ router.get("/", authenticate, async (req, res) => {
           success: true,
           data: { sales: [], refunds: [], expenses: [] },
           totals: emptyTotals(),
+          meta: buildMeta(dateFilter, { sales: 0, refunds: 0, expenses: 0 }),
         });
       }
     }
@@ -70,7 +97,7 @@ router.get("/", authenticate, async (req, res) => {
     // ── Build Sale where clause ────────────────────────────────────────
     const saleWhere = {
       invoice: {
-        saleDate: { gte: rangeStart, lte: rangeEnd },
+        ...(dateFilter ? { saleDate: dateFilter } : {}),
         ...(agentId ? { userId: agentId } : {}),
         ...(branchId ? { user: { branchId } } : {}),
       },
@@ -102,11 +129,14 @@ router.get("/", authenticate, async (req, res) => {
     // ── Flatten sales into report-friendly rows ────────────────────────
     // NOTE: this includes negative sale rows created by refunds — that's
     // intentional, see business rule #2 above.
+    //
+    // NOTE: profit is reported as-stored (s.profit). paxVat/vatAmount are
+    // no longer subtracted out — VAT is purely informational here, not a
+    // profit deduction.
     const flatSales = sales.map((s) => {
       const paxVat = s.paxVat || 0;
       const vatAmount = s.vatAmount || 0;
       const vatTotal = paxVat + vatAmount;
-      const adjustedProfit = s.profit - vatTotal;
 
       return {
         id: s.id,
@@ -126,13 +156,12 @@ router.get("/", authenticate, async (req, res) => {
         status: s.status,
         netPrice: s.netPrice,
         sellPrice: s.sellPrice,
-        // Raw values, as stored
-        grossProfit: s.profit,       // profit INCLUDING vat, as stored in DB
+        // Profit as stored — no VAT subtraction.
+        profit: s.profit,
+        // VAT — informational only, not deducted from profit.
         paxVat,
         vatAmount,
-        vatTotal,                    // paxVat + vatAmount, combined
-        // Reporting value — this is what should be summed for "profit"
-        profit: adjustedProfit,
+        vatTotal,
         paidAmount: s.paidAmount,
         isNegativeSaleEntry: s.profit < 0, // flag so the UI can badge refund-reversal rows if desired
       };
@@ -142,7 +171,7 @@ router.get("/", authenticate, async (req, res) => {
     // Refunds don't carry vendor/customer/branch directly — filter via
     // their related sale, and via processedById for the agent filter.
     const refundWhere = {
-      refundDate: { gte: rangeStart, lte: rangeEnd },
+      ...(dateFilter ? { refundDate: dateFilter } : {}),
       ...(agentId ? { processedById: agentId } : {}),
       ...(vendorId || customerId || branchId || airlineId
         ? {
@@ -194,7 +223,7 @@ router.get("/", authenticate, async (req, res) => {
     // ── Build Expense where clause ──────────────────────────────────────
     // Only APPROVED expenses post to the ledger and count toward reports.
     const expenseWhere = {
-      expenseDate: { gte: rangeStart, lte: rangeEnd },
+      ...(dateFilter ? { expenseDate: dateFilter } : {}),
       status: "APPROVED",
       ...(branchId ? { branchId } : {}),
       ...(agentId ? { userId: agentId } : {}),
@@ -232,13 +261,11 @@ router.get("/", authenticate, async (req, res) => {
         expenses: flatExpenses,
       },
       totals,
-      meta: {
-        dateFrom: rangeStart,
-        dateTo: rangeEnd,
-        salesCount: flatSales.length,
-        refundsCount: flatRefunds.length,
-        expensesCount: flatExpenses.length,
-      },
+      meta: buildMeta(dateFilter, {
+        sales: flatSales.length,
+        refunds: flatRefunds.length,
+        expenses: flatExpenses.length,
+      }),
     });
   } catch (err) {
     console.error("GET /api/reports error:", err);
@@ -258,15 +285,16 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
   const totalNetPrice = flatSales.reduce((s, r) => s + (r.netPrice || 0), 0);
   const totalPaid = flatSales.reduce((s, r) => s + (r.paidAmount || 0), 0);
 
-  // VAT — displayed as its own figure, and already excluded from `profit`
-  // on each row above.
+  // VAT — displayed as its own figure. Informational only; NOT deducted
+  // from profit anywhere below.
   const totalPaxVat = flatSales.reduce((s, r) => s + (r.paxVat || 0), 0);
   const totalVatAmount = flatSales.reduce((s, r) => s + (r.vatAmount || 0), 0);
   const totalVat = totalPaxVat + totalVatAmount;
 
-  // Profit — VAT-excluded, and already includes negative sale rows from
-  // refunds (business rule #2), so refunds are NOT subtracted again below.
-  const totalProfitExclVat = flatSales.reduce((s, r) => s + (r.profit || 0), 0);
+  // Profit — as stored, no VAT subtraction. Already includes negative sale
+  // rows from refunds (business rule #2), so refunds are NOT subtracted
+  // again below.
+  const totalProfit = flatSales.reduce((s, r) => s + (r.profit || 0), 0);
 
   // Cancellation charges are profit kept by the business — add on top.
   const totalCancellationCharges = flatRefunds.reduce(
@@ -287,8 +315,9 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
 
   const totalExpenses = flatExpenses.reduce((s, e) => s + (e.amount || 0), 0);
 
-  // ✅ Final net revenue formula (business rules #1–#4)
-  const netRevenue = totalProfitExclVat + totalCancellationCharges - totalExpenses;
+  // ✅ Final net revenue formula:
+  //    sale profit (as stored) + cancellation charges kept − expenses
+  const netRevenue = totalProfit + totalCancellationCharges - totalExpenses;
 
   const outstandingDue = totalSellPrice - totalPaid;
 
@@ -298,18 +327,18 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
     totalPaid,
     outstandingDue,
 
-    totalPaxVat,
-    totalVatAmount,
-    totalVat,
+    totalPaxVat,      // informational only
+    totalVatAmount,   // informational only
+    totalVat,         // informational only
 
-    totalProfitExclVat,        // sum of (profit - vat) across all sales, incl. negative refund-reversal rows
-    totalCancellationCharges,  // added to profit
-    totalRefundedToCustomers,  // informational only
-    totalRefundCostToUs,       // informational only
+    totalProfit,                // sum of raw sale profit, incl. negative refund-reversal rows
+    totalCancellationCharges,   // added to profit
+    totalRefundedToCustomers,   // informational only
+    totalRefundCostToUs,        // informational only
 
     totalExpenses,
 
-    netRevenue,                // = totalProfitExclVat + totalCancellationCharges - totalExpenses
+    netRevenue,                 // = totalProfit + totalCancellationCharges - totalExpenses
 
     salesCount: flatSales.length,
     refundsCount: flatRefunds.length,
@@ -322,6 +351,17 @@ function emptyTotals() {
   return computeTotals([], [], []);
 }
 
+function buildMeta(dateFilter, counts) {
+  return {
+    dateFrom: dateFilter?.gte ?? null,
+    dateTo: dateFilter?.lte ?? null,
+    isCompleteRange: !dateFilter, // true when no dateFrom/dateTo was given (all-time report)
+    salesCount: counts.sales,
+    refundsCount: counts.refunds,
+    expensesCount: counts.expenses,
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 // GET /api/reports/summary
 // Lightweight KPI-only endpoint using the same corrected business rules,
@@ -329,15 +369,13 @@ function emptyTotals() {
 // ─────────────────────────────────────────────────────────────
 router.get("/summary", authenticate, async (req, res) => {
   try {
-    const { dateFrom, dateTo, branchId, vendorId, customerId, agentId } = req.query;
+    const { dateFrom, dateTo, timeZone, branchId, vendorId, customerId, agentId } = req.query;
 
-    const rangeStart = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const rangeEnd = dateTo ? new Date(dateTo) : new Date();
-    rangeEnd.setHours(23, 59, 59, 999);
+    const dateFilter = resolveDateFilter(dateFrom, dateTo, timeZone);
 
     const saleWhere = {
       invoice: {
-        saleDate: { gte: rangeStart, lte: rangeEnd },
+        ...(dateFilter ? { saleDate: dateFilter } : {}),
         ...(agentId ? { userId: agentId } : {}),
         ...(branchId ? { user: { branchId } } : {}),
       },
@@ -346,9 +384,6 @@ router.get("/summary", authenticate, async (req, res) => {
     };
 
     const [salesAgg, refundsAgg, expensesAgg] = await Promise.all([
-      // NOTE: aggregate can't compute (profit - paxVat - vatAmount) in one
-      // shot, so we sum each field separately and combine below. This still
-      // includes negative sale rows in every sum (business rule #2).
       prisma.sale.aggregate({
         where: saleWhere,
         _sum: {
@@ -363,7 +398,7 @@ router.get("/summary", authenticate, async (req, res) => {
       }),
       prisma.refund.aggregate({
         where: {
-          refundDate: { gte: rangeStart, lte: rangeEnd },
+          ...(dateFilter ? { refundDate: dateFilter } : {}),
           ...(agentId ? { processedById: agentId } : {}),
         },
         _sum: { netRefundToCustomer: true, cancellationCharges: true, netCostToUs: true },
@@ -371,7 +406,7 @@ router.get("/summary", authenticate, async (req, res) => {
       }),
       prisma.expense.aggregate({
         where: {
-          expenseDate: { gte: rangeStart, lte: rangeEnd },
+          ...(dateFilter ? { expenseDate: dateFilter } : {}),
           status: "APPROVED",
           ...(branchId ? { branchId } : {}),
         },
@@ -381,11 +416,11 @@ router.get("/summary", authenticate, async (req, res) => {
     ]);
 
     const totalSellPrice = salesAgg._sum.sellPrice || 0;
-    const totalGrossProfit = salesAgg._sum.profit || 0; // includes VAT, as stored
+    // ✅ Profit as stored — no VAT subtraction.
+    const totalProfit = salesAgg._sum.profit || 0;
     const totalPaxVat = salesAgg._sum.paxVat || 0;
     const totalVatAmount = salesAgg._sum.vatAmount || 0;
-    const totalVat = totalPaxVat + totalVatAmount;
-    const totalProfitExclVat = totalGrossProfit - totalVat; // ✅ business rule #1
+    const totalVat = totalPaxVat + totalVatAmount; // informational only
 
     const totalPaid = salesAgg._sum.paidAmount || 0;
     const totalCancellationCharges = refundsAgg._sum.cancellationCharges || 0; // ✅ business rule #3
@@ -394,8 +429,8 @@ router.get("/summary", authenticate, async (req, res) => {
     const totalExpenses = expensesAgg._sum.amount || 0;
 
     // ✅ business rule #2 — refunds NOT subtracted again here, since the
-    // negative sale rows already pulled totalGrossProfit/totalProfitExclVat down.
-    const netRevenue = totalProfitExclVat + totalCancellationCharges - totalExpenses;
+    // negative sale rows already pulled totalProfit down.
+    const netRevenue = totalProfit + totalCancellationCharges - totalExpenses;
 
     return res.json({
       success: true,
@@ -404,7 +439,7 @@ router.get("/summary", authenticate, async (req, res) => {
         totalPaxVat,
         totalVatAmount,
         totalVat,
-        totalProfitExclVat,
+        totalProfit,
         totalCancellationCharges,
         totalRefundedToCustomers,
         totalRefundCostToUs,
@@ -415,6 +450,11 @@ router.get("/summary", authenticate, async (req, res) => {
         refundsCount: refundsAgg._count,
         expensesCount: expensesAgg._count,
         avgSaleValue: salesAgg._count ? totalSellPrice / salesAgg._count : 0,
+      },
+      meta: {
+        dateFrom: dateFilter?.gte ?? null,
+        dateTo: dateFilter?.lte ?? null,
+        isCompleteRange: !dateFilter,
       },
     });
   } catch (err) {
