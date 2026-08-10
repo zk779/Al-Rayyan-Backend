@@ -11924,6 +11924,21 @@
 			"timeZoneDesc": "Asia/Kolkata"
 		}
 	},
+	"GOP": {
+		"airportCodeIata": "GOP",
+		"airportName": "Gorakhpur Airport",
+		"cityName": "Gorakhpur",
+		"cityType": "Domestic",
+		"countryCode": "IN",
+		"region": "India",
+		"meta": {
+			"icaoCode": "VEGK",
+			"iataCode": "GOP",
+			"latitudeDegreeNum": 26.7397003174,
+			"longitudeDegreeNum": 83.4496994019,
+			"timeZoneDesc": "Asia/Kolkata"
+		}
+	},
 	"SVMI": {
 		"airportCodeIata": "CCS",
 		"airportName": "Simon Bolivar International Airport",
