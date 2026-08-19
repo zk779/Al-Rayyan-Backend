@@ -294,11 +294,17 @@ router.get("/", authenticate, async (req, res) => {
     }
 
     /* ---------- Entry Type Filter ---------- */
+    // Supports either ?entryTypes=SALE,PAYMENT or ?entryType=SALE,PAYMENT
+    // (comma-separated), or a single ?entryType=SALE. Whichever param is
+    // present, split on commas and drop any empty segments.
     let entryTypeFilter;
-    if (entryTypes) {
-      entryTypeFilter = entryTypes.split(",");
-    } else if (entryType) {
-      entryTypeFilter = [entryType];
+    const rawEntryTypeParam = entryTypes ?? entryType;
+    if (rawEntryTypeParam) {
+      entryTypeFilter = rawEntryTypeParam
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (entryTypeFilter.length === 0) entryTypeFilter = undefined;
     }
 
     /* ---------- Reference Filter ---------- */
