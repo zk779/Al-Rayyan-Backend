@@ -128,7 +128,9 @@ router.get("/", authenticate, async (req, res) => {
 
     // ── Flatten sales into report-friendly rows ────────────────────────
     // NOTE: this includes negative sale rows created by refunds — that's
-    // intentional, see business rule #2 above.
+    // intentional, see business rule #2 above. They're excluded from the
+    // headline STATS (see computeTotals) via the REFUNDED-status filter,
+    // but still returned here so the row-level table can show them.
     //
     // NOTE: profit is reported as-stored (s.profit). paxVat/vatAmount are
     // no longer subtracted out — VAT is purely informational here, not a
@@ -281,32 +283,26 @@ router.get("/", authenticate, async (req, res) => {
 // and can be reused anywhere else totals need to be derived consistently.
 // ─────────────────────────────────────────────────────────────
 function computeTotals(flatSales, flatRefunds, flatExpenses) {
-  const totalSellPrice = flatSales.reduce((s, r) => s + (r.sellPrice || 0), 0);
-  const totalNetPrice = flatSales.reduce((s, r) => s + (r.netPrice || 0), 0);
-  const totalPaid = flatSales.reduce((s, r) => s + (r.paidAmount || 0), 0);
+  const statsSales = flatSales.filter((r) => r.status !== "REFUNDED");
+
+  const totalSellPrice = statsSales.reduce((s, r) => s + (r.sellPrice || 0), 0);
+  const totalPaid = statsSales.reduce((s, r) => s + (r.paidAmount || 0), 0);
 
   // VAT — displayed as its own figure. Informational only; NOT deducted
   // from profit anywhere below.
-  const totalPaxVat = flatSales.reduce((s, r) => s + (r.paxVat || 0), 0);
-  const totalVatAmount = flatSales.reduce((s, r) => s + (r.vatAmount || 0), 0);
+  const totalPaxVat = statsSales.reduce((s, r) => s + (r.paxVat || 0), 0);
+  const totalVatAmount = statsSales.reduce((s, r) => s + (r.vatAmount || 0), 0);
   const totalVat = totalPaxVat + totalVatAmount;
-
-  // Profit — as stored, no VAT subtraction. Excludes REFUNDED sales (their
-  // profit is no longer real revenue), but still includes negative sale
-  // rows created by refunds' reversal entries (business rule #2), so
-  // refunds are NOT subtracted again below.
-  const totalProfit = flatSales
-    .filter((r) => r.status !== "REFUNDED")
-    .reduce((s, r) => s + (r.profit || 0), 0);
+  const totalNetPrice = flatSales
+    .filter((r) => r.status === "COMPLETED")
+    .reduce((s, r) => s + (r.netPrice || 0), 0);
+  const totalProfit = statsSales.reduce((s, r) => s + (r.profit || 0), 0);
 
   // Cancellation charges are profit kept by the business — add on top.
   const totalCancellationCharges = flatRefunds.reduce(
     (s, r) => s + (r.cancellationCharges || 0),
     0,
   );
-
-  // Informational only — NOT subtracted from netRevenue (already reflected
-  // via the negative sale rows). Still useful to display for transparency.
   const totalRefundedToCustomers = flatRefunds.reduce(
     (s, r) => s + (r.netRefundToCustomer || 0),
     0,
@@ -317,16 +313,13 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
   );
 
   const totalExpenses = flatExpenses.reduce((s, e) => s + (e.amount || 0), 0);
-
-  // ✅ Final net revenue formula:
-  //    sale profit (as stored) + cancellation charges kept − expenses
   const netRevenue = totalProfit + totalCancellationCharges - totalExpenses;
 
   const outstandingDue = totalSellPrice - totalPaid;
 
   return {
     totalSellPrice,
-    totalNetPrice,
+    totalNetPrice,     // ✅ now COMPLETED-only, computed separately above
     totalPaid,
     outstandingDue,
 
@@ -334,7 +327,7 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
     totalVatAmount,   // informational only
     totalVat,         // informational only
 
-    totalProfit,                // sum of raw sale profit, incl. negative refund-reversal rows
+    totalProfit,                // sum of raw sale profit, REFUNDED rows excluded, incl. negative reversal rows
     totalCancellationCharges,   // added to profit
     totalRefundedToCustomers,   // informational only
     totalRefundCostToUs,        // informational only
@@ -343,10 +336,10 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
 
     netRevenue,                 // = totalProfit + totalCancellationCharges - totalExpenses
 
-    salesCount: flatSales.length,
+    salesCount: statsSales.length,
     refundsCount: flatRefunds.length,
     expensesCount: flatExpenses.length,
-    avgSaleValue: flatSales.length ? totalSellPrice / flatSales.length : 0,
+    avgSaleValue: statsSales.length ? totalSellPrice / statsSales.length : 0,
   };
 }
 
@@ -386,24 +379,26 @@ router.get("/summary", authenticate, async (req, res) => {
       ...(customerId ? { customerId } : {}),
     };
 
-    const [salesAgg, profitAgg, refundsAgg, expensesAgg] = await Promise.all([
+    const [statsAgg, netPriceAgg, refundsAgg, expensesAgg] = await Promise.all([
+      // ✅ One aggregate for everything that should exclude REFUNDED-status
+      // sales (sellPrice, paidAmount, VAT, profit, count). The reversal
+      // (negative) Sale row created by a refund is NOT REFUNDED-status, so
+      // it stays in and correctly pulls these sums down.
       prisma.sale.aggregate({
-        where: saleWhere,
+        where: { ...saleWhere, status: { not: "REFUNDED" } },
         _sum: {
           sellPrice: true,
-          netPrice: true,
           paidAmount: true,
           paxVat: true,
           vatAmount: true,
+          profit: true,
         },
         _count: true,
       }),
-      // Profit only — exclude REFUNDED sales so their profit isn't double
-      // counted (the refund's own negative reversal Sale row already
-      // reflects the reversal; the original REFUNDED sale should not).
+      // ✅ Total Net Price — COMPLETED ("confirmed") sales only.
       prisma.sale.aggregate({
-        where: { ...saleWhere, status: { not: "REFUNDED" } },
-        _sum: { profit: true },
+        where: { ...saleWhere, status: "COMPLETED" },
+        _sum: { netPrice: true },
       }),
       prisma.refund.aggregate({
         where: {
@@ -424,14 +419,15 @@ router.get("/summary", authenticate, async (req, res) => {
       }),
     ]);
 
-    const totalSellPrice = salesAgg._sum.sellPrice || 0;
+    const totalSellPrice = statsAgg._sum.sellPrice || 0;
+    const totalNetPrice = netPriceAgg._sum.netPrice || 0; // ✅ COMPLETED-only
     // ✅ Profit as stored, REFUNDED sales excluded — no VAT subtraction.
-    const totalProfit = profitAgg._sum.profit || 0;
-    const totalPaxVat = salesAgg._sum.paxVat || 0;
-    const totalVatAmount = salesAgg._sum.vatAmount || 0;
+    const totalProfit = statsAgg._sum.profit || 0;
+    const totalPaxVat = statsAgg._sum.paxVat || 0;
+    const totalVatAmount = statsAgg._sum.vatAmount || 0;
     const totalVat = totalPaxVat + totalVatAmount; // informational only
 
-    const totalPaid = salesAgg._sum.paidAmount || 0;
+    const totalPaid = statsAgg._sum.paidAmount || 0;
     const totalCancellationCharges = refundsAgg._sum.cancellationCharges || 0; // ✅ business rule #3
     const totalRefundedToCustomers = refundsAgg._sum.netRefundToCustomer || 0; // informational only
     const totalRefundCostToUs = refundsAgg._sum.netCostToUs || 0; // informational only
@@ -445,6 +441,7 @@ router.get("/summary", authenticate, async (req, res) => {
       success: true,
       data: {
         totalSellPrice,
+        totalNetPrice,
         totalPaxVat,
         totalVatAmount,
         totalVat,
@@ -455,10 +452,10 @@ router.get("/summary", authenticate, async (req, res) => {
         totalExpenses,
         outstandingDue: totalSellPrice - totalPaid,
         netRevenue,
-        salesCount: salesAgg._count,
+        salesCount: statsAgg._count,
         refundsCount: refundsAgg._count,
         expensesCount: expensesAgg._count,
-        avgSaleValue: salesAgg._count ? totalSellPrice / salesAgg._count : 0,
+        avgSaleValue: statsAgg._count ? totalSellPrice / statsAgg._count : 0,
       },
       meta: {
         dateFrom: dateFilter?.gte ?? null,
