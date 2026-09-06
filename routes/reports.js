@@ -146,6 +146,7 @@ router.get("/", authenticate, async (req, res) => {
         invoiceNumber: s.invoice?.invoiceNo ?? null,
         airline: s.airline?.airlineCode ?? s.airline?.iataName ?? "-",
         airlineName: s.airline?.airlineName ?? "-",
+        documentNo: s.documentNo,
         vendor: s.vendor?.vendorName ?? "-",
         vendorId: s.vendorId,
         customer: s.customer?.customerName ?? "",
