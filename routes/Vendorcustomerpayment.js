@@ -163,15 +163,15 @@ router.post("/", authenticate, upload.single("attachment"), async (req, res) => 
       bank = await prisma.bank.findUnique({ where: { id: bankId }, include: { account: true } });
       if (!bank) return res.status(404).json({ success: false, error: "Bank not found" });
       if (!bank.isActive) return res.status(400).json({ success: false, error: "Bank account is inactive" });
-      if (partyType === "VENDOR" && amount > bank.account.balance)
-        return res.status(400).json({ success: false, error: `Insufficient bank balance. Trying to pay ${amount} but bank only has ${bank.account.balance} available.` });
+      // if (partyType === "VENDOR" && amount > bank.account.balance)
+      //   return res.status(400).json({ success: false, error: `Insufficient bank balance. Trying to pay ${amount} but bank only has ${bank.account.balance} available.` });
     }
 
     let cashAccount = null;
     if (method === "CASH") {
       cashAccount = await prisma.account.findFirst({ where: { type: "CASH" } });
-      if (partyType === "VENDOR" && cashAccount && amount > cashAccount.balance)
-        return res.status(400).json({ success: false, error: `Insufficient cash balance. Trying to pay ${amount} but cash account only has ${cashAccount.balance} available.` });
+      // if (partyType === "VENDOR" && cashAccount && amount > cashAccount.balance)
+      //   return res.status(400).json({ success: false, error: `Insufficient cash balance. Trying to pay ${amount} but cash account only has ${cashAccount.balance} available.` });
     }
 
     const partyAccount = partyType === "VENDOR" ? vendor.account : customer.account;
@@ -959,11 +959,11 @@ router.put("/:id", async (req, res) => {
             ? newBank.account.balance + existing.amount
             : newBank.account.balance;
 
-        if (newAmount > restoredBankBalance)
-          return res.status(400).json({
-            success: false,
-            error: `Insufficient bank balance. Trying to pay ${newAmount} but bank only has ${restoredBankBalance} available.`,
-          });
+        // if (newAmount > restoredBankBalance)
+        //   return res.status(400).json({
+        //     success: false,
+        //     error: `Insufficient bank balance. Trying to pay ${newAmount} but bank only has ${restoredBankBalance} available.`,
+        //   });
 
         bankLegDebit = newAmount;
       } else {
@@ -985,11 +985,11 @@ router.put("/:id", async (req, res) => {
             : newCashAccount.balance)
           : 0;
 
-        if (newAmount > restoredCashBalance)
-          return res.status(400).json({
-            success: false,
-            error: `Insufficient cash balance. Trying to pay ${newAmount} but cash account only has ${restoredCashBalance} available.`,
-          });
+        // if (newAmount > restoredCashBalance)
+        //   return res.status(400).json({
+        //     success: false,
+        //     error: `Insufficient cash balance. Trying to pay ${newAmount} but cash account only has ${restoredCashBalance} available.`,
+        //   });
 
         cashLegDebit = newAmount;
       } else {
