@@ -990,7 +990,6 @@ router.put("/:id", async (req, res) => {
         //     success: false,
         //     error: `Insufficient cash balance. Trying to pay ${newAmount} but cash account only has ${restoredCashBalance} available.`,
         //   });
-
         cashLegDebit = newAmount;
       } else {
         cashLegCredit = newAmount;
