@@ -79,7 +79,7 @@ async function attachRelatedDetails(entries) {
               select: { id: true, vendorName: true, category: true },
             },
             customer: {
-              select: { id: true, customerName: true, phone: true, email: true },
+              select: { id: true, customerName: true, phone: true, email: true, customerType: true },
             },
             bank: {
               select: { id: true, bankName: true, accountNumber: true },

@@ -67,10 +67,14 @@ router.get("/", authenticate, async (req, res) => {
       paymentStatus,
       saleStatus,
       paymentMethod,
+      order,
     } = req.query;
 
     // ── Resolve local-timezone-aware date filter (null = complete/all-time) ──
     const dateFilter = resolveDateFilter(dateFrom, dateTo, timeZone);
+
+    // Sort direction for the sales rows below — defaults to newest first.
+    const sortDirection = String(order || "").toLowerCase() === "asc" ? "asc" : "desc";
 
     // ── Resolve airlineCode -> airlineId (Sale stores airlineId, not code) ──
     let airlineId;
@@ -123,18 +127,12 @@ router.get("/", authenticate, async (req, res) => {
         vendor: { select: { id: true, vendorName: true } },
         customer: { select: { id: true, customerName: true } },
       },
-      orderBy: { createdAt: "desc" },
+      // Sort by the invoice's saleDate (the date the report is filtered/
+      // grouped by), not createdAt — a backdated sale should sort by the
+      // date it's dated for, not when the row happened to be inserted.
+      orderBy: { invoice: { saleDate: sortDirection } },
     });
-
-    // ── Flatten sales into report-friendly rows ────────────────────────
-    // NOTE: this includes negative sale rows created by refunds — that's
-    // intentional, see business rule #2 above. They're excluded from the
-    // headline STATS (see computeTotals) via the REFUNDED-status filter,
-    // but still returned here so the row-level table can show them.
-    //
-    // NOTE: profit is reported as-stored (s.profit). paxVat/vatAmount are
-    // no longer subtracted out — VAT is purely informational here, not a
-    // profit deduction.
+    
     const flatSales = sales.map((s) => {
       const paxVat = s.paxVat || 0;
       const vatAmount = s.vatAmount || 0;
