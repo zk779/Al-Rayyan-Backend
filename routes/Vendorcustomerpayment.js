@@ -401,6 +401,8 @@ router.get("/", async (req, res) => {
       dateTo,
       order,
       search,
+      page = 1,
+      limit = 20,
     } = req.query;
 
     const filters = [];
@@ -470,34 +472,58 @@ router.get("/", async (req, res) => {
     const where = filters.length > 0 ? { AND: filters } : {};
     const sortDirection = String(order || "").toLowerCase() === "asc" ? "asc" : "desc";
 
-    const payments = await prisma.vendorCustomerPayment.findMany({
-      where,
-      include: {
-        vendor: { select: { id: true, vendorName: true, category: true } },
-        customer: { select: { id: true, customerName: true } },
-        sale: {
-          select: {
-            id: true,
-            documentNo: true,
-            paxName: true,
-            invoice: { select: { id: true, invoiceNo: true } },
+    const take = Math.min(Math.max(Number(limit) || 20, 1), 200);
+    const skip = (Math.max(Number(page) || 1, 1) - 1) * take;
+
+    const [payments, total, amountAgg] = await prisma.$transaction([
+      prisma.vendorCustomerPayment.findMany({
+        where,
+        skip,
+        take,
+        include: {
+          vendor: { select: { id: true, vendorName: true, category: true } },
+          customer: { select: { id: true, customerName: true } },
+          sale: {
+            select: {
+              id: true,
+              documentNo: true,
+              paxName: true,
+              invoice: { select: { id: true, invoiceNo: true } },
+            },
           },
+          bank: { select: { id: true, bankName: true, accountNumber: true } },
+          account: { select: { id: true, name: true, type: true, balance: true } },
+          createdBy: { select: { id: true, fullName: true } }, // NEW
+          branch: { select: { id: true, name: true, code: true } }, // NEW
+          ledgerEntries: true,
         },
-        bank: { select: { id: true, bankName: true, accountNumber: true } },
-        account: { select: { id: true, name: true, type: true, balance: true } },
-        createdBy: { select: { id: true, fullName: true } }, // NEW
-        branch: { select: { id: true, name: true, code: true } }, // NEW
-        ledgerEntries: true,
-      },
-      orderBy: { transactionDate: sortDirection },
-    });
+        orderBy: { transactionDate: sortDirection },
+      }),
+      prisma.vendorCustomerPayment.count({ where }),
+      // Sum across the WHOLE filtered set (not just this page) — lets the
+      // frontend show an accurate total without fetching every row.
+      prisma.vendorCustomerPayment.aggregate({ where, _sum: { amount: true } }),
+    ]);
 
     const data = payments.map((p) => ({
       ...p,
       isWalkIn: !p.customerId && !p.vendorId && !!p.saleId,
     }));
 
-    res.status(200).json({ success: true, data });
+    res.status(200).json({
+      success: true,
+      data,
+      pagination: {
+        page: Math.max(Number(page) || 1, 1),
+        limit: take,
+        total,
+        pages: Math.max(Math.ceil(total / take), 1),
+      },
+      summary: {
+        count: total,
+        totalAmount: amountAgg._sum.amount || 0,
+      },
+    });
   } catch (err) {
     console.error("Error fetching payments:", err);
     res.status(500).json({ success: false, error: "Failed to fetch payments" });

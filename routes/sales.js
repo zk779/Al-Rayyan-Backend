@@ -350,10 +350,12 @@ router.get("/search", authenticate, async (req, res) => {
 				customer: {
 					select: {
 						customerName: true,
+						customerType: true,
 						phone: true,
 						account: { select: { balance: true } }
 					}
-				}
+				},
+				bank: { select: { bankName: true } }
 			}
 		});
 
@@ -386,9 +388,13 @@ router.get("/search", authenticate, async (req, res) => {
 			vendorName: s.vendor?.vendorName || null,
 			vendorCategory: s.vendor?.category || null,
 			vendorBalance: s.vendor?.account?.balance ?? null,
+			customerId: s.customerId || null,
 			customerName: s.customer?.customerName || null,
+			customerType: s.customer?.customerType || null,
 			customerPhone: s.customer?.phone || null,
 			customerBalance: s.customer?.account?.balance ?? null,
+			bankId: s.bankId || null,
+			bankName: s.bank?.bankName || null,
 			createdAt: s.createdAt
 		}));
 

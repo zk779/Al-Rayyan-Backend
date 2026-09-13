@@ -1,8 +1,29 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
+import jwt from "jsonwebtoken";
 
 const router = express.Router();
 const prisma = new PrismaClient();
+
+/* --------------------------- 🔐 AUTH MIDDLEWARE --------------------------- */
+async function authenticate(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader)
+    return res.status(401).json({ success: false, error: "Missing Authorization header" });
+
+  const token = authHeader.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+    if (!user || !user.isActive)
+      return res.status(401).json({ success: false, error: "User inactive or removed" });
+
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, error: "Invalid or expired token" });
+  }
+}
 
 const EXPENSE_CATEGORIES = [
   "OFFICE_SUPPLIES",
@@ -17,7 +38,7 @@ const EXPENSE_STATUSES = ["APPROVED", "REJECTED"];
 const PAYMENT_MODES = ["CASH", "BANK_TRANSFER"];
 
 // ---- POST (CREATE) ----
-router.post("/", async (req, res) => {
+router.post("/", authenticate, async (req, res) => {
   try {
     let {
       date,
@@ -192,6 +213,7 @@ router.post("/", async (req, res) => {
           accountId: paymentMode === "CASH" ? cash.id : null,
           userId: category === "SALARY" ? userId : null,
           description: description ?? null,
+          createdById: req.user?.id ?? null,
         },
       });
 
@@ -266,6 +288,7 @@ router.post("/", async (req, res) => {
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
         user: { select: { id: true, fullName: true, email: true } },
+        createdBy: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
     });
@@ -278,10 +301,10 @@ router.post("/", async (req, res) => {
 });
 
 // ---- GET ALL ----
-// Optional query filters: ?branchId=&category=&status=&paymentMode=&userId=
-router.get("/", async (req, res) => {
+// Optional query filters: ?branchId=&category=&status=&paymentMode=&userId=&page=&limit=
+router.get("/", authenticate, async (req, res) => {
   try {
-    const { branchId, category, status, paymentMode, userId } = req.query;
+    const { branchId, category, status, paymentMode, userId, page = 1, limit = 20 } = req.query;
 
     const where = {};
     if (branchId) where.branchId = branchId;
@@ -290,19 +313,66 @@ router.get("/", async (req, res) => {
     if (paymentMode) where.paymentMode = paymentMode;
     if (userId) where.userId = userId;
 
-    const expenses = await prisma.expense.findMany({
-      where,
-      include: {
-        branch: { select: { id: true, name: true, code: true } },
-        bank: { select: { id: true, bankName: true, accountNumber: true } },
-        account: { select: { id: true, name: true, type: true, balance: true } },
-        user: { select: { id: true, fullName: true, email: true } },
-        ledgerEntries: true,
-      },
-      orderBy: { expenseDate: "desc" },
-    });
+    const take = Math.min(Math.max(Number(limit) || 20, 1), 200);
+    const skip = (Math.max(Number(page) || 1, 1) - 1) * take;
 
-    res.status(200).json({ success: true, data: expenses });
+    const [expenses, total, amountAgg] = await prisma.$transaction([
+      prisma.expense.findMany({
+        where,
+        include: {
+          branch: { select: { id: true, name: true, code: true } },
+          bank: { select: { id: true, bankName: true, accountNumber: true } },
+          account: { select: { id: true, name: true, type: true, balance: true } },
+          user: { select: { id: true, fullName: true, email: true } },
+          createdBy: { select: { id: true, fullName: true, email: true } },
+          ledgerEntries: true,
+        },
+        orderBy: { expenseDate: "desc" },
+        skip,
+        take,
+      }),
+      prisma.expense.count({ where }),
+      prisma.expense.aggregate({ where, _sum: { amount: true } }),
+    ]);
+
+    // Total expense for the branch currently being filtered on (or overall,
+    // if no branch is selected) — independent of pagination/page size.
+    let branchTotal = null;
+    if (branchId) {
+      branchTotal = amountAgg._sum.amount || 0;
+    } else {
+      const branchGroups = await prisma.expense.groupBy({
+        by: ["branchId"],
+        where,
+        _sum: { amount: true },
+      });
+      const branchIds = branchGroups.map((g) => g.branchId);
+      const branchList = await prisma.branch.findMany({
+        where: { id: { in: branchIds } },
+        select: { id: true, name: true, code: true },
+      });
+      const branchMap = Object.fromEntries(branchList.map((b) => [b.id, b]));
+      branchTotal = branchGroups.map((g) => ({
+        branch: branchMap[g.branchId] ?? { id: g.branchId },
+        totalAmount: g._sum.amount || 0,
+      }));
+    }
+
+    res.status(200).json({
+      success: true,
+      data: expenses,
+      pagination: {
+        page: Math.max(Number(page) || 1, 1),
+        limit: take,
+        total,
+        pages: Math.max(Math.ceil(total / take), 1),
+      },
+      summary: {
+        count: total,
+        totalAmount: amountAgg._sum.amount || 0,
+        byBranch: branchId ? null : branchTotal,
+      },
+    });
   } catch (err) {
     console.error("Error fetching expenses:", err);
     res.status(500).json({ success: false, error: "Failed to fetch expenses" });
@@ -310,7 +380,7 @@ router.get("/", async (req, res) => {
 });
 
 // ---- GET BY ID ----
-router.get("/:id", async (req, res) => {
+router.get("/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -321,6 +391,7 @@ router.get("/:id", async (req, res) => {
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
         user: { select: { id: true, fullName: true, email: true } },
+        createdBy: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
     });
@@ -339,7 +410,7 @@ router.get("/:id", async (req, res) => {
 // Aggregate report: total expense amount per branch (optionally filtered).
 // This replaces the old "running balance account" — totals are computed
 // on demand instead of tracked as a persisted balance.
-router.get("/reports/by-branch", async (req, res) => {
+router.get("/reports/by-branch", authenticate, async (req, res) => {
   try {
     const { status, category } = req.query;
 
@@ -381,7 +452,7 @@ router.get("/reports/by-branch", async (req, res) => {
 // should post. Ledger entries get recreated for both CASH and BANK_TRANSFER;
 // account BALANCE and accountId are only ever touched for BANK_TRANSFER —
 // CASH's ledger entry always has accountId: null.
-router.put("/:id", async (req, res) => {
+router.put("/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -714,6 +785,7 @@ router.put("/:id", async (req, res) => {
         bank: { select: { id: true, bankName: true, accountNumber: true } },
         account: { select: { id: true, name: true, type: true, balance: true } },
         user: { select: { id: true, fullName: true, email: true } },
+        createdBy: { select: { id: true, fullName: true, email: true } },
         ledgerEntries: true,
       },
     });
@@ -726,7 +798,7 @@ router.put("/:id", async (req, res) => {
 });
 
 // ---- DELETE ----
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
 

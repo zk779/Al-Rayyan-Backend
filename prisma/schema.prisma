@@ -57,6 +57,13 @@ enum LedgerEntryType {
     ADJUSTMENT
 }
 
+// How a refund's customer-side amount was actually paid out.
+enum RefundPayoutType {
+    CUSTOMER_LEDGER // credited back to the customer's own receivable balance
+    CASH
+    BANK_TRANSFER
+}
+
 enum PaymentStatus {
     DUE
     PARTIAL
@@ -153,7 +160,8 @@ model User {
 
     salesInvoices          SalesInvoice[]
     refunds                Refund[]
-    expenses               Expense[]
+    expenses               Expense[]                @relation("ExpenseEmployee")
+    expensesCreated        Expense[]                @relation("ExpenseCreator")
     vendorCustomerPayments VendorCustomerPayment[]
 }
 
@@ -306,6 +314,7 @@ model Bank {
     salePayments           SalePayment[]
     vendorCustomerPayments VendorCustomerPayment[]
     expenses               Expense[]
+    refunds                Refund[]
 
     @@index([bankDate])
     @@index([createdAt])
@@ -448,6 +457,16 @@ model Refund {
     remarks      String?
     status       RefundStatus @default(PENDING)
 
+    // How the customer-side amount was actually paid out, and where.
+    // payoutAccountId is whichever Account absorbed netRefundToCustomer
+    // (the customer's own receivable account, the CASH account, or a
+    // specific bank's account) — stamped at creation so edits/reversals
+    // never have to guess which account to adjust.
+    refundType      RefundPayoutType @default(CUSTOMER_LEDGER)
+    payoutAccountId String?          @db.ObjectId
+    bankId          String?          @db.ObjectId
+    bank            Bank?            @relation(fields: [bankId], references: [id])
+
     // Dates
     refundDate   DateTime
     approvedAt   DateTime?
@@ -536,13 +555,16 @@ model Expense {
     bankId String? @db.ObjectId
     bank   Bank?   @relation(fields: [bankId], references: [id])
     userId String? @db.ObjectId
-    user   User?   @relation(fields: [userId], references: [id])
+    user   User?   @relation("ExpenseEmployee", fields: [userId], references: [id])
     description String?
     ledgerEntries LedgerEntry[]
     createdAt DateTime @default(now())
     updatedAt DateTime @updatedAt
     account   Account? @relation(fields: [accountId], references: [id])
     accountId String?  @db.ObjectId
+
+    createdById String? @db.ObjectId
+    createdBy   User?   @relation("ExpenseCreator", fields: [createdById], references: [id])
 
     @@index([branchId])
     @@index([category])
@@ -552,4 +574,5 @@ model Expense {
     @@index([expenseDate])
     @@index([createdAt])
     @@index([accountId])
+    @@index([createdById])
 }
