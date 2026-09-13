@@ -1,6 +1,7 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
+import { localDayRangeToUtc } from "../utils/dateRange.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -24,22 +25,6 @@ async function authenticate(req, res, next) {
         return res.status(401).json({ error: "Invalid or expired token" });
     }
 }
-
-/* ====================================================
-   TABBY/TAMARA REFUND HANDLING
-   ----------------------------------------------------
-   For a normal CREDIT customer, the sale's `customerId` IS the party we
-   owe money to on refund — crediting their ledger is correct.
-
-   For a TABBY_OR_TAMARA customer, `customerId` is only a LABEL used to
-   track what Tabby/Tamara owes us for tickets sold through them — the
-   real traveler is a separate, untracked person. When we cancel that
-   ticket we hand cash back to the TRAVELER directly, out of our own
-   cash drawer — Tabby/Tamara's obligation to us for that sale is
-   completely unaffected. So a refund on a TABBY_OR_TAMARA sale must
-   NOT touch that customer's receivable balance; instead it's booked as
-   a plain cash outflow, same as any other cash payout.
-==================================================== */
 const isTabbyOrTamaraCustomer = (customer) =>
     customer?.customerType === "TABBY_OR_TAMARA";
 
@@ -55,7 +40,25 @@ async function getCashAccount(tx) {
     return cash;
 }
 
-/* ======================= GET ALL REFUNDS (LIST) ======================= */
+function resolveDateFilter(startDate, endDate, timeZone) {
+    if (!startDate && !endDate) return null;
+
+    const filter = {};
+
+    if (startDate) {
+        const range = localDayRangeToUtc(startDate, timeZone);
+        if (range) filter.gte = range.start;
+    }
+
+    if (endDate) {
+        const range = localDayRangeToUtc(endDate, timeZone);
+        if (range) filter.lte = range.end;
+    }
+
+    return Object.keys(filter).length ? filter : null;
+}
+
+/* ======================= LIST REFUNDS ======================= */
 router.get("/", authenticate, async (req, res) => {
     const {
         page = 1,
@@ -64,6 +67,7 @@ router.get("/", authenticate, async (req, res) => {
         saleId,
         startDate,
         endDate,
+        tz,
         sortBy = "createdAt",
         sortOrder = "desc",
         search,
@@ -90,25 +94,10 @@ router.get("/", authenticate, async (req, res) => {
         filters.push({ processedById });
     }
 
-    if (startDate || endDate) {
-        const refundDateFilter = {};
-
-        if (startDate) {
-            const start = new Date(startDate);
-            if (!isNaN(start.getTime())) refundDateFilter.gte = start;
-        }
-
-        if (endDate) {
-            const end = new Date(endDate);
-            if (!isNaN(end.getTime())) {
-                end.setHours(23, 59, 59, 999);
-                refundDateFilter.lte = end;
-            }
-        }
-
-        if (Object.keys(refundDateFilter).length > 0) {
-            filters.push({ refundDate: refundDateFilter });
-        }
+    // ── Resolve local-timezone-aware date filter ──
+    const dateFilter = resolveDateFilter(startDate, endDate, tz);
+    if (dateFilter) {
+        filters.push({ refundDate: dateFilter });
     }
 
     // Search across: the refund's own remarks/refundReason, the linked
@@ -140,9 +129,7 @@ router.get("/", authenticate, async (req, res) => {
                             netPrice: true,
                             sellPrice: true,
                             documentNo: true,
-                            // ✅ FIXED: Using vendorName instead of name
                             vendor: { select: { id: true, vendorName: true } },
-                            // ✅ FIXED: Using customerName instead of name
                             // customerType exposed so the UI can flag TABBY/TAMARA
                             // pass-through refunds (paid out in cash, not credited
                             // back to this customer's receivable balance).
@@ -157,7 +144,6 @@ router.get("/", authenticate, async (req, res) => {
                         }
                     },
                     processedBy: {
-                        // ✅ FIXED: Using fullName instead of name
                         select: { id: true, fullName: true, email: true }
                     }
                 }
@@ -185,7 +171,6 @@ router.get("/", authenticate, async (req, res) => {
 });
 
 /* ======================= GET REFUND BY ID ======================= */
-/* ======================= GET REFUND BY ID ======================= */
 router.get("/:refundId", authenticate, async (req, res) => {
     const { refundId } = req.params;
 
@@ -201,7 +186,6 @@ router.get("/:refundId", authenticate, async (req, res) => {
                     }
                 },
                 processedBy: {
-                    // ✅ FIXED: Using fullName instead of name
                     select: { id: true, fullName: true, email: true }
                 }
             }
@@ -332,34 +316,6 @@ router.post("/", authenticate, async (req, res) => {
                 where: { id: vendorAccId },
                 data: { balance: { increment: vendorBalDelta } }
             });
-
-            /* ====================================================
-               5️⃣ CUSTOMER-SIDE LEDGER ENTRY + BALANCE UPDATE
-               Applies to:
-                 - pure CREDIT sales (uses originalSale.customer directly)
-                 - PARTIAL sales that included a CREDIT leg (uses that
-                   leg's customer, since originalSale.customer may not
-                   be populated the same way for PARTIAL sales)
-
-               NOTE: the full netRefundToCustomer is always credited here,
-               uncapped by the customer's current outstanding balance. If
-               the refund exceeds what the customer still owed, their
-               account balance is allowed to go NEGATIVE — a negative
-               balance means the business now owes that amount BACK to
-               the customer in cash (e.g. sellPrice 2000, paid 500, so
-               balance was +1500 owed to us; a 1700 refund brings it to
-               -200, meaning we now owe the customer 200).
-               This keeps the ledger entry and the Refund record's
-               netRefundToCustomer always in agreement — no silent gaps.
-
-               EXCEPTION — TABBY_OR_TAMARA: that "customer" is only a
-               ledger label for what Tabby/Tamara owes us; the actual
-               refund cash goes straight to the real traveler, who isn't
-               tracked in this system. So instead of crediting Tabby/
-               Tamara's receivable (which they never actually received
-               back), this books a plain cash outflow — see
-               isTabbyOrTamaraCustomer at the top of this file.
-            ==================================================== */
             const pt = String(originalSale.paymentType).toUpperCase();
             const isCredit = pt === "CREDIT";
 
@@ -574,32 +530,6 @@ router.put("/:refundId", authenticate, async (req, res) => {
                         data:  { balance: { increment: vendorBalanceDelta } }
                     });
                 }
-
-                /* ====================================================
-                   2️⃣ UPDATE CUSTOMER-SIDE LEDGER + BALANCE
-                   Applies to:
-                     - pure CREDIT sales (uses originalSale.customer directly)
-                     - PARTIAL sales that included a CREDIT leg (uses that
-                       leg's customer, since originalSale.customer may not
-                       be populated the same way for PARTIAL sales)
-
-                   NOTE: this always uses the FULL newNetRefundToCustomer,
-                   uncapped by the customer's current balance — matching
-                   the POST route. The customer's account balance is
-                   allowed to go negative, which means the business now
-                   owes that amount back to the customer in cash. Editing
-                   a refund's fee/charges here simply re-deltas the ledger
-                   and balance by (new - old), same logic as before, but
-                   now both sides always agree with each other since POST
-                   no longer caps the initial credit.
-
-                   TABBY_OR_TAMARA: rather than assume based on today's
-                   customerType (which the sale's ledger entry may predate),
-                   look for the entry on whichever of the two candidate
-                   accounts (the customer's, or cash) it actually lives on
-                   and adjust that one — correct for both new pass-through
-                   refunds and any created before this fix.
-                ==================================================== */
                 const pt = String(originalSale.paymentType).toUpperCase();
                 const isCredit = pt === "CREDIT";
 
@@ -641,11 +571,6 @@ router.put("/:refundId", authenticate, async (req, res) => {
                                     remarks: `Customer refund - ${newNetRefundToCustomer} (Fee: ${newFee}, Srv: ${newCharges}) | ${refRef} | Reason: ${refundReason ?? existingRefund.refundReason ?? "-"}`,
                                 }
                         });
-
-                        // Same math either way: a bigger refund always means
-                        // more money leaving toward the traveler, so the
-                        // account it's tracked against (receivable or cash)
-                        // moves down by the same delta.
                         await tx.account.update({
                             where: { id: custSideLedger.accountId },
                             data:  { balance: { increment: -customerDelta } }
@@ -653,13 +578,6 @@ router.put("/:refundId", authenticate, async (req, res) => {
                     }
                 }
 
-                /* ====================================================
-                   3️⃣ SYNC THE NEGATIVE MIRROR SALE'S PAID AMOUNT
-                   Only paidAmount on the negative sale reflects the
-                   customer refund side — net/sell/profit stay mirrored
-                   to the original sale and are untouched by fee/charge edits.
-                   Found via refundRecordId now, not documentNo string match.
-                ==================================================== */
                 const negativeSale = await tx.sale.findFirst({
                     where: { refundRecordId: refundId }
                 });
@@ -748,28 +666,6 @@ router.delete("/:refundId", authenticate, async (req, res) => {
                         data:  { balance: { increment: vendorReverseDelta } }
                     });
                 }
-
-                /* ====================================================
-                   3️⃣ REVERSE CUSTOMER-SIDE ACCOUNT BALANCE
-                   Applies to:
-                     - pure CREDIT sales (uses originalSale.customer directly)
-                     - PARTIAL sales that included a CREDIT leg (uses that
-                       leg's customer)
-
-                   NOTE: this reverses the FULL refund.netRefundToCustomer,
-                   uncapped — matching what POST actually credited. Since
-                   the customer's balance may currently be negative (i.e.
-                   the business owes them money from this refund), this
-                   increment correctly restores it back to whatever it was
-                   before the refund was ever created, even if that means
-                   moving from a negative value back up to a positive one.
-
-                   TABBY_OR_TAMARA: reverses whichever account (the
-                   customer's, or cash) this refund's customer-side ledger
-                   entry actually lives on — not assumed from today's
-                   customerType — so it's correct for both new pass-through
-                   refunds and any created before this fix.
-                ==================================================== */
                 const pt = String(originalSale.paymentType).toUpperCase();
                 const isCredit = pt === "CREDIT";
 
