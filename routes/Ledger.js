@@ -276,14 +276,9 @@ router.get("/", authenticate, async (req, res) => {
       from,
       to,
       timezone, // IANA tz from the client, e.g. "Asia/Karachi" — falls back to UTC if omitted/invalid
-      page = 1,
-      limit = 50,
       includeDetails = "true",
       includeSummary = "true", // default ON; pass false to skip the extra scan
     } = req.query;
-
-    const take = Math.min(100, Math.max(1, Number(limit)));
-    const skip = (Number(page) - 1) * take;
 
     /* ---------- Account Type Filter ---------- */
     let accountTypeFilter;
@@ -334,8 +329,11 @@ router.get("/", authenticate, async (req, res) => {
       },
     };
 
-    /* ---------- Query (paginated entries + total count + full-set totals) ---------- */
-    const [rawEntries, total, summary] = await Promise.all([
+    /* ---------- Query (whole filtered set + full-set totals) ----------
+       No skip/take — every matching entry is returned in one go and
+       paginated client-side (by page size only, no re-request per page),
+       same approach as GET /api/sales and GET /api/refunds. ---------- */
+    const [rawEntries, summary] = await Promise.all([
       prisma.ledgerEntry.findMany({
         where,
         include: {
@@ -350,10 +348,7 @@ router.get("/", authenticate, async (req, res) => {
           },
         },
         orderBy: { transactionDate: "desc" },
-        skip,
-        take,
       }),
-      prisma.ledgerEntry.count({ where }),
       includeSummary !== "false" ? computeAccountTotals(where) : null,
     ]);
 
@@ -368,10 +363,7 @@ router.get("/", authenticate, async (req, res) => {
       success: true,
       data: entries,
       meta: {
-        page: Number(page),
-        limit: take,
-        total,
-        totalPages: Math.ceil(total / take),
+        total: entries.length,
       },
       ...(summary && { summary }), // omitted entirely when includeSummary=false
     });

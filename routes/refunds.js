@@ -149,8 +149,6 @@ function resolveDateFilter(startDate, endDate, timeZone) {
 /* ======================= LIST REFUNDS ======================= */
 router.get("/", authenticate, async (req, res) => {
     const {
-        page = 1,
-        limit = 20,
         status,
         saleId,
         startDate,
@@ -161,9 +159,6 @@ router.get("/", authenticate, async (req, res) => {
         search,
         processedById
     } = req.query;
-
-    const skip = (Number(page) - 1) * Number(limit);
-    const take = Number(limit);
 
     // Each condition below is pushed into `filters` and combined with AND,
     // so search + status + saleId + date range + processedBy can all be
@@ -204,52 +199,44 @@ router.get("/", authenticate, async (req, res) => {
     const where = filters.length > 0 ? { AND: filters } : {};
 
     try {
-        const [refunds, total] = await prisma.$transaction([
-            prisma.refund.findMany({
-                where,
-                skip,
-                take,
-                orderBy: { [sortBy]: sortOrder },
-                include: {
-                    sale: {
-                        select: {
-                            id: true,
-                            netPrice: true,
-                            sellPrice: true,
-                            documentNo: true,
-                            vendor: { select: { id: true, vendorName: true } },
-                            // customerType exposed so the UI can flag TABBY/TAMARA
-                            // pass-through refunds (paid out in cash, not credited
-                            // back to this customer's receivable balance).
-                            customer: { select: { id: true, customerName: true, customerType: true } },
-                            invoice: {
-                                select: {
-                                    id: true,
-                                    invoiceNo: true,
-                                    saleDate: true
-                                }
+        // No skip/take — the whole filtered set is returned in one go and
+        // paginated client-side (by page size only, no re-request per page),
+        // same approach as GET /api/sales.
+        const refunds = await prisma.refund.findMany({
+            where,
+            orderBy: { [sortBy]: sortOrder },
+            include: {
+                sale: {
+                    select: {
+                        id: true,
+                        netPrice: true,
+                        sellPrice: true,
+                        documentNo: true,
+                        vendor: { select: { id: true, vendorName: true } },
+                        // customerType exposed so the UI can flag TABBY/TAMARA
+                        // pass-through refunds (paid out in cash, not credited
+                        // back to this customer's receivable balance).
+                        customer: { select: { id: true, customerName: true, customerType: true } },
+                        invoice: {
+                            select: {
+                                id: true,
+                                invoiceNo: true,
+                                saleDate: true
                             }
                         }
-                    },
-                    processedBy: {
-                        select: { id: true, fullName: true, email: true }
-                    },
-                    // Present only when refundType is BANK_TRANSFER.
-                    bank: { select: { id: true, bankName: true } }
-                }
-            }),
-            prisma.refund.count({ where })
-        ]);
+                    }
+                },
+                processedBy: {
+                    select: { id: true, fullName: true, email: true }
+                },
+                // Present only when refundType is BANK_TRANSFER.
+                bank: { select: { id: true, bankName: true } }
+            }
+        });
 
         return res.json({
             success: true,
-            data: refunds,
-            pagination: {
-                total,
-                page: Number(page),
-                pages: Math.ceil(total / take),
-                limit: take
-            }
+            data: refunds
         });
     } catch (err) {
         console.error(err);
