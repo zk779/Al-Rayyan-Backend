@@ -65,7 +65,10 @@ router.get("/", authenticate, async (req, res) => {
 		} else {
 			filters.push({ invoice: { userId: req.user.id } });
 		}
-		if (dateFrom || dateTo) {
+		// Searching by invoice #/document #/remarks looks across ALL dates —
+		// the whole point of a text search is finding something you can't
+		// place in time, so the date range is ignored while `search` is set.
+		if ((dateFrom || dateTo) && !search) {
 			const saleDateFilter = {};
 			const fromRange = localDayRangeToUtc(dateFrom, tz);
 			if (fromRange) saleDateFilter.gte = fromRange.start;
