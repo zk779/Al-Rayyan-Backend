@@ -38,7 +38,7 @@ async function authenticate(req, res, next) {
 }
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search, dateFrom, dateTo, order, createdById, branchId, tz, page = 1, limit = 20 } = req.query;
+		const { search, dateFrom, dateTo, order, createdById, branchId, tz } = req.query;
 
 		const filters = [];
 
@@ -81,14 +81,12 @@ router.get("/", authenticate, async (req, res) => {
 
 		const where = filters.length > 0 ? { AND: filters } : {};
 		const sortDirection = String(order || "").toLowerCase() === "asc" ? "asc" : "desc";
-		const take = Math.min(Math.max(Number(limit) || 20, 1), 200);
-		const skip = (Math.max(Number(page) || 1, 1) - 1) * take;
 
-		const [sales, total, summary] = await prisma.$transaction([
+		// No skip/take — the whole filtered set is returned in one go and
+		// paginated client-side (by page size only, no re-request per page).
+		const [sales, summary] = await prisma.$transaction([
 			prisma.sale.findMany({
 				where,
-				skip,
-				take,
 				orderBy: { invoice: { saleDate: sortDirection } },
 				select: {
 					id: true,
@@ -181,8 +179,7 @@ router.get("/", authenticate, async (req, res) => {
 					}
 				}
 			}),
-			prisma.sale.count({ where }),
-			// Grand totals across the WHOLE filtered set, not just this page.
+			// Grand totals across the whole filtered set.
 			prisma.sale.aggregate({ where, _sum: { netPrice: true, sellPrice: true, profit: true } })
 		]);
 
@@ -256,7 +253,6 @@ router.get("/", authenticate, async (req, res) => {
 		res.json({
 			success: true,
 			data,
-			pagination: { page: Math.max(Number(page) || 1, 1), limit: take, total, pages: Math.max(Math.ceil(total / take), 1) },
 			summary: {
 				totalNet: summary._sum.netPrice || 0,
 				totalSell: summary._sum.sellPrice || 0,
