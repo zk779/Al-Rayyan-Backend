@@ -26,15 +26,21 @@ async function authenticate(req, res, next) {
    A bank account can have zero, one, or several POS terminals — the
    frontend always submits the CURRENT full list for a bank, so both
    create and update just validate + (re)write that whole list rather
-   than trying to diff individual entries. */
+   than trying to diff individual entries. Each terminal can in turn
+   charge a different commission rate per card type it accepts
+   (commissionTypes — embedded, not a separate collection). */
 function validatePosMachines(posMachines) {
 	if (posMachines === undefined) return null;
 	if (!Array.isArray(posMachines)) return "posMachines must be an array";
 
 	for (const pos of posMachines) {
-		if (pos.commissionRate !== undefined && pos.commissionRate !== null && pos.commissionRate !== "") {
-			const rate = Number(pos.commissionRate);
-			if (isNaN(rate) || rate < 0) return "Invalid POS commission rate";
+		const commissionTypes = Array.isArray(pos.commissionTypes) ? pos.commissionTypes : [];
+		for (const ct of commissionTypes) {
+			if (!ct.cardType || !String(ct.cardType).trim()) return "Each commission type needs a card type";
+			if (ct.commissionRate !== undefined && ct.commissionRate !== null && ct.commissionRate !== "") {
+				const rate = Number(ct.commissionRate);
+				if (isNaN(rate) || rate < 0) return `Invalid commission rate for ${ct.cardType}`;
+			}
 		}
 	}
 	return null;
@@ -47,10 +53,15 @@ function toPosCreateData(pos, bankId) {
 		merchantId: pos.merchantId || null,
 		terminalId: pos.terminalId || null,
 		providerName: pos.providerName || null,
-		commissionRate:
-			pos.commissionRate !== undefined && pos.commissionRate !== null && pos.commissionRate !== ""
-				? Number(pos.commissionRate)
-				: null,
+		commissionTypes: (Array.isArray(pos.commissionTypes) ? pos.commissionTypes : [])
+			.filter((ct) => ct.cardType && String(ct.cardType).trim())
+			.map((ct) => ({
+				cardType: String(ct.cardType).trim(),
+				commissionRate:
+					ct.commissionRate !== undefined && ct.commissionRate !== null && ct.commissionRate !== ""
+						? Number(ct.commissionRate)
+						: null,
+			})),
 		isActive: pos.isActive === undefined ? true : Boolean(pos.isActive),
 	};
 }

@@ -327,24 +327,32 @@ model Bank {
     @@index([createdAt])
 }
 
+// One card network's commission/MDR rate on a POS terminal — e.g. Visa
+// 1.5%, Mada 1.0%. Embedded directly on Pos (no separate collection);
+// a terminal can charge a different rate per card type it accepts.
+type PosCommissionType {
+    cardType       String
+    commissionRate Float?
+}
+
 // A single POS (card machine) terminal linked to a bank account. A bank
 // account can have several of these (e.g. one per branch counter).
 model Pos {
-    id             String   @id @default(auto()) @map("_id") @db.ObjectId
-    bankId         String   @db.ObjectId
-    bank           Bank     @relation(fields: [bankId], references: [id])
+    id              String              @id @default(auto()) @map("_id") @db.ObjectId
+    bankId          String              @db.ObjectId
+    bank            Bank                @relation(fields: [bankId], references: [id])
     // Which office branch this specific terminal sits at — independent of
     // the bank account's own branch, since one account's POS machines can
     // be spread across several branches.
-    branchId       String?  @db.ObjectId
-    branch         Branch?  @relation(fields: [branchId], references: [id])
-    merchantId     String?
-    terminalId     String?
-    providerName   String?
-    commissionRate Float?
-    isActive       Boolean  @default(true)
-    createdAt      DateTime @default(now())
-    updatedAt      DateTime @updatedAt
+    branchId        String?             @db.ObjectId
+    branch          Branch?             @relation(fields: [branchId], references: [id])
+    merchantId      String?
+    terminalId      String?
+    providerName    String?
+    commissionTypes PosCommissionType[]
+    isActive        Boolean             @default(true)
+    createdAt       DateTime            @default(now())
+    updatedAt       DateTime            @updatedAt
 
     @@index([bankId])
     @@index([branchId])
