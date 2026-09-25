@@ -16,6 +16,7 @@ enum PaymentType {
     CASH
     CREDIT
     BANK_TRANSFER
+    POS
     PARTIAL
 }
 
@@ -354,6 +355,8 @@ model Pos {
     createdAt       DateTime            @default(now())
     updatedAt       DateTime            @updatedAt
 
+    sales Sale[]
+
     @@index([bankId])
     @@index([branchId])
 }
@@ -404,6 +407,14 @@ model Sale {
     returnDate    DateTime?
     bankId String? @db.ObjectId
     bank   Bank?   @relation(fields: [bankId], references: [id])
+
+    // Populated only when paymentType = POS — which terminal was used,
+    // plus a snapshot of the card type + commission rate at time of sale
+    // (the Pos record's own rate can change later, so we freeze it here).
+    posId              String? @db.ObjectId
+    pos                Pos?    @relation(fields: [posId], references: [id])
+    posCardType        String?
+    posCommissionRate  Float?
 
     // Pricing & taxes
     netPrice    Float

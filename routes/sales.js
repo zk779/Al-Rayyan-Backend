@@ -136,6 +136,15 @@ router.get("/", authenticate, async (req, res) => {
 							account: { select: { balance: true } }
 						}
 					},
+					// POS terminal (populated when paymentType = POS)
+					pos: {
+						select: {
+							id: true,
+							terminalId: true,
+							providerName: true,
+							bank: { select: { bankName: true, account: { select: { balance: true } } } }
+						}
+					},
 					// Payment legs for PARTIAL sales — breakdown of how it was split
 					payments: {
 						select: {
@@ -229,6 +238,14 @@ router.get("/", authenticate, async (req, res) => {
 				cashAccountBalance: s.account?.balance ?? null,
 				bankName: s.bank?.bankName || null,
 				bankAccountBalance: s.bank?.account?.balance ?? null,
+				// POS context (populated when paymentType = POS)
+				posId: s.posId || null,
+				posCardType: s.posCardType || null,
+				posCommissionRate: s.posCommissionRate ?? null,
+				posTerminalId: s.pos?.terminalId || null,
+				posProviderName: s.pos?.providerName || null,
+				posBankName: s.pos?.bank?.bankName || null,
+				posAccountBalance: s.pos?.bank?.account?.balance ?? null,
 				// Split payment breakdown, if PARTIAL
 				paymentLegs: (s.payments || []).map(p => ({
 					id: p.id,
@@ -614,6 +631,24 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 								account: { select: { balance: true } },
 							},
 						},
+						// POS terminal for single POS sales
+						pos: {
+							select: {
+								id: true,
+								terminalId: true,
+								merchantId: true,
+								providerName: true,
+								commissionTypes: true,
+								bank: {
+									select: {
+										id: true,
+										bankName: true,
+										accountNumber: true,
+										branch: { select: { id: true, name: true, code: true } },
+									},
+								},
+							},
+						},
 						// Payment legs for PARTIAL sales
 						payments: {
 							select: {
@@ -675,6 +710,19 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 					bankId: sale.bank?.id || null,
 					bankName: sale.bank?.bankName || null,
 					accountNo: sale.bank?.accountNumber || null,
+				};
+			} else if (pt === "POS") {
+				paymentSummary = {
+					type: "POS",
+					label: "POS Machine",
+					amount: sale.paidAmount,
+					posId: sale.pos?.id || null,
+					terminalId: sale.pos?.terminalId || null,
+					providerName: sale.pos?.providerName || null,
+					bankId: sale.pos?.bank?.id || null,
+					bankName: sale.pos?.bank?.bankName || null,
+					cardType: sale.posCardType || null,
+					commissionRate: sale.posCommissionRate ?? null,
 				};
 			} else if (pt === "CREDIT") {
 				paymentSummary = {
@@ -848,6 +896,9 @@ router.post("/", authenticate, async (req, res) => {
 			if (pt === "BANK_TRANSFER" && !s.bankId)
 				throw new Error("bankId required for BANK_TRANSFER sales");
 
+			if (pt === "POS" && !s.posId)
+				throw new Error("posId required for POS sales");
+
 			if (pt === "PARTIAL") {
 				if (!Array.isArray(s.paymentLegs) || s.paymentLegs.length === 0)
 					throw new Error("paymentLegs array required for PARTIAL sales");
@@ -895,6 +946,18 @@ router.post("/", authenticate, async (req, res) => {
 			: [];
 		const customerMap = Object.fromEntries(customers.map(c => [c.id, c]));
 
+		const posIds = [...new Set(
+			sales
+				.filter(s => String(s.paymentType).toUpperCase() === "POS")
+				.map(s => s.posId)
+				.filter(Boolean)
+		)];
+
+		const posList = posIds.length
+			? await prisma.pos.findMany({ where: { id: { in: posIds } } })
+			: [];
+		const posMap = Object.fromEntries(posList.map(p => [p.id, p]));
+
 		const bankIds = [...new Set([
 			...sales
 				.filter(s => String(s.paymentType).toUpperCase() === "BANK_TRANSFER")
@@ -904,6 +967,7 @@ router.post("/", authenticate, async (req, res) => {
 					.filter(l => String(l.method).toUpperCase() === "BANK_TRANSFER")
 					.map(l => l.bankId)
 			),
+			...posList.map(p => p.bankId),
 		].filter(Boolean))];
 
 		const banks = bankIds.length
@@ -1152,6 +1216,9 @@ router.post("/", authenticate, async (req, res) => {
 						vendorId: s.vendorId,
 						customerId: saleCustomerId,
 						bankId: pt === "BANK_TRANSFER" ? (s.bankId || null) : null,
+						posId: pt === "POS" ? (s.posId || null) : null,
+						posCardType: pt === "POS" ? (s.posCardType || null) : null,
+						posCommissionRate: pt === "POS" ? (s.posCommissionRate ?? null) : null,
 						accountId: pt === "CASH" ? (await getCashAccount()).id : null,
 						documentNo: s.documentNo || null,
 						pnr: s.pnr || null,
@@ -1204,6 +1271,15 @@ router.post("/", authenticate, async (req, res) => {
 					const remainingBT = sell - paid;
 					if (remainingBT > 0 && s.customerId) {
 						await creditCustomer(s.customerId, remainingBT, 0, sale.id, "Balance due after bank transfer");
+					}
+				} else if (pt === "POS") {
+					const pos = posMap[s.posId];
+					if (!pos) throw new Error(`POS terminal not found: ${s.posId}`);
+					await creditBank(pos.bankId, paid, sale.id, "POS payment received");
+
+					const remainingPos = sell - paid;
+					if (remainingPos > 0 && s.customerId) {
+						await creditCustomer(s.customerId, remainingPos, 0, sale.id, "Balance due after POS payment");
 					}
 				} else if (pt === "CREDIT") {
 					await creditCustomer(s.customerId, sell, paid, sale.id, "Sale on credit");
@@ -1335,10 +1411,12 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		const vendorIdSet = new Set();
 		const customerIdSet = new Set();
 		const bankIdSet = new Set();
+		const posIdSet = new Set();
 		existingInvoice.sales.forEach(s => {
 			if (s.vendorId) vendorIdSet.add(s.vendorId);
 			if (s.customerId) customerIdSet.add(s.customerId);
 			if (s.bankId) bankIdSet.add(s.bankId);
+			if (s.posId) posIdSet.add(s.posId);
 			s.payments?.forEach(leg => {
 				if (leg.customerId) customerIdSet.add(leg.customerId);
 				if (leg.bankId) bankIdSet.add(leg.bankId);
@@ -1350,11 +1428,18 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			if (s.vendorId) vendorIdSet.add(s.vendorId);
 			if (s.customerId) customerIdSet.add(s.customerId);
 			if (s.bankId) bankIdSet.add(s.bankId);
+			if (s.posId) posIdSet.add(s.posId);
 			(s.paymentLegs || []).forEach(leg => {
 				if (leg.customerId) customerIdSet.add(leg.customerId);
 				if (leg.bankId) bankIdSet.add(leg.bankId);
 			});
 		});
+
+		const posList = posIdSet.size
+			? await prisma.pos.findMany({ where: { id: { in: [...posIdSet] } } })
+			: [];
+		posList.forEach(p => { if (p.bankId) bankIdSet.add(p.bankId); });
+		const posMap = new Map(posList.map(p => [p.id, p]));
 
 		const [vendors, customers, banks, existingCashAccount] = await Promise.all([
 			vendorIdSet.size
@@ -1448,6 +1533,36 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			/** Reverse a previous bank-received-payment (money out) */
 			const reverseBankPayment = async (bankId, amount, saleId) => {
 				const bank = bankMap.get(bankId);
+				if (!bank) return;
+				await tx.ledgerEntry.deleteMany({
+					where: { saleId, accountId: bank.account.id, entryType: "PAYMENT" },
+				});
+				adjBal(bank.account.id, -amount);
+			};
+
+			/** Apply a POS-received-payment ledger entry (money in, credited to the POS's linked bank) */
+			const applyPosPayment = async (posId, amount, saleId) => {
+				const pos = posMap.get(posId);
+				if (!pos) throw new Error(`POS terminal not found: ${posId}`);
+				const bank = bankMap.get(pos.bankId);
+				if (!bank) throw new Error(`Bank not found for POS: ${posId}`);
+				await tx.ledgerEntry.create({
+					data: {
+						accountId: bank.account.id, entryType: "PAYMENT",
+						debit: 0, credit: amount,
+						transactionDate: businessDate,
+						saleId, invoiceId,
+						remarks: `POS payment received - Invoice ${invoiceNo}`,
+					},
+				});
+				adjBal(bank.account.id, amount);
+			};
+
+			/** Reverse a previous POS-received-payment (money out) */
+			const reversePosPayment = async (posId, amount, saleId) => {
+				const pos = posMap.get(posId);
+				if (!pos) return;
+				const bank = bankMap.get(pos.bankId);
 				if (!bank) return;
 				await tx.ledgerEntry.deleteMany({
 					where: { saleId, accountId: bank.account.id, entryType: "PAYMENT" },
@@ -1645,6 +1760,13 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					}
 				}
 
+				if (pt === "POS" && sale.posId) {
+					await reversePosPayment(sale.posId, paid, sale.id);
+					if (sell - paid > 0 && sale.customer?.account) {
+						await reverseCreditSale(sale.customerId, sell - paid, 0, sale.id);
+					}
+				}
+
 				if (pt === "CREDIT" && sale.customer?.account) {
 					await reverseCreditSale(sale.customerId, sell, paid, sale.id);
 				}
@@ -1697,6 +1819,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				const vendorChanged = current.vendorId !== payload.vendorId;
 				const customerChanged = (current.customerId || null) !== (payload.customerId || null);
 				const bankChanged = (current.bankId || null) !== (payload.bankId || null);
+				const posChanged = (current.posId || null) !== (payload.posId || null);
 				const netChanged = oldNet !== newNet;
 				const sellChanged = oldSell !== newSell;
 				const paidChanged = oldPaid !== newPaid;
@@ -1707,6 +1830,8 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					throw new Error("customerId required for CREDIT sales");
 				if (newPt === "BANK_TRANSFER" && !payload.bankId)
 					throw new Error("bankId required for BANK_TRANSFER sales");
+				if (newPt === "POS" && !payload.posId)
+					throw new Error("posId required for POS sales");
 				if (newPt === "PARTIAL") {
 					if (!Array.isArray(payload.paymentLegs) || payload.paymentLegs.length === 0)
 						throw new Error("paymentLegs required for PARTIAL sales");
@@ -1778,7 +1903,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					}
 				}
 				const paymentSideChanged =
-					paymentTypeChanged || sellChanged || paidChanged || customerChanged || bankChanged ||
+					paymentTypeChanged || sellChanged || paidChanged || customerChanged || bankChanged || posChanged ||
 					(newPt === "PARTIAL"); // always re-sync partial legs
 
 				if (paymentSideChanged) {
@@ -1792,6 +1917,14 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						const oldRemainingBT = oldSell - oldPaid;
 						if (oldRemainingBT > 0 && current.customerId) {
 							await reverseCreditSale(current.customerId, oldRemainingBT, 0, current.id);
+						}
+					}
+
+					if (oldPt === "POS" && current.posId) {
+						await reversePosPayment(current.posId, oldPaid, current.id);
+						const oldRemainingPos = oldSell - oldPaid;
+						if (oldRemainingPos > 0 && current.customerId) {
+							await reverseCreditSale(current.customerId, oldRemainingPos, 0, current.id);
 						}
 					}
 
@@ -1831,6 +1964,14 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						const remainingBT = newSell - newPaid;
 						if (remainingBT > 0 && payload.customerId) {
 							await applyCreditSale(payload.customerId, remainingBT, 0, current.id);
+						}
+					}
+
+					else if (newPt === "POS") {
+						await applyPosPayment(payload.posId, newPaid, current.id);
+						const remainingPos = newSell - newPaid;
+						if (remainingPos > 0 && payload.customerId) {
+							await applyCreditSale(payload.customerId, remainingPos, 0, current.id);
 						}
 					}
 
@@ -1898,7 +2039,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 				];
 				const saleCustomerId = newPt === "PARTIAL"
 					? (payload.paymentLegs.find(l => String(l.method).toUpperCase() === "CREDIT")?.customerId || null)
-					: ((newPt === "CREDIT" || newPt === "BANK_TRANSFER") ? (payload.customerId || null) : null);
+					: ((newPt === "CREDIT" || newPt === "BANK_TRANSFER" || newPt === "POS") ? (payload.customerId || null) : null);
 
 				/* ── UPDATE SALE RECORD ── */
 				await tx.sale.update({
@@ -1908,6 +2049,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						vendorId: payload.vendorId,
 						customerId: saleCustomerId,
 						bankId: newPt === "BANK_TRANSFER" ? (payload.bankId || null) : null,
+						posId: newPt === "POS" ? (payload.posId || null) : null,
+						posCardType: newPt === "POS" ? (payload.posCardType || null) : null,
+						posCommissionRate: newPt === "POS" ? (payload.posCommissionRate ?? null) : null,
 						accountId: newPt === "CASH" ? (await getCashAccount()).id : null,
 						documentNo: payload.documentNo || null,
 						pnr: payload.pnr ?? current.pnr,
@@ -1987,6 +2131,7 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 							vendor: { include: { account: true } },
 							customer: { include: { account: true } },
 							bank: { include: { account: true } },
+							pos: { include: { bank: { include: { account: true } } } },
 							account: true, // cash account (populated when paymentType/leg = CASH)
 							payments: {
 								include: {
@@ -2084,6 +2229,41 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 						await tx.account.update({
 							where: { id: accId },
 							data: { balance: { decrement: remainingBT } },
+						});
+					}
+				}
+
+				else if (pt === "POS") {
+					if (sale.pos?.bank?.account) {
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: sale.pos.bank.account.id,
+								entryType: "PAYMENT",
+							},
+						});
+
+						await tx.account.update({
+							where: { id: sale.pos.bank.account.id },
+							data: { balance: { decrement: paid } },
+						});
+					}
+
+					const remainingPos = sell - paid;
+					if (remainingPos > 0 && sale.customer?.account) {
+						const accId = sale.customer.account.id;
+
+						await tx.ledgerEntry.deleteMany({
+							where: {
+								saleId: sale.id,
+								accountId: accId,
+								entryType: { in: ["SALE", "PAYMENT"] },
+							},
+						});
+
+						await tx.account.update({
+							where: { id: accId },
+							data: { balance: { decrement: remainingPos } },
 						});
 					}
 				}
@@ -2205,6 +2385,7 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 					vendor: { include: { account: true } },
 					customer: { include: { account: true } },
 					bank: { include: { account: true } },
+					pos: { include: { bank: { include: { account: true } } } },
 					account: true, // cash account
 					payments: {
 						include: {
@@ -2304,6 +2485,47 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 					await tx.account.update({
 						where: { id: accId },
 						data: { balance: { decrement: remainingBT } },
+					});
+				}
+			}
+
+			else if (pt === "POS") {
+				/* POS bank received paid amount in create API */
+				if (!sale.pos?.bank?.account) {
+					throw new Error("Related bank account not found for POS sale");
+				}
+
+				await tx.ledgerEntry.deleteMany({
+					where: {
+						saleId: sale.id,
+						accountId: sale.pos.bank.account.id,
+						entryType: "PAYMENT",
+					},
+				});
+
+				await tx.account.update({
+					where: { id: sale.pos.bank.account.id },
+					data: {
+						balance: { decrement: paid },
+					},
+				});
+
+				/* If there was a remaining balance charged to customer */
+				const remainingPos = sell - paid;
+				if (remainingPos > 0 && sale.customer?.account) {
+					const accId = sale.customer.account.id;
+
+					await tx.ledgerEntry.deleteMany({
+						where: {
+							saleId: sale.id,
+							accountId: accId,
+							entryType: { in: ["SALE", "PAYMENT"] },
+						},
+					});
+
+					await tx.account.update({
+						where: { id: accId },
+						data: { balance: { decrement: remainingPos } },
 					});
 				}
 			}
