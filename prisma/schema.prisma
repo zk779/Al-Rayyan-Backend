@@ -140,6 +140,8 @@ model Branch {
     users                  User[]
     salesInvoices          SalesInvoice[]
     vendorCustomerPayments VendorCustomerPayment[]
+    banks                  Bank[]
+    posMachines            Pos[]
 }
 
 model User {
@@ -300,7 +302,8 @@ model Bank {
     id             String   @id @default(auto()) @map("_id") @db.ObjectId
     bankName       String
     accountNumber  String   @unique
-    branchName     String?
+    branchId       String?  @db.ObjectId
+    branch         Branch?  @relation(fields: [branchId], references: [id])
     swiftCode      String?
     openingBalance Float    @default(0)
     accountId      String   @db.ObjectId
@@ -310,6 +313,10 @@ model Bank {
     createdAt      DateTime @default(now())
     updatedAt      DateTime @updatedAt
 
+    // A bank account may have zero, one, or several POS (card machine)
+    // terminals — see the Pos model below.
+    posMachines Pos[]
+
     sales                  Sale[]
     salePayments           SalePayment[]
     vendorCustomerPayments VendorCustomerPayment[]
@@ -318,6 +325,29 @@ model Bank {
 
     @@index([bankDate])
     @@index([createdAt])
+}
+
+// A single POS (card machine) terminal linked to a bank account. A bank
+// account can have several of these (e.g. one per branch counter).
+model Pos {
+    id             String   @id @default(auto()) @map("_id") @db.ObjectId
+    bankId         String   @db.ObjectId
+    bank           Bank     @relation(fields: [bankId], references: [id])
+    // Which office branch this specific terminal sits at — independent of
+    // the bank account's own branch, since one account's POS machines can
+    // be spread across several branches.
+    branchId       String?  @db.ObjectId
+    branch         Branch?  @relation(fields: [branchId], references: [id])
+    merchantId     String?
+    terminalId     String?
+    providerName   String?
+    commissionRate Float?
+    isActive       Boolean  @default(true)
+    createdAt      DateTime @default(now())
+    updatedAt      DateTime @updatedAt
+
+    @@index([bankId])
+    @@index([branchId])
 }
 
 model InvoiceCounter {

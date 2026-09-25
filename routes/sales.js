@@ -482,7 +482,7 @@ router.get("/customerSales", authenticate, async (req, res) => {
 						id: true,
 						bankName: true,
 						accountNumber: true,
-						branchName: true
+						branch: { select: { name: true } }
 					}
 				},
 				payments: {
@@ -546,7 +546,7 @@ router.get("/customerSales", authenticate, async (req, res) => {
 							id: s.bank.id,
 							bankName: s.bank.bankName,
 							accountNumber: s.bank.accountNumber,
-							branchName: s.bank.branchName
+							branchName: s.bank.branch?.name || null
 						}
 						: null,
 					payments: s.payments,
@@ -610,7 +610,7 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 								id: true,
 								bankName: true,
 								accountNumber: true,
-								branchName: true,
+								branch: { select: { id: true, name: true, code: true } },
 								account: { select: { balance: true } },
 							},
 						},
@@ -627,7 +627,7 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 										id: true,
 										bankName: true,
 										accountNumber: true,
-										branchName: true,
+										branch: { select: { id: true, name: true, code: true } },
 									},
 								},
 								customer: {

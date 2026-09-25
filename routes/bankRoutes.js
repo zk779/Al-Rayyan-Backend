@@ -22,6 +22,44 @@ async function authenticate(req, res, next) {
 	}
 }
 
+/* ======================= POS HELPERS =======================
+   A bank account can have zero, one, or several POS terminals — the
+   frontend always submits the CURRENT full list for a bank, so both
+   create and update just validate + (re)write that whole list rather
+   than trying to diff individual entries. */
+function validatePosMachines(posMachines) {
+	if (posMachines === undefined) return null;
+	if (!Array.isArray(posMachines)) return "posMachines must be an array";
+
+	for (const pos of posMachines) {
+		if (pos.commissionRate !== undefined && pos.commissionRate !== null && pos.commissionRate !== "") {
+			const rate = Number(pos.commissionRate);
+			if (isNaN(rate) || rate < 0) return "Invalid POS commission rate";
+		}
+	}
+	return null;
+}
+
+function toPosCreateData(pos, bankId) {
+	return {
+		bankId,
+		branchId: pos.branchId || null,
+		merchantId: pos.merchantId || null,
+		terminalId: pos.terminalId || null,
+		providerName: pos.providerName || null,
+		commissionRate:
+			pos.commissionRate !== undefined && pos.commissionRate !== null && pos.commissionRate !== ""
+				? Number(pos.commissionRate)
+				: null,
+		isActive: pos.isActive === undefined ? true : Boolean(pos.isActive),
+	};
+}
+
+const posMachinesInclude = {
+	orderBy: { createdAt: "asc" },
+	include: { branch: { select: { id: true, name: true, code: true } } },
+};
+
 /* ======================= GET ALL BANKS ======================= */
 router.get("/", authenticate, async (req, res) => {
 	try {
@@ -31,7 +69,11 @@ router.get("/", authenticate, async (req, res) => {
 			where: {
 				...(isActive !== undefined && { isActive: isActive === "true" }),
 			},
-			include: { account: { select: { balance: true } } },
+			include: {
+				account: { select: { balance: true } },
+				branch: { select: { id: true, name: true, code: true } },
+				posMachines: posMachinesInclude,
+			},
 			orderBy: {
 				[["createdAt", "bankDate"].includes(orderBy) ? orderBy : "bankDate"]:
 					orderDir === "asc" ? "asc" : "desc",
@@ -56,6 +98,8 @@ router.get("/:id", authenticate, async (req, res) => {
 						entries: { orderBy: { transactionDate: "asc" } },
 					},
 				},
+				branch: { select: { id: true, name: true, code: true } },
+				posMachines: posMachinesInclude,
 			},
 		});
 
@@ -71,10 +115,18 @@ router.get("/:id", authenticate, async (req, res) => {
 /* ======================= CREATE BANK ======================= */
 router.post("/", authenticate, async (req, res) => {
 	try {
-		const { bankName, accountNumber, branchName, swiftCode, openingBalance, bankDate, isActive } = req.body;
+		const {
+			bankName, accountNumber, branchId, swiftCode, openingBalance, bankDate, isActive,
+			posMachines,
+		} = req.body;
 
 		if (!bankName || !accountNumber) {
 			return res.status(400).json({ success: false, error: "bankName and accountNumber are required" });
+		}
+
+		const posError = validatePosMachines(posMachines);
+		if (posError) {
+			return res.status(400).json({ success: false, error: posError });
 		}
 
 		const exists = await prisma.bank.findUnique({ where: { accountNumber } });
@@ -100,7 +152,7 @@ router.post("/", authenticate, async (req, res) => {
 				data: {
 					bankName,
 					accountNumber,
-					branchName: branchName || null,
+					branchId: branchId || null,
 					swiftCode:  swiftCode  || null,
 					openingBalance: opening,
 					bankDate: businessDate,
@@ -108,6 +160,13 @@ router.post("/", authenticate, async (req, res) => {
 					accountId: account.id,
 				},
 			});
+
+			// 2b. Create its POS terminals, if any were submitted
+			if (Array.isArray(posMachines) && posMachines.length > 0) {
+				await Promise.all(
+					posMachines.map((pos) => tx.pos.create({ data: toPosCreateData(pos, created.id) })),
+				);
+			}
 
 			// 3. Link Account referenceId back to the bank
 			await tx.account.update({
@@ -130,7 +189,14 @@ router.post("/", authenticate, async (req, res) => {
 				});
 			}
 
-			return created;
+			return tx.bank.findUnique({
+				where: { id: created.id },
+				include: {
+					account: { select: { balance: true } },
+					branch: { select: { id: true, name: true, code: true } },
+					posMachines: posMachinesInclude,
+				},
+			});
 		});
 
 		res.status(201).json({ success: true, data: bank });
@@ -144,7 +210,15 @@ router.post("/", authenticate, async (req, res) => {
 /* ======================= UPDATE BANK ======================= */
 router.put("/:id", authenticate, async (req, res) => {
 	try {
-		const { bankName, accountNumber, branchName, swiftCode, openingBalance, bankDate, isActive } = req.body;
+		const {
+			bankName, accountNumber, branchId, swiftCode, openingBalance, bankDate, isActive,
+			posMachines,
+		} = req.body;
+
+		const posError = validatePosMachines(posMachines);
+		if (posError) {
+			return res.status(400).json({ success: false, error: posError });
+		}
 
 		const updated = await prisma.$transaction(async (tx) => {
 			// 1. Fetch Bank
@@ -166,12 +240,24 @@ router.put("/:id", authenticate, async (req, res) => {
 				data: {
 					...(bankName        && { bankName }),
 					...(accountNumber   && { accountNumber }),
-					...(branchName !== undefined && { branchName: branchName || null }),
+					...(branchId !== undefined && { branchId: branchId || null }),
 					...(swiftCode  !== undefined && { swiftCode:  swiftCode  || null }),
 					...(bankDate        && { bankDate: new Date(bankDate) }),
 					...(isActive !== undefined && { isActive: Boolean(isActive) }),
 				},
 			});
+
+			// 3b. Replace its POS terminals wholesale, if a list was submitted —
+			// the frontend always sends the full current list, so a full
+			// delete+recreate is simpler and safer than diffing individual rows.
+			if (posMachines !== undefined) {
+				await tx.pos.deleteMany({ where: { bankId: bank.id } });
+				if (posMachines.length > 0) {
+					await Promise.all(
+						posMachines.map((pos) => tx.pos.create({ data: toPosCreateData(pos, bank.id) })),
+					);
+				}
+			}
 
 			// 4. Sync Account name
 			if (bankName && bank.accountId) {
@@ -239,7 +325,11 @@ router.put("/:id", authenticate, async (req, res) => {
 
 			return tx.bank.findUnique({
 				where: { id: bank.id },
-				include: { account: true },
+				include: {
+					account: true,
+					branch: { select: { id: true, name: true, code: true } },
+					posMachines: posMachinesInclude,
+				},
 			});
 		});
 
@@ -289,6 +379,7 @@ router.delete("/:id", authenticate, async (req, res) => {
 		// Hard delete — no real transactions, safe to wipe
 		await prisma.$transaction([
 			prisma.ledgerEntry.deleteMany({ where: { accountId: bank.accountId } }),
+			prisma.pos.deleteMany({ where: { bankId: req.params.id } }),
 			prisma.bank.delete({ where: { id: req.params.id } }),
 			prisma.account.delete({ where: { id: bank.accountId } }),
 		]);
