@@ -170,6 +170,8 @@ router.get("/", authenticate, async (req, res) => {
 							cancellationCharges: true,
 							refundReason: true,
 							remarks: true,
+							refundType: true,
+							bank: { select: { bankName: true } },
 						}
 					},
 					// Refund that CREATED this sale (negative mirror sale side)
@@ -184,6 +186,8 @@ router.get("/", authenticate, async (req, res) => {
 							cancellationCharges: true,
 							refundReason: true,
 							remarks: true,
+							refundType: true,
+							bank: { select: { bankName: true } },
 						}
 					}
 				}
