@@ -1242,6 +1242,7 @@ router.post("/", authenticate, async (req, res) => {
 						paymentType: pt,
 						paymentStatus: paid >= sell ? "PAID" : paid > 0 ? "PARTIAL" : "DUE",
 						status: "COMPLETED",
+						remarks: s.remarks || null,
 					},
 				});
 
