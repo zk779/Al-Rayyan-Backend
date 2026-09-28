@@ -680,8 +680,30 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 							},
 							orderBy: { paymentDate: "asc" },
 						},
+						// Refund created FROM this sale (original sale side) — only
+						// the summary fields needed to badge it, matching GET / (list).
 						refunds: {
-							select: { id: true },
+							select: {
+								id: true,
+								status: true,
+								refundDate: true,
+								netRefundToCustomer: true,
+								refundType: true,
+								refundReason: true,
+								bank: { select: { bankName: true } },
+							},
+						},
+						// Refund that CREATED this sale (negative mirror sale side)
+						refundRecord: {
+							select: {
+								id: true,
+								status: true,
+								refundDate: true,
+								netRefundToCustomer: true,
+								refundType: true,
+								refundReason: true,
+								bank: { select: { bankName: true } },
+							},
 						},
 					},
 				},
@@ -692,11 +714,19 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 			return res.status(404).json({ success: false, error: "Invoice not found" });
 		}
 
-		const activeSales = invoice.sales.filter(
-			(sale) => !sale.refundRecordId && (!sale.refunds || sale.refunds.length === 0)
-		);
+		// By default (used by the Edit Sale form) refunded sales and their
+		// negative mirrors are hidden — they're not editable. The internal
+		// "View Invoice" staff page passes ?includeRefunded=true to see the
+		// complete, unfiltered invoice instead.
+		const includeRefunded = req.query.includeRefunded === "true";
+		const activeSales = includeRefunded
+			? invoice.sales
+			: invoice.sales.filter(
+				(sale) => !sale.refundRecordId && (!sale.refunds || sale.refunds.length === 0)
+			);
 		const enrichedSales = activeSales.map((sale) => {
-			const { refunds, ...saleWithoutRefunds } = sale;
+			const { refunds, refundRecord, ...saleWithoutRefunds } = sale;
+			const refund = (refunds && refunds.length > 0 ? refunds[0] : null) || refundRecord || null;
 			const pt = String(sale.paymentType).toUpperCase();
 			let paymentSummary;
 
@@ -770,7 +800,7 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 				paymentSummary = { type: pt, label: pt, amount: sale.paidAmount };
 			}
 
-			return { ...saleWithoutRefunds, paymentSummary };
+			return { ...saleWithoutRefunds, paymentSummary, refund };
 		});
 
 		res.json({
