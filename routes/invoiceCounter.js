@@ -31,14 +31,14 @@ function pad(num, size = 4) {
 }
 function buildKey(date = new Date()) {
   const yy = String(date.getFullYear()).slice(-2);
-  return `INV-ALR${yy}`; // INV-ALR26
+  return `INV-AMD${yy}`; // INV-AMD26
 }
 
 /* ----------------------- ✅ PREVIEW (LAST ISSUED) ----------------------- */
 /**
  * GET /api/invoice/preview?saleDate=2026-02-06
  * Returns last issued invoice number (no increment, no +1)
- * If none exists yet, returns INV-ALRxx-0000
+ * If none exists yet, returns INV-AMDxx-0000
  */
 router.get("/preview", authenticate, async (req, res) => {
   try {
@@ -75,7 +75,7 @@ router.get("/preview", authenticate, async (req, res) => {
 /**
  * GET /api/invoice/next?saleDate=2026-02-06
  * Returns last counter + 1 (but does NOT update DB)
- * If none exists yet, returns INV-ALRxx-0001
+ * If none exists yet, returns INV-AMDxx-0001
  */
 router.get("/next", authenticate, async (req, res) => {
   try {

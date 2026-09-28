@@ -4,7 +4,7 @@ function pad(num, size = 4) {
 
 function getInvoiceKey(date = new Date()) {
   const yy = String(date.getFullYear()).slice(-2);
-  return `INV-ALR${yy}`;
+  return `INV-AMD${yy}`;
 }
 
 export async function generateNextSalesInvoiceNo(tx, date = new Date()) {

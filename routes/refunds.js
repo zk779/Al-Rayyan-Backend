@@ -259,6 +259,7 @@ router.get("/:refundId", authenticate, async (req, res) => {
                     include: {
                         vendor: { include: { account: true } },
                         customer: { include: { account: true } },
+                        airline: { select: { airlineCode: true, airlineName: true } },
                         invoice: true
                     }
                 },
@@ -540,7 +541,7 @@ async function runWithRetry(fn, retries = 3) {
 
 router.put("/:refundId", authenticate, async (req, res) => {
     const { refundId } = req.params;
-    const { refundDate, refundFee, serviceCharges, refundReason, remarks } = req.body;
+    const { refundDate, refundFee, serviceCharges, refundReason, remarks, refundType, bankId } = req.body;
 
     try {
         const result = await runWithRetry(() =>
@@ -621,14 +622,82 @@ router.put("/:refundId", authenticate, async (req, res) => {
 
                 /* ====================================================
                    2️⃣ UPDATE CUSTOMER-SIDE PAYOUT LEDGER + BALANCE
-                   Note: this edits fee/serviceCharges/date/reason only —
-                   it does NOT change WHERE the refund was paid out to.
-                   Changing refundType/bankId on an existing refund isn't
-                   supported here (that would mean moving money from one
-                   account to another); delete and recreate the refund if
-                   the payout method itself was wrong.
+                   Two cases:
+                    - Payout method (refundType/bankId) is UNCHANGED: edit
+                      the existing ledger entry in place, adjusting the
+                      target account's balance by customerDelta only.
+                    - Payout method CHANGED (e.g. CASH -> BANK_TRANSFER, or
+                      switching banks): fully reverse the old entry/balance
+                      on the OLD account, then create a fresh entry and
+                      apply the full new amount on the NEW account — this
+                      is a real transfer between two different accounts, so
+                      a partial delta wouldn't make sense.
                 ==================================================== */
-                if (customerDelta !== 0) {
+                const requestedRefundType = refundType !== undefined ? refundType : existingRefund.refundType;
+                const requestedBankId = bankId !== undefined ? (bankId || null) : existingRefund.bankId;
+                const payoutChanged =
+                    requestedRefundType !== existingRefund.refundType ||
+                    (requestedRefundType === "BANK_TRANSFER" && requestedBankId !== existingRefund.bankId);
+
+                let newPayoutTarget = null;
+
+                if (payoutChanged) {
+                    // Resolve (and validate) the NEW target first — fails fast
+                    // on a bad bankId or a TABBY/TAMARA CUSTOMER_LEDGER misuse
+                    // before anything is reversed, so the transaction rolls
+                    // back cleanly on a bad request.
+                    newPayoutTarget = await resolveRefundPayoutTarget(tx, {
+                        originalSale,
+                        refundCustomer,
+                        refundType: requestedRefundType,
+                        bankId: requestedBankId,
+                    });
+
+                    const oldPayoutAccountId = existingRefund.payoutAccountId
+                        || (await resolveLegacyPayoutAccountId(tx, { originalSale, refundCustomer }));
+
+                    const oldCustSideLedger = oldPayoutAccountId
+                        ? await tx.ledgerEntry.findFirst({
+                            where: { saleId: originalSale.id, entryType: "REFUND", accountId: oldPayoutAccountId }
+                        })
+                        : null;
+
+                    if (!oldPayoutAccountId || !oldCustSideLedger) {
+                        throw new Error(
+                            "Couldn't locate the original payout ledger entry to reverse — delete and recreate this refund instead of changing its payout method."
+                        );
+                    }
+
+                    // Reverse the OLD account fully (undo the original
+                    // netRefundToCustomer, not just this edit's delta).
+                    await tx.ledgerEntry.delete({ where: { id: oldCustSideLedger.id } });
+                    await tx.account.update({
+                        where: { id: oldPayoutAccountId },
+                        data: { balance: { increment: Number(existingRefund.netRefundToCustomer) } }
+                    });
+
+                    // Apply the NEW account fully, with the up-to-date amount
+                    // (in case fee/serviceCharges were edited in this same request).
+                    await tx.ledgerEntry.create({
+                        data: {
+                            accountId: newPayoutTarget.accountId,
+                            entryType: "REFUND",
+                            debit: newPayoutTarget.type === "CUSTOMER_LEDGER" ? 0 : newNetRefundToCustomer,
+                            credit: newPayoutTarget.type === "CUSTOMER_LEDGER" ? newNetRefundToCustomer : 0,
+                            transactionDate: businessDate,
+                            saleId: originalSale.id,
+                            invoiceId: originalSale.invoiceId,
+                            refundId: existingRefund.id,
+                            remarks: buildPayoutRemarks(newPayoutTarget, originalSale, refundCustomer, { fee: newFee, charges: newCharges, refundReason: refundReason ?? existingRefund.refundReason }),
+                        }
+                    });
+
+                    await tx.account.update({
+                        where: { id: newPayoutTarget.accountId },
+                        data: { balance: { increment: -newNetRefundToCustomer } }
+                    });
+
+                } else if (customerDelta !== 0) {
                     const payoutAccountId = existingRefund.payoutAccountId
                         || (await resolveLegacyPayoutAccountId(tx, { originalSale, refundCustomer }));
 
@@ -703,6 +772,13 @@ router.put("/:refundId", authenticate, async (req, res) => {
                         refundDate:           businessDate,
                         refundReason:         refundReason  ?? existingRefund.refundReason,
                         remarks:              remarks        ?? existingRefund.remarks,
+                        ...(newPayoutTarget
+                            ? {
+                                refundType:      newPayoutTarget.type,
+                                payoutAccountId: newPayoutTarget.accountId,
+                                bankId:          newPayoutTarget.bankId,
+                            }
+                            : {}),
                     }
                 });
             }, { timeout: 20000, maxWait: 10000 })

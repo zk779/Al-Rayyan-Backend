@@ -847,7 +847,7 @@ router.get("/invoice-no", authenticate, async (req, res) => {
 		const date = saleDate ? new Date(saleDate) : new Date();
 
 		const yy = String(date.getFullYear()).slice(-2);
-		const key = `INV-ALR${yy}`;
+		const key = `INV-AMD${yy}`;
 
 		const counter = await prisma.invoiceCounter.findUnique({
 			where: { key },
