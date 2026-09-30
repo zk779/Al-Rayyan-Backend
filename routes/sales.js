@@ -583,6 +583,142 @@ router.get("/customerSales", authenticate, async (req, res) => {
 	}
 });
 
+/* ======================= VAT REPORT ======================= */
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
+
+router.get("/vat-report", authenticate, async (req, res) => {
+	try {
+		const { dateFrom, dateTo, tz } = req.query;
+		const permissions = req.user.permissions || [];
+
+		const scopeFilter = permissions.includes("SALE_VIEW_ALL")
+			? null
+			: permissions.includes("SALE_VIEW_BRANCH")
+				? { invoice: { branchId: req.user.branchId || null } }
+				: { invoice: { userId: req.user.id } };
+
+		const dateRangeFilter = (() => {
+			if (!dateFrom && !dateTo) return null;
+			const range = {};
+			const fromRange = localDayRangeToUtc(dateFrom, tz);
+			if (fromRange) range.gte = fromRange.start;
+			const toRange = localDayRangeToUtc(dateTo, tz);
+			if (toRange) range.lte = toRange.end;
+			return Object.keys(range).length ? range : null;
+		})();
+
+		// Purchasing/Selling totals — real sales only, never the internal
+		// negative-mirror row a refund creates to balance the ledger. Refunds
+		// are reported as their own explicit line below instead of being
+		// silently netted into these totals. Filtered by status rather than
+		// refundRecordId: null — Prisma's Mongo connector doesn't reliably
+		// match { refundRecordId: null } against documents where the field
+		// is simply absent (as opposed to explicitly stored null), so it
+		// matched nothing at all; every negative mirror is always status
+		// REFUNDED, which is a reliable substitute.
+		const saleFilters = [{ status: { not: "REFUNDED" } }];
+		if (scopeFilter) saleFilters.push(scopeFilter);
+		if (dateRangeFilter) saleFilters.push({ invoice: { saleDate: dateRangeFilter } });
+		const saleWhere = { AND: saleFilters };
+
+		// Refunds — same scope (reached via the original sale's invoice),
+		// dated by when the REFUND itself happened, not the original sale.
+		const refundFilters = [];
+		if (scopeFilter) refundFilters.push({ sale: scopeFilter });
+		if (dateRangeFilter) refundFilters.push({ refundDate: dateRangeFilter });
+		const refundWhere = refundFilters.length > 0 ? { AND: refundFilters } : {};
+
+		const [saleAggregate, refundAggregate, sales, refunds] = await Promise.all([
+			prisma.sale.aggregate({
+				where: saleWhere,
+				_sum: { netPrice: true, sellPrice: true },
+				_count: { _all: true },
+			}),
+			prisma.refund.aggregate({
+				where: refundWhere,
+				_sum: { netRefundToCustomer: true },
+				_count: { _all: true },
+			}),
+			prisma.sale.findMany({
+				where: saleWhere,
+				orderBy: { createdAt: "desc" },
+				select: {
+					id: true,
+					documentNo: true,
+					paxName: true,
+					status: true,
+					paymentType: true,
+					netPrice: true,
+					sellPrice: true,
+					vendor: { select: { vendorName: true } },
+					invoice: { select: { invoiceNo: true, saleDate: true } },
+				},
+			}),
+			prisma.refund.findMany({
+				where: refundWhere,
+				orderBy: { refundDate: "desc" },
+				select: {
+					id: true,
+					refundDate: true,
+					netRefundToCustomer: true,
+					refundReason: true,
+					sale: { select: { documentNo: true, invoice: { select: { invoiceNo: true } } } },
+				},
+			}),
+		]);
+
+		const totalNet = Number(saleAggregate._sum.netPrice || 0);
+		const totalSell = Number(saleAggregate._sum.sellPrice || 0);
+		const totalRefund = Number(refundAggregate._sum.netRefundToCustomer || 0);
+
+		// Exclusive 15% — added on top of each total, not extracted from
+		// within it.
+		const purchasingVat = round2(totalNet * 0.15);
+		const sellingVat = round2(totalSell * 0.15);
+		const refundVat = round2(totalRefund * 0.15);
+		// What's actually owed: VAT collected on sales, minus VAT already
+		// paid on purchases, minus VAT that must be given back on refunds.
+		const payableVat = round2(sellingVat - purchasingVat - refundVat);
+
+		res.json({
+			success: true,
+			data: {
+				totalNet: round2(totalNet),
+				purchasingVat,
+				totalSell: round2(totalSell),
+				sellingVat,
+				totalRefund: round2(totalRefund),
+				refundVat,
+				payableVat,
+				saleCount: saleAggregate._count._all,
+				refundCount: refundAggregate._count._all,
+				sales: sales.map((s) => ({
+					id: s.id,
+					documentNo: s.documentNo,
+					paxName: s.paxName,
+					status: s.status,
+					paymentType: s.paymentType,
+					netPrice: Number(s.netPrice || 0),
+					sellPrice: Number(s.sellPrice || 0),
+					vendorName: s.vendor?.vendorName || null,
+					invoiceNo: s.invoice?.invoiceNo || null,
+					saleDate: s.invoice?.saleDate || null,
+				})),
+				refunds: refunds.map((r) => ({
+					id: r.id,
+					refundDate: r.refundDate,
+					netRefundToCustomer: Number(r.netRefundToCustomer || 0),
+					refundReason: r.refundReason,
+					documentNo: r.sale?.documentNo || null,
+					invoiceNo: r.sale?.invoice?.invoiceNo || null,
+				})),
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({ success: false, error: "Failed to generate VAT report" });
+	}
+});
 
 /* ======================= GET INVOICE BY ID ======================= */
 router.get("/:invoiceId", authenticate, async (req, res) => {
