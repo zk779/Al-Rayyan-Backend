@@ -628,15 +628,10 @@ router.get("/vat-report", authenticate, async (req, res) => {
 		if (dateRangeFilter) refundFilters.push({ refundDate: dateRangeFilter });
 		const refundWhere = refundFilters.length > 0 ? { AND: refundFilters } : {};
 
-		const [saleAggregate, refundAggregate, sales, refunds] = await Promise.all([
+		const [saleAggregate, sales, refunds] = await Promise.all([
 			prisma.sale.aggregate({
 				where: saleWhere,
 				_sum: { netPrice: true, sellPrice: true },
-				_count: { _all: true },
-			}),
-			prisma.refund.aggregate({
-				where: refundWhere,
-				_sum: { netRefundToCustomer: true },
 				_count: { _all: true },
 			}),
 			prisma.sale.findMany({
@@ -654,6 +649,9 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					invoice: { select: { invoiceNo: true, saleDate: true } },
 				},
 			}),
+			// Prisma can't _sum a field reached through a relation (refund ->
+			// sale -> profit), so the original sale's profit is pulled in here
+			// per refund and summed in JS below instead of via aggregate().
 			prisma.refund.findMany({
 				where: refundWhere,
 				orderBy: { refundDate: "desc" },
@@ -662,14 +660,26 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					refundDate: true,
 					netRefundToCustomer: true,
 					refundReason: true,
-					sale: { select: { documentNo: true, invoice: { select: { invoiceNo: true } } } },
+					sale: {
+						select: {
+							documentNo: true,
+							profit: true,
+							invoice: { select: { invoiceNo: true } },
+						},
+					},
 				},
 			}),
 		]);
 
 		const totalNet = Number(saleAggregate._sum.netPrice || 0);
 		const totalSell = Number(saleAggregate._sum.sellPrice || 0);
-		const totalRefund = Number(refundAggregate._sum.netRefundToCustomer || 0);
+
+		// The refund "amount" for VAT purposes is the ORIGINAL sale's profit
+		// (what VAT was actually charged on via the margin scheme), not the
+		// cash netRefundToCustomer paid back to the traveler — refund fees/
+		// service charges make those two figures diverge, and it's the
+		// profit that determines how much VAT needs to be reversed.
+		const totalRefund = refunds.reduce((sum, r) => sum + Number(r.sale?.profit || 0), 0);
 
 		// Exclusive 15% — added on top of each total, not extracted from
 		// within it.
@@ -691,7 +701,7 @@ router.get("/vat-report", authenticate, async (req, res) => {
 				refundVat,
 				payableVat,
 				saleCount: saleAggregate._count._all,
-				refundCount: refundAggregate._count._all,
+				refundCount: refunds.length,
 				sales: sales.map((s) => ({
 					id: s.id,
 					documentNo: s.documentNo,
@@ -708,6 +718,7 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					id: r.id,
 					refundDate: r.refundDate,
 					netRefundToCustomer: Number(r.netRefundToCustomer || 0),
+					originalProfit: Number(r.sale?.profit || 0),
 					refundReason: r.refundReason,
 					documentNo: r.sale?.documentNo || null,
 					invoiceNo: r.sale?.invoice?.invoiceNo || null,
