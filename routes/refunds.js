@@ -477,6 +477,10 @@ router.post("/", authenticate, async (req, res) => {
                     tripType: originalSale.tripType || null,
                     departureDate: originalSale.departureDate || null,
                     returnDate: originalSale.returnDate || null,
+                    saleType: originalSale.saleType || null,
+                    checkInDate: originalSale.checkInDate || null,
+                    checkOutDate: originalSale.checkOutDate || null,
+                    hotelName: originalSale.hotelName || null,
                     destinations: originalSale.destinations || null,
 
                     netPrice: -originalNet,

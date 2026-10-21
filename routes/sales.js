@@ -36,9 +36,37 @@ async function authenticate(req, res, next) {
 		return res.status(401).json({ error: "Invalid or expired token" });
 	}
 }
+// Resolves the sale-type specific "stay" fields for one sale payload.
+// AIRLINE (the default) carries none of them; HOTEL requires valid check-in and
+// check-out dates (check-out may not be before check-in) and takes an optional
+// hotel name. `current` is the existing DB row when editing, so fields that
+// aren't resent keep their stored value.
+function resolveStay(src, current = {}) {
+	const saleType = String(src.saleType ?? current.saleType ?? "AIRLINE").toUpperCase();
+	if (!["AIRLINE", "HOTEL"].includes(saleType))
+		throw new Error("saleType must be AIRLINE or HOTEL");
+
+	if (saleType !== "HOTEL")
+		return { saleType, checkInDate: null, checkOutDate: null, hotelName: null };
+
+	const pick = (key) => (src[key] !== undefined ? src[key] : current[key]);
+	const checkInDate = pick("checkInDate") ? new Date(pick("checkInDate")) : null;
+	const checkOutDate = pick("checkOutDate") ? new Date(pick("checkOutDate")) : null;
+
+	if (!checkInDate || isNaN(checkInDate.getTime()))
+		throw new Error("checkInDate is required for HOTEL sales");
+	if (!checkOutDate || isNaN(checkOutDate.getTime()))
+		throw new Error("checkOutDate is required for HOTEL sales");
+	if (checkOutDate < checkInDate)
+		throw new Error("checkOutDate cannot be before checkInDate");
+
+	const hotelName = String(pick("hotelName") ?? "").trim() || null;
+	return { saleType, checkInDate, checkOutDate, hotelName };
+}
+
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search, dateFrom, dateTo, order, createdById, branchId, tz } = req.query;
+		const { search, dateFrom, dateTo, order, createdById, branchId, tz, saleType } = req.query;
 
 		const filters = [];
 
@@ -48,10 +76,20 @@ router.get("/", authenticate, async (req, res) => {
 				OR: [
 					{ invoice: { invoiceNo: { contains: search, mode: "insensitive" } } },
 					{ documentNo: { contains: search, mode: "insensitive" } },
-					{ remarks: { contains: search, mode: "insensitive" } }
+					{ remarks: { contains: search, mode: "insensitive" } },
+					{ hotelName: { contains: search, mode: "insensitive" } }
 				]
 			});
 		}
+		// Optional ?saleType=AIRLINE|HOTEL. Legacy sales that predate the field have
+		// no saleType stored at all, so AIRLINE must also match "field not set"
+		// (Mongo's `not: "HOTEL"` would skip those documents entirely).
+		if (String(saleType || "").toUpperCase() === "HOTEL") {
+			filters.push({ saleType: "HOTEL" });
+		} else if (String(saleType || "").toUpperCase() === "AIRLINE") {
+			filters.push({ OR: [{ saleType: "AIRLINE" }, { saleType: null }, { saleType: { isSet: false } }] });
+		}
+
 		const permissions = req.user.permissions || [];
 
 		if (permissions.includes("SALE_VIEW_ALL")) {
@@ -102,6 +140,11 @@ router.get("/", authenticate, async (req, res) => {
 					remarks: true,
 					pnr: true,
 					paxName: true,
+					saleType: true,
+					checkInDate: true,
+					checkOutDate: true,
+					hotelName: true,
+					destinations: true,
 					invoice: {
 						select: {
 							id: true,
@@ -233,6 +276,11 @@ router.get("/", authenticate, async (req, res) => {
 				documentNo: s.documentNo,
 				pnr: s.pnr,
 				paxName: s.paxName,
+				saleType: s.saleType || "AIRLINE",
+				checkInDate: s.checkInDate || null,
+				checkOutDate: s.checkOutDate || null,
+				hotelName: s.hotelName || null,
+				destinations: Array.isArray(s.destinations) ? s.destinations : [],
 				vendorName: s.vendor?.vendorName || null,
 				vendorCategory: s.vendor?.category || null,
 				vendorBalance: s.vendor?.account?.balance ?? null,
@@ -779,6 +827,7 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 								airlineName: true,
 								airlineCode: true,
 								iataName: true,
+								icao_code: true,
 							},
 						},
 						customer: {
@@ -1105,6 +1154,8 @@ router.post("/", authenticate, async (req, res) => {
 			if (net < 0 || sell < 0) throw new Error("Prices cannot be negative");
 			if (paid < 0 || paid > sell) throw new Error("Invalid paidAmount");
 			if (vat < 0 || paxVat < 0 || misc < 0) throw new Error("Taxes/charges cannot be negative");
+
+			resolveStay(s); // validates saleType + hotel dates
 
 			const pt = String(s.paymentType).toUpperCase();
 
@@ -1474,9 +1525,10 @@ router.post("/", authenticate, async (req, res) => {
 						documentNo: s.documentNo || null,
 						pnr: s.pnr || null,
 						routeType: s.routeType || null,
-						tripType: s.tripType || "Oneway",
+						tripType: String(s.saleType || "").toUpperCase() === "HOTEL" ? null : (s.tripType || "Oneway"),
 						departureDate: s.departureDate ? new Date(s.departureDate) : null,
 						returnDate: s.returnDate ? new Date(s.returnDate) : null,
+						...resolveStay(s),
 						paxName: s.paxName || null,
 						destinations: s.destinations || null,
 						netPrice: net,
@@ -1658,6 +1710,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 					`Sale not found or not editable (it may already be refunded): ${s.id}`
 				);
 			}
+			resolveStay(s, saleMap.get(s.id)); // validates saleType + hotel dates
 		}
 		const payloadSaleIds = new Set(sales.map(s => s.id));
 		const deletedSales = editableSales.filter(s => !payloadSaleIds.has(s.id));
@@ -2355,6 +2408,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						tripType: payload.tripType ?? current.tripType,
 						departureDate: payload.departureDate ? new Date(payload.departureDate) : current.departureDate,
 						returnDate: payload.returnDate ? new Date(payload.returnDate) : current.returnDate,
+						...resolveStay(payload, current),
 						paxName: payload.paxName === undefined ? current.paxName : payload.paxName,
 						destinations: payload.destinations ?? current.destinations,
 						netPrice: newNet,

@@ -110,6 +110,7 @@ router.get("/", authenticate, async (req, res) => {
       paymentStatus,
       saleStatus,
       paymentMethod,
+      saleType,
       order,
     } = req.query;
 
@@ -153,6 +154,12 @@ router.get("/", authenticate, async (req, res) => {
       ...(airlineId ? { airlineId } : {}),
       ...(paymentStatus ? { paymentStatus } : {}),
       ...(saleStatus ? { status: saleStatus } : {}),
+      // Legacy sales have no saleType stored, so AIRLINE also matches "not set"
+      ...(String(saleType || "").toUpperCase() === "HOTEL"
+        ? { saleType: "HOTEL" }
+        : String(saleType || "").toUpperCase() === "AIRLINE"
+          ? { OR: [{ saleType: "AIRLINE" }, { saleType: null }, { saleType: { isSet: false } }] }
+          : {}),
       ...(paymentMethod === "POS"
         ? { OR: [{ paymentType: "POS" }, { payments: { some: { method: "POS" } } }] }
         : paymentMethod
@@ -212,6 +219,7 @@ router.get("/", authenticate, async (req, res) => {
         agent: s.invoice?.user?.fullName ?? "-",
         agentId: s.invoice?.userId ?? null,
         paymentMethod: s.paymentType,
+        saleType: s.saleType || "AIRLINE",
         paymentStatus: s.paymentStatus,
         status: s.status,
         netPrice: s.netPrice,

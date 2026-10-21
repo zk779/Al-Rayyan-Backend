@@ -20,6 +20,11 @@ enum PaymentType {
   PARTIAL
 }
 
+enum SaleType {
+  AIRLINE
+  HOTEL
+}
+
 enum SaleStatus {
   PENDING
   COMPLETED
@@ -406,6 +411,15 @@ model Sale {
   tripType      String?   @default("Oneway")
   departureDate DateTime?
   returnDate    DateTime?
+
+  // Sale type: AIRLINE (default; also what every pre-existing sale is) or
+  // HOTEL. Hotel bookings reuse the same pricing/payment/VAT fields and the
+  // airline dropdown (the "Domestic Hotel" / "International Hotel" entries).
+  // Optional so sales created before this field existed still read cleanly.
+  saleType     SaleType?
+  checkInDate  DateTime?
+  checkOutDate DateTime?
+  hotelName    String?
   bankId        String?   @db.ObjectId
   bank          Bank?     @relation(fields: [bankId], references: [id])
 
