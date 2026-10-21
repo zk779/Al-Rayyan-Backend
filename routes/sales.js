@@ -153,7 +153,17 @@ router.get("/", authenticate, async (req, res) => {
 							amount: true,
 							remarks: true,
 							paymentDate: true,
+							posCardType: true,
+							posCommissionRate: true,
 							bank: { select: { bankName: true } },
+							pos: {
+								select: {
+									id: true,
+									terminalId: true,
+									providerName: true,
+									bank: { select: { bankName: true } }
+								}
+							},
 							customer: { select: { customerName: true } },
 							account: { select: { balance: true } }
 						}
@@ -258,6 +268,12 @@ router.get("/", authenticate, async (req, res) => {
 					remarks: p.remarks,
 					paymentDate: p.paymentDate,
 					bankName: p.bank?.bankName || null,
+					posId: p.pos?.id || null,
+					posCardType: p.posCardType || null,
+					posCommissionRate: p.posCommissionRate ?? null,
+					posTerminalId: p.pos?.terminalId || null,
+					posProviderName: p.pos?.providerName || null,
+					posBankName: p.pos?.bank?.bankName || null,
 					customerName: p.customer?.customerName || null,
 					cashAccountBalance: p.account?.balance ?? null
 				})),
@@ -512,7 +528,10 @@ router.get("/customerSales", authenticate, async (req, res) => {
 						method: true,
 						amount: true,
 						paymentDate: true,
-						remarks: true
+						remarks: true,
+						posId: true,
+						posCardType: true,
+						posCommissionRate: true
 					},
 					orderBy: { paymentDate: "asc" }
 				},
@@ -805,6 +824,17 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 							select: {
 								id: true,
 								method: true,
+								posCardType: true,
+								posCommissionRate: true,
+								pos: {
+									select: {
+										id: true,
+										terminalId: true,
+										providerName: true,
+										commissionTypes: true,
+										bank: { select: { id: true, bankName: true } },
+									},
+								},
 								amount: true,
 								paymentDate: true,
 								remarks: true,
@@ -825,7 +855,7 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 									},
 								},
 							},
-							orderBy: { paymentDate: "asc" },
+							orderBy: [{ paymentDate: "asc" }, { createdAt: "asc" }],
 						},
 						// Refund created FROM this sale (original sale side) — only
 						// the summary fields needed to badge it, matching GET / (list).
@@ -928,6 +958,13 @@ router.get("/:invoiceId", authenticate, async (req, res) => {
 						bankId: lm === "BANK_TRANSFER" ? (leg.bank?.id || null) : null,
 						bankName: lm === "BANK_TRANSFER" ? (leg.bank?.bankName || null) : null,
 						accountNo: lm === "BANK_TRANSFER" ? (leg.bank?.accountNumber || null) : null,
+						// POS fields — only populated for POS legs
+						posId: lm === "POS" ? (leg.pos?.id || null) : null,
+						posCardType: lm === "POS" ? (leg.posCardType || null) : null,
+						posCommissionRate: lm === "POS" ? (leg.posCommissionRate ?? null) : null,
+						terminalId: lm === "POS" ? (leg.pos?.terminalId || null) : null,
+						providerName: lm === "POS" ? (leg.pos?.providerName || null) : null,
+						posBankName: lm === "POS" ? (leg.pos?.bank?.bankName || null) : null,
 						// customer fields — only populated for CREDIT legs
 						customerId: lm === "CREDIT" ? (leg.customer?.id || null) : null,
 						customerName: lm === "CREDIT" ? (leg.customer?.customerName || null) : null,
@@ -1086,12 +1123,14 @@ router.post("/", authenticate, async (req, res) => {
 
 				for (const leg of s.paymentLegs) {
 					const legMethod = String(leg.method || "").toUpperCase();
-					if (!["CASH", "BANK_TRANSFER", "CREDIT"].includes(legMethod))
+					if (!["CASH", "BANK_TRANSFER", "POS", "CREDIT"].includes(legMethod))
 						throw new Error(`Invalid payment leg method: ${leg.method}`);
 					if (!Number(leg.amount) || Number(leg.amount) <= 0)
 						throw new Error("Each payment leg must have a positive amount");
 					if (legMethod === "BANK_TRANSFER" && !leg.bankId)
 						throw new Error("bankId required for BANK_TRANSFER leg");
+					if (legMethod === "POS" && !leg.posId)
+						throw new Error("posId required for POS leg");
 					if (legMethod === "CREDIT" && !leg.customerId)
 						throw new Error("customerId required for CREDIT leg");
 				}
@@ -1127,12 +1166,16 @@ router.post("/", authenticate, async (req, res) => {
 			: [];
 		const customerMap = Object.fromEntries(customers.map(c => [c.id, c]));
 
-		const posIds = [...new Set(
-			sales
+		const posIds = [...new Set([
+			...sales
 				.filter(s => String(s.paymentType).toUpperCase() === "POS")
-				.map(s => s.posId)
-				.filter(Boolean)
-		)];
+				.map(s => s.posId),
+			...sales.flatMap(s =>
+				(s.paymentLegs || [])
+					.filter(l => String(l.method).toUpperCase() === "POS")
+					.map(l => l.posId)
+			),
+		].filter(Boolean))];
 
 		const posList = posIds.length
 			? await prisma.pos.findMany({ where: { id: { in: posIds } } })
@@ -1254,6 +1297,13 @@ router.post("/", authenticate, async (req, res) => {
 				});
 			};
 
+			// A POS leg/sale credits whichever bank account the terminal is linked to.
+			const creditPos = async (posId, amount, saleId, label) => {
+				const pos = posMap[posId];
+				if (!pos) throw new Error(`POS terminal not found: ${posId}`);
+				await creditBank(pos.bankId, amount, saleId, label);
+			};
+
 			const creditCustomer = async (customerId, saleAmount, paidNow, saleId, label) => {
 				const cust = customerMap[customerId];
 				if (!cust) throw new Error(`Customer not found: ${customerId}`);
@@ -1324,6 +1374,9 @@ router.post("/", authenticate, async (req, res) => {
 							method: legMethod,
 							amount: legAmount,
 							bankId: legMethod === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+							posId: legMethod === "POS" ? (leg.posId || null) : null,
+							posCardType: legMethod === "POS" ? (leg.posCardType || null) : null,
+							posCommissionRate: legMethod === "POS" ? (leg.posCommissionRate ?? null) : null,
 							accountId: legMethod === "CASH" ? (await getCashAccount()).id : null,
 							customerId: legMethod === "CREDIT" ? (leg.customerId || null) : null,
 							remarks: leg.remarks || null,
@@ -1361,6 +1414,23 @@ router.post("/", authenticate, async (req, res) => {
 								saleId: sale.id,
 								invoiceId: invoice.id,
 								remarks: `Bank transfer payment against credit sale - Invoice ${invoiceNo}`,
+							},
+						});
+
+						totalPaidNow += legAmount;
+					} else if (legMethod === "POS") {
+						await creditPos(leg.posId, legAmount, sale.id, "Partial POS payment received");
+
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: cust.account.id,
+								entryType: "PAYMENT",
+								debit: 0,
+								credit: legAmount,
+								transactionDate: businessDate,
+								saleId: sale.id,
+								invoiceId: invoice.id,
+								remarks: `POS payment against credit sale - Invoice ${invoiceNo}`,
 							},
 						});
 
@@ -1481,23 +1551,28 @@ router.post("/", authenticate, async (req, res) => {
 									method: legMethod,
 									amount: legAmount,
 									bankId: legMethod === "BANK_TRANSFER" ? (leg.bankId || null) : null,
-									accountId: legMethod === "CASH" ? (await getCashAccount()).id : null,
-									customerId: null,
-									remarks: leg.remarks || null,
-									paymentDate: businessDate,
-								},
-							});
+										posId: legMethod === "POS" ? (leg.posId || null) : null,
+										posCardType: legMethod === "POS" ? (leg.posCardType || null) : null,
+										posCommissionRate: legMethod === "POS" ? (leg.posCommissionRate ?? null) : null,
+										accountId: legMethod === "CASH" ? (await getCashAccount()).id : null,
+										customerId: null,
+										remarks: leg.remarks || null,
+										paymentDate: businessDate,
+									},
+								});
 
-							if (legMethod === "CASH") {
-								await creditCash(legAmount, sale.id, "Partial cash payment received");
-							} else if (legMethod === "BANK_TRANSFER") {
-								await creditBank(
-									leg.bankId,
-									legAmount,
-									sale.id,
-									"Partial bank transfer received"
-								);
-							}
+								if (legMethod === "CASH") {
+									await creditCash(legAmount, sale.id, "Partial cash payment received");
+								} else if (legMethod === "BANK_TRANSFER") {
+									await creditBank(
+										leg.bankId,
+										legAmount,
+										sale.id,
+										"Partial bank transfer received"
+									);
+								} else if (legMethod === "POS") {
+									await creditPos(leg.posId, legAmount, sale.id, "Partial POS payment received");
+								}
 						}
 					}
 				}
@@ -1602,6 +1677,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			s.payments?.forEach(leg => {
 				if (leg.customerId) customerIdSet.add(leg.customerId);
 				if (leg.bankId) bankIdSet.add(leg.bankId);
+				if (leg.posId) posIdSet.add(leg.posId);
 			});
 		});
 
@@ -1614,6 +1690,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			(s.paymentLegs || []).forEach(leg => {
 				if (leg.customerId) customerIdSet.add(leg.customerId);
 				if (leg.bankId) bankIdSet.add(leg.bankId);
+				if (leg.posId) posIdSet.add(leg.posId);
 			});
 		});
 
@@ -1845,6 +1922,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 							method: lm,
 							amount: legAmount,
 							bankId: lm === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+							posId: lm === "POS" ? (leg.posId || null) : null,
+							posCardType: lm === "POS" ? (leg.posCardType || null) : null,
+							posCommissionRate: lm === "POS" ? (leg.posCommissionRate ?? null) : null,
 							accountId: lm === "CASH" ? (await getCashAccount()).id : null,
 							customerId: lm === "CREDIT" ? (leg.customerId || null) : null,
 							remarks: leg.remarks || null,
@@ -1884,6 +1964,22 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						});
 
 						totalPaidNow += legAmount;
+					} else if (lm === "POS") {
+						await applyPosPayment(leg.posId, legAmount, saleId);
+
+						await tx.ledgerEntry.create({
+							data: {
+								accountId: cust.account.id,
+								entryType: "PAYMENT",
+								debit: 0,
+								credit: legAmount,
+								transactionDate: businessDate,
+								saleId, invoiceId,
+								remarks: `POS payment against credit sale - Invoice ${invoiceNo}`,
+							},
+						});
+
+						totalPaidNow += legAmount;
 					}
 				}
 
@@ -1907,6 +2003,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						oldTotalPaidNow += legAmount;
 					} else if (lm === "BANK_TRANSFER" && leg.bankId) {
 						await reverseBankPayment(leg.bankId, legAmount, sale.id);
+						oldTotalPaidNow += legAmount;
+					} else if (lm === "POS" && leg.posId) {
+						await reversePosPayment(leg.posId, legAmount, sale.id);
 						oldTotalPaidNow += legAmount;
 					}
 				}
@@ -1969,6 +2068,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 							if (lm === "BANK_TRANSFER" && leg.bank?.account) {
 								await reverseBankPayment(leg.bankId, leg.amount, sale.id);
 							}
+							if (lm === "POS" && leg.posId) {
+								await reversePosPayment(leg.posId, leg.amount, sale.id);
+							}
 						}
 					}
 					await tx.salePayment.deleteMany({ where: { saleId: sale.id } });
@@ -2019,12 +2121,14 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						throw new Error("paymentLegs required for PARTIAL sales");
 					for (const leg of payload.paymentLegs) {
 						const lm = String(leg.method || "").toUpperCase();
-						if (!["CASH", "BANK_TRANSFER", "CREDIT"].includes(lm))
+						if (!["CASH", "BANK_TRANSFER", "POS", "CREDIT"].includes(lm))
 							throw new Error(`Invalid payment leg method: ${leg.method}`);
 						if (!Number(leg.amount) || Number(leg.amount) <= 0)
 							throw new Error("Each payment leg must have a positive amount");
 						if (lm === "BANK_TRANSFER" && !leg.bankId)
 							throw new Error("bankId required for BANK_TRANSFER leg");
+						if (lm === "POS" && !leg.posId)
+							throw new Error("posId required for POS leg");
 						if (lm === "CREDIT" && !leg.customerId)
 							throw new Error("customerId required for CREDIT leg");
 					}
@@ -2130,6 +2234,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 								if (lm === "BANK_TRANSFER" && leg.bankId) {
 									await reverseBankPayment(leg.bankId, leg.amount, current.id);
 								}
+								if (lm === "POS" && leg.posId) {
+									await reversePosPayment(leg.posId, leg.amount, current.id);
+								}
 							}
 						}
 						// Delete all old SalePayment legs
@@ -2180,6 +2287,9 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 										method: lm,
 										amount: legAmount,
 										bankId: lm === "BANK_TRANSFER" ? (leg.bankId || null) : null,
+										posId: lm === "POS" ? (leg.posId || null) : null,
+										posCardType: lm === "POS" ? (leg.posCardType || null) : null,
+										posCommissionRate: lm === "POS" ? (leg.posCommissionRate ?? null) : null,
 										accountId: lm === "CASH" ? (await getCashAccount()).id : null,
 										customerId: null,
 										remarks: leg.remarks || null,
@@ -2193,6 +2303,10 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 
 								if (lm === "BANK_TRANSFER") {
 									await applyBankPayment(leg.bankId, legAmount, current.id);
+								}
+
+								if (lm === "POS") {
+									await applyPosPayment(leg.posId, legAmount, current.id);
 								}
 							}
 						}
@@ -2318,8 +2432,9 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 							payments: {
 								include: {
 									bank: { include: { account: true } },
-									customer: { include: { account: true } },
-									account: true, // cash account for PARTIAL cash legs
+								pos: { include: { bank: { include: { account: true } } } },
+								customer: { include: { account: true } },
+								account: true, // cash account for PARTIAL cash legs
 								},
 							},
 						},
@@ -2505,7 +2620,22 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 							});
 						}
 
-						else if (lm === "CREDIT" && leg.customer?.account) {
+						else if (lm === "POS" && leg.pos?.bank?.account) {
+								await tx.ledgerEntry.deleteMany({
+									where: {
+										saleId: sale.id,
+										accountId: leg.pos.bank.account.id,
+										entryType: "PAYMENT",
+									},
+								});
+
+								await tx.account.update({
+									where: { id: leg.pos.bank.account.id },
+									data: { balance: { decrement: legAmount } },
+								});
+							}
+
+							else if (lm === "CREDIT" && leg.customer?.account) {
 							await tx.ledgerEntry.deleteMany({
 								where: {
 									saleId: sale.id,
@@ -2572,8 +2702,9 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 					payments: {
 						include: {
 							bank: { include: { account: true } },
-							customer: { include: { account: true } },
-							account: true, // cash account for PARTIAL cash legs
+								pos: { include: { bank: { include: { account: true } } } },
+								customer: { include: { account: true } },
+								account: true, // cash account for PARTIAL cash legs
 						},
 					},
 				},
@@ -2801,6 +2932,25 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 							});
 
 							totalPaidNow += legAmount;
+						} else if (legMethod === "POS") {
+							if (!leg.pos?.bank?.account) {
+								throw new Error(`Related POS bank account not found for payment leg ${leg.id}`);
+							}
+
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.pos.bank.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.pos.bank.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
+
+							totalPaidNow += legAmount;
 						}
 					}
 					await tx.account.update({
@@ -2845,6 +2995,23 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 
 							await tx.account.update({
 								where: { id: leg.bank.account.id },
+								data: { balance: { decrement: legAmount } },
+							});
+						} else if (legMethod === "POS") {
+							if (!leg.pos?.bank?.account) {
+								throw new Error(`Related POS bank account not found for payment leg ${leg.id}`);
+							}
+
+							await tx.ledgerEntry.deleteMany({
+								where: {
+									saleId: sale.id,
+									accountId: leg.pos.bank.account.id,
+									entryType: "PAYMENT",
+								},
+							});
+
+							await tx.account.update({
+								where: { id: leg.pos.bank.account.id },
 								data: { balance: { decrement: legAmount } },
 							});
 						}

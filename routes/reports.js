@@ -53,6 +53,49 @@ function resolveDateFilter(dateFrom, dateTo, timeZone) {
     return Object.keys(filter).length ? filter : null;
 }
 
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// POS sales are stored net of the machine's commission (the "deducted real
+// amount"), so the customer's original order amount is reconstructed from the
+// net amount + commission rate: order = net / (1 - rate/100). Linear, so a
+// refund's negative mirror sale comes out as the exact negative.
+function posOrderFromNet(net, rate) {
+  const n = Number(net) || 0;
+  const r = Number(rate) || 0;
+  if (r <= 0 || r >= 100) return round2(n);
+  return round2(n / (1 - r / 100));
+}
+
+function posLegDetail(net, rate, cardType, pos) {
+  const orderAmount = posOrderFromNet(net, rate);
+  const netAmount = round2(net);
+  return {
+    cardType: cardType || null,
+    commissionRate: rate ?? null,
+    orderAmount,
+    netAmount,
+    commission: round2(orderAmount - netAmount),
+    terminalId: pos?.terminalId ?? null,
+    providerName: pos?.providerName ?? null,
+    bankName: pos?.bank?.bankName ?? null,
+  };
+}
+
+// Every POS portion of a sale: the whole sale for a single POS payment, or the
+// POS leg(s) of a split payment.
+function buildPosLegs(s) {
+  if (s.paymentType === "POS") {
+    const net = s.paidAmount ?? s.sellPrice;
+    return [posLegDetail(net, s.posCommissionRate, s.posCardType, s.pos)];
+  }
+  if (s.paymentType === "PARTIAL") {
+    return (s.payments || [])
+      .filter((p) => p.method === "POS")
+      .map((p) => posLegDetail(p.amount, p.posCommissionRate, p.posCardType, p.pos));
+  }
+  return [];
+}
+
 router.get("/", authenticate, async (req, res) => {
   try {
     const {
@@ -110,7 +153,11 @@ router.get("/", authenticate, async (req, res) => {
       ...(airlineId ? { airlineId } : {}),
       ...(paymentStatus ? { paymentStatus } : {}),
       ...(saleStatus ? { status: saleStatus } : {}),
-      ...(paymentMethod ? { paymentType: paymentMethod } : {}),
+      ...(paymentMethod === "POS"
+        ? { OR: [{ paymentType: "POS" }, { payments: { some: { method: "POS" } } }] }
+        : paymentMethod
+          ? { paymentType: paymentMethod }
+          : {}),
     };
 
     const sales = await prisma.sale.findMany({
@@ -126,6 +173,17 @@ router.get("/", authenticate, async (req, res) => {
         airline: { select: { airlineName: true, airlineCode: true, iataName: true } },
         vendor: { select: { id: true, vendorName: true } },
         customer: { select: { id: true, customerName: true } },
+        pos: { select: { terminalId: true, providerName: true, bank: { select: { bankName: true } } } },
+        payments: {
+          where: { method: "POS" },
+          select: {
+            method: true,
+            amount: true,
+            posCardType: true,
+            posCommissionRate: true,
+            pos: { select: { terminalId: true, providerName: true, bank: { select: { bankName: true } } } },
+          },
+        },
       },
       // Sort by the invoice's saleDate (the date the report is filtered/
       // grouped by), not createdAt — a backdated sale should sort by the
@@ -137,6 +195,7 @@ router.get("/", authenticate, async (req, res) => {
       const paxVat = s.paxVat || 0;
       const vatAmount = s.vatAmount || 0;
       const vatTotal = paxVat + vatAmount;
+      const posLegs = buildPosLegs(s);
 
       return {
         id: s.id,
@@ -164,6 +223,12 @@ router.get("/", authenticate, async (req, res) => {
         vatAmount,
         vatTotal,
         paidAmount: s.paidAmount,
+        // POS details — one entry per POS portion (single POS, or the POS leg of a split)
+        posLegs,
+        hasPos: posLegs.length > 0,
+        posOrderAmount: round2(posLegs.reduce((a, l) => a + l.orderAmount, 0)),
+        posNetAmount: round2(posLegs.reduce((a, l) => a + l.netAmount, 0)),
+        posCommission: round2(posLegs.reduce((a, l) => a + l.commission, 0)),
         isNegativeSaleEntry: s.profit < 0, // flag so the UI can badge refund-reversal rows if desired
       };
     });
@@ -316,6 +381,25 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
 
   const outstandingDue = totalSellPrice - totalPaid;
 
+  // POS stats — same REFUNDED exclusion as the other sale figures, so a
+  // refund's negative mirror row nets out against the original.
+  const posSales = statsSales.filter((r) => r.hasPos);
+  const posByCard = new Map();
+  posSales.forEach((r) =>
+    r.posLegs.forEach((l) => {
+      const key = l.cardType || "Unknown";
+      const row = posByCard.get(key) || { cardType: key, commissionRate: l.commissionRate, count: 0, orderAmount: 0, netAmount: 0, commission: 0 };
+      row.count += 1;
+      row.orderAmount += l.orderAmount;
+      row.netAmount += l.netAmount;
+      row.commission += l.commission;
+      posByCard.set(key, row);
+    }),
+  );
+  const totalPosOrderAmount = round2(posSales.reduce((s, r) => s + r.posOrderAmount, 0));
+  const totalPosNetAmount = round2(posSales.reduce((s, r) => s + r.posNetAmount, 0));
+  const totalPosCommission = round2(posSales.reduce((s, r) => s + r.posCommission, 0));
+
   return {
     totalSellPrice,
     totalNetPrice,     // ✅ now COMPLETED-only, computed separately above
@@ -334,6 +418,17 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
     totalExpenses,
 
     netRevenue,                 // = totalProfit + totalCancellationCharges - totalExpenses
+
+    posSalesCount: posSales.length,
+    totalPosOrderAmount,    // what customers actually swiped on the machine
+    totalPosNetAmount,      // what reached the bank after commission
+    totalPosCommission,     // order - net
+    posByCardType: [...posByCard.values()].map((r) => ({
+      ...r,
+      orderAmount: round2(r.orderAmount),
+      netAmount: round2(r.netAmount),
+      commission: round2(r.commission),
+    })),
 
     salesCount: statsSales.length,
     refundsCount: flatRefunds.length,

@@ -355,7 +355,8 @@ model Pos {
     createdAt       DateTime            @default(now())
     updatedAt       DateTime            @updatedAt
 
-    sales Sale[]
+    sales        Sale[]
+    salePayments SalePayment[]
 
     @@index([bankId])
     @@index([branchId])
@@ -463,12 +464,19 @@ model SalePayment {
     saleId String @db.ObjectId
     sale   Sale   @relation(fields: [saleId], references: [id])
 
-    method PaymentType // CASH | BANK_TRANSFER | CREDIT (never PARTIAL here)
+    method PaymentType // CASH | BANK_TRANSFER | POS | CREDIT (never PARTIAL here)
     amount Float
 
     // Populated only when method = BANK_TRANSFER
     bankId String? @db.ObjectId
     bank   Bank?   @relation(fields: [bankId], references: [id])
+
+    // Populated only when method = POS — which terminal was used, plus a
+    // frozen snapshot of the card type + commission rate (same as Sale).
+    posId             String? @db.ObjectId
+    pos               Pos?    @relation(fields: [posId], references: [id])
+    posCardType       String?
+    posCommissionRate Float?
 
     // Populated only when method = CREDIT
     customerId String?   @db.ObjectId

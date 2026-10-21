@@ -115,6 +115,16 @@ async function attachRelatedDetails(entries) {
             bank: {
               select: { id: true, bankName: true, accountNumber: true },
             },
+            posCardType: true,
+            posCommissionRate: true,
+            pos: {
+              select: {
+                id: true,
+                terminalId: true,
+                providerName: true,
+                bank: { select: { id: true, bankName: true, accountNumber: true } },
+              },
+            },
             customer: {
               select: { id: true, customerName: true, phone: true },
             },
