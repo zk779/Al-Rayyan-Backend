@@ -44,6 +44,12 @@ const PERMISSIONS = [
   { name: "EXPENSE_EDIT", description: "Can edit expenses" },
   { name: "EXPENSE_DELETE", description: "Can delete expenses" },
 
+  // --- Balance Adjustments (manual Cash / Bank balance corrections) ---
+  { name: "BALANCE_ADJUSTMENT_CREATE", description: "Can create balance adjustments" },
+  { name: "BALANCE_ADJUSTMENT_READ", description: "Can view balance adjustments" },
+  { name: "BALANCE_ADJUSTMENT_EDIT", description: "Can edit balance adjustments" },
+  { name: "BALANCE_ADJUSTMENT_DELETE", description: "Can delete balance adjustments" },
+
   // --- Customers ---
   { name: "CUSTOMER_CREATE", description: "Can create customers" },
   { name: "CUSTOMER_READ", description: "Can view customers" },

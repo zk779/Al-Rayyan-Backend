@@ -1,6 +1,7 @@
 import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
+import { localDayRangeToUtc } from "../utils/dateRange.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -33,6 +34,22 @@ const EXPENSE_CATEGORIES = [
   "MEALS",
   "TRAINING",
 ];
+
+// Display labels used by the UI, so a text search for "office" or "rent" also
+// matches on the category and not just the free-text description.
+const CATEGORY_LABELS = {
+  OFFICE_SUPPLIES: "Office Supplies",
+  SALARY: "Salary",
+  TRAVEL: "Travel",
+  MARKETING: "Marketing",
+  MEALS: "Meals",
+  TRAINING: "Training",
+  UTILITIES: "Utilities",
+  RENT: "Rent",
+  INSURANCE: "Insurance",
+  MAINTENANCE: "Maintenance",
+  OTHER: "Other",
+};
 
 const EXPENSE_STATUSES = ["APPROVED", "REJECTED"];
 const PAYMENT_MODES = ["CASH", "BANK_TRANSFER"];
@@ -301,17 +318,64 @@ router.post("/", authenticate, async (req, res) => {
 });
 
 // ---- GET ALL ----
-// Optional query filters: ?branchId=&category=&status=&paymentMode=&userId=&page=&limit=
+// Optional query filters: ?branchId=&category=&status=&paymentMode=&bankId=&userId=&createdById=
+//   &dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD&timeZone=&search=&page=&limit=
+// No date filter is applied unless dateFrom and/or dateTo is given (either one
+// alone gives an open-ended range). All filters combine (AND).
 router.get("/", authenticate, async (req, res) => {
   try {
-    const { branchId, category, status, paymentMode, userId, page = 1, limit = 20 } = req.query;
+    const {
+      branchId,
+      category,
+      status,
+      paymentMode,
+      bankId,
+      userId,
+      createdById,
+      dateFrom,
+      dateTo,
+      timeZone,
+      search,
+      page = 1,
+      limit = 20,
+    } = req.query;
 
     const where = {};
     if (branchId) where.branchId = branchId;
     if (category) where.category = category;
     if (status) where.status = status;
     if (paymentMode) where.paymentMode = paymentMode;
+    if (bankId) where.bankId = bankId;
     if (userId) where.userId = userId;
+    if (createdById) where.createdById = createdById;
+
+    // Local-calendar-day aware, same helper the reports use.
+    const dateFilter = {};
+    if (dateFrom) {
+      const range = localDayRangeToUtc(dateFrom, timeZone);
+      if (range) dateFilter.gte = range.start;
+    }
+    if (dateTo) {
+      const range = localDayRangeToUtc(dateTo, timeZone);
+      if (range) dateFilter.lte = range.end;
+    }
+    if (Object.keys(dateFilter).length) where.expenseDate = dateFilter;
+
+    const q = String(search || "").trim();
+    if (q) {
+      const ql = q.toLowerCase();
+      const matchedCategories = Object.entries(CATEGORY_LABELS)
+        .filter(([key, label]) => label.toLowerCase().includes(ql) || key.toLowerCase().includes(ql))
+        .map(([key]) => key);
+      const contains = { contains: q, mode: "insensitive" };
+      where.OR = [
+        { description: contains },
+        { branch: { name: contains } },
+        { user: { fullName: contains } },
+        { createdBy: { fullName: contains } },
+        ...(matchedCategories.length ? [{ category: { in: matchedCategories } }] : []),
+      ];
+    }
 
     const take = Math.min(Math.max(Number(limit) || 20, 1), 200);
     const skip = (Math.max(Number(page) || 1, 1) - 1) * take;
