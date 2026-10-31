@@ -785,6 +785,50 @@ router.get("/vat-report", authenticate, async (req, res) => {
 						totalNet: round2(zero.reduce((a, s) => a + Number(s.netPrice || 0), 0)),
 					};
 				})(),
+				// Sales / purchases split by route type, each with its 15% VAT. The parts
+				// are rounded in whole halalas and allocated so they add up EXACTLY to
+				// sellingVat / purchasingVat (no stray cent between cards and footer).
+				// OTHER = sales that have no route type saved.
+				routes: (() => {
+					const KEYS = ["ZERO_VAT", "DOMESTIC", "MIXED", "OTHER"];
+					const b = Object.fromEntries(KEYS.map((k) => [k, { count: 0, totalSell: 0, totalNet: 0 }]));
+					for (const s of sales) {
+						const k = ["ZERO_VAT", "DOMESTIC", "MIXED"].includes(s.routeType) ? s.routeType : "OTHER";
+						b[k].count += 1;
+						b[k].totalSell += Number(s.sellPrice || 0);
+						b[k].totalNet += Number(s.netPrice || 0);
+					}
+					const allocate = (field, totalVat) => {
+						const target = Math.round(totalVat * 100);
+						const parts = KEYS.map((k) => ({ k, raw: b[k][field] * 15 })); // value x 100 x 15%
+						parts.forEach((p) => (p.cents = Math.floor(p.raw + 1e-9)));
+						let rest = target - parts.reduce((a, p) => a + p.cents, 0);
+						[...parts]
+							.sort((x, y) => y.raw - y.cents - (x.raw - x.cents))
+							.forEach((p) => {
+								if (rest > 0) {
+									p.cents += 1;
+									rest -= 1;
+								}
+							});
+						if (rest !== 0) parts[0].cents += rest; // safety net: never leave the parts off the total
+						return Object.fromEntries(parts.map((p) => [p.k, p.cents / 100]));
+					};
+					const sellVat = allocate("totalSell", sellingVat);
+					const netVat = allocate("totalNet", purchasingVat);
+					return Object.fromEntries(
+						KEYS.map((k) => [
+							k,
+							{
+								count: b[k].count,
+								totalSell: round2(b[k].totalSell),
+								sellVat: sellVat[k],
+								totalNet: round2(b[k].totalNet),
+								netVat: netVat[k],
+							},
+						]),
+					);
+				})(),
 				saleCount: saleAggregate._count._all,
 				refundCount: refunds.length,
 				sales: sales.map((s) => ({
