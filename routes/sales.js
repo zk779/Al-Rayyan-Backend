@@ -145,6 +145,9 @@ router.get("/", authenticate, async (req, res) => {
 					checkOutDate: true,
 					hotelName: true,
 					destinations: true,
+					routeType: true,
+					paxVat: true,
+					vatAmount: true,
 					invoice: {
 						select: {
 							id: true,
@@ -281,6 +284,10 @@ router.get("/", authenticate, async (req, res) => {
 				checkOutDate: s.checkOutDate || null,
 				hotelName: s.hotelName || null,
 				destinations: Array.isArray(s.destinations) ? s.destinations : [],
+				// VAT: paxVat only applies to DOMESTIC routes; vatAmount is our 15% on profit
+				routeType: s.routeType || null,
+				paxVat: s.paxVat ?? 0,
+				vatAmount: s.vatAmount ?? 0,
 				vendorName: s.vendor?.vendorName || null,
 				vendorCategory: s.vendor?.category || null,
 				vendorBalance: s.vendor?.account?.balance ?? null,
