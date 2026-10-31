@@ -717,6 +717,7 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					paxName: true,
 					status: true,
 					paymentType: true,
+					routeType: true,
 					netPrice: true,
 					sellPrice: true,
 					vendor: { select: { vendorName: true } },
@@ -774,6 +775,16 @@ router.get("/vat-report", authenticate, async (req, res) => {
 				totalRefund: round2(totalRefund),
 				refundVat,
 				payableVat,
+				// Sales on a ZERO_VAT route — same sales as the totals above, just the
+				// ones whose route type is ZERO_VAT (non-KSA routes)
+				zeroVat: (() => {
+					const zero = sales.filter((s) => s.routeType === "ZERO_VAT");
+					return {
+						count: zero.length,
+						totalSell: round2(zero.reduce((a, s) => a + Number(s.sellPrice || 0), 0)),
+						totalNet: round2(zero.reduce((a, s) => a + Number(s.netPrice || 0), 0)),
+					};
+				})(),
 				saleCount: saleAggregate._count._all,
 				refundCount: refunds.length,
 				sales: sales.map((s) => ({
@@ -782,6 +793,7 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					paxName: s.paxName,
 					status: s.status,
 					paymentType: s.paymentType,
+					routeType: s.routeType || null,
 					netPrice: Number(s.netPrice || 0),
 					sellPrice: Number(s.sellPrice || 0),
 					vendorName: s.vendor?.vendorName || null,
