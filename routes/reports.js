@@ -142,6 +142,15 @@ router.get("/", authenticate, async (req, res) => {
       }
     }
 
+    // Sale-type filter, shared by the sales rows and the refunds below.
+    // Legacy sales have no saleType stored, so AIRLINE also matches "not set".
+    const saleTypeWhere =
+      String(saleType || "").toUpperCase() === "HOTEL"
+        ? { saleType: "HOTEL" }
+        : String(saleType || "").toUpperCase() === "AIRLINE"
+          ? { OR: [{ saleType: "AIRLINE" }, { saleType: null }, { saleType: { isSet: false } }] }
+          : {};
+
     // ── Build Sale where clause ────────────────────────────────────────
     const saleWhere = {
       invoice: {
@@ -154,12 +163,7 @@ router.get("/", authenticate, async (req, res) => {
       ...(airlineId ? { airlineId } : {}),
       ...(paymentStatus ? { paymentStatus } : {}),
       ...(saleStatus ? { status: saleStatus } : {}),
-      // Legacy sales have no saleType stored, so AIRLINE also matches "not set"
-      ...(String(saleType || "").toUpperCase() === "HOTEL"
-        ? { saleType: "HOTEL" }
-        : String(saleType || "").toUpperCase() === "AIRLINE"
-          ? { OR: [{ saleType: "AIRLINE" }, { saleType: null }, { saleType: { isSet: false } }] }
-          : {}),
+      ...saleTypeWhere,
       ...(paymentMethod === "POS"
         ? { OR: [{ paymentType: "POS" }, { payments: { some: { method: "POS" } } }] }
         : paymentMethod
@@ -247,13 +251,14 @@ router.get("/", authenticate, async (req, res) => {
     const refundWhere = {
       ...(dateFilter ? { refundDate: dateFilter } : {}),
       ...(agentId ? { processedById: agentId } : {}),
-      ...(vendorId || customerId || branchId || airlineId
+      ...(vendorId || customerId || branchId || airlineId || Object.keys(saleTypeWhere).length
         ? {
             sale: {
               ...(vendorId ? { vendorId } : {}),
               ...(customerId ? { customerId } : {}),
               ...(airlineId ? { airlineId } : {}),
               ...(branchId ? { invoice: { user: { branchId } } } : {}),
+              ...saleTypeWhere,
             },
           }
         : {}),
@@ -280,6 +285,8 @@ router.get("/", authenticate, async (req, res) => {
       date: r.refundDate,
       status: r.status,
       originalAmount: r.originalSaleAmount,
+      // Profit of the ORIGINAL ticket that was refunded — the base the refund VAT is taken on
+      originalProfit: Number(r.sale?.profit || 0),
       customerRefundAmount: r.customerRefundAmount,
       vendorRefundAmount: r.vendorRefundAmount,
       refundFee: r.refundFee,
@@ -384,6 +391,15 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
     0,
   );
 
+  // VAT on profit, same margin-scheme maths as the VAT report (exclusive 15%).
+  const totalProfitVat = round2(totalProfit * 0.15);
+  // Refunded VAT: 15% of the profit of the refunded tickets. Each refund is one
+  // row in the refunds table, so a ticket's profit is counted exactly once —
+  // never via the negative mirror sale a refund creates (those carry their own
+  // negative profit inside totalProfit and are not read here).
+  const totalRefundedProfit = round2(flatRefunds.reduce((s, r) => s + (r.originalProfit || 0), 0));
+  const totalRefundVat = round2(totalRefundedProfit * 0.15);
+
   const totalExpenses = flatExpenses.reduce((s, e) => s + (e.amount || 0), 0);
   const netRevenue = totalProfit + totalCancellationCharges - totalExpenses;
 
@@ -413,6 +429,10 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
     totalNetPrice,     // ✅ now COMPLETED-only, computed separately above
     totalPaid,
     outstandingDue,
+
+    totalProfitVat,       // 15% of totalProfit
+    totalRefundedProfit, // profit of the refunded tickets (once each)
+    totalRefundVat,      // 15% of totalRefundedProfit
 
     totalPaxVat,      // informational only
     totalVatAmount,   // informational only

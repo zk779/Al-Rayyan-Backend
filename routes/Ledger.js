@@ -278,6 +278,82 @@ async function computeAccountTotals(where) {
   };
 }
 
+const roundMoney = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// How one entry moves the account's balance, by account type:
+//   CASH / BANK / VENDOR (and anything else) -> credit raises it, debit lowers it
+//   CUSTOMER (receivable) / EXPENSE          -> debit raises it, credit lowers it
+// One exception: a VENDOR's OPENING_BALANCE always raises the balance. Debit-
+// category vendors store their opening as a debit, yet the account starts at
+// +opening (see routes/vendors.js), so reading it as "debit lowers" put the
+// whole running balance off by twice the opening amount.
+const balanceDelta = (type, e) => {
+  if (type === "VENDOR" && e.entryType === "OPENING_BALANCE") {
+    return (e.credit || 0) + (e.debit || 0);
+  }
+  return type === "CUSTOMER" || type === "EXPENSE"
+    ? (e.debit || 0) - (e.credit || 0)
+    : (e.credit || 0) - (e.debit || 0);
+};
+
+// Adds `balanceAfter` to each entry: the account's remaining balance right after
+// that entry. Always computed over the account's FULL history, never just the
+// filtered/paged rows, so a date or entry-type filter doesn't change the numbers.
+//
+// It is a true running total of the account's own entries, oldest to newest, so
+// every row can be verified by adding up the entries above it. If the account's
+// stored balance (Account.balance) disagrees with that total, the account is
+// returned in `drift` with both figures so the UI can flag the discrepancy
+// instead of silently shifting every row.
+async function attachRunningBalances(entries) {
+  if (!entries.length) return { entries, drift: [] };
+
+  const accounts = new Map();
+  for (const e of entries) {
+    if (e.account && !accounts.has(e.accountId)) accounts.set(e.accountId, e.account);
+  }
+
+  const history = await prisma.ledgerEntry.findMany({
+    where: { accountId: { in: [...accounts.keys()] } },
+    select: { id: true, accountId: true, debit: true, credit: true, entryType: true },
+    // Same chronological order the list uses (reversed), so ties line up
+    orderBy: [{ transactionDate: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+  });
+
+  const byAccount = new Map();
+  for (const h of history) {
+    if (!byAccount.has(h.accountId)) byAccount.set(h.accountId, []);
+    byAccount.get(h.accountId).push(h);
+  }
+
+  const balanceAfter = new Map();
+  const drift = [];
+  for (const [accountId, list] of byAccount) {
+    const acc = accounts.get(accountId);
+    let running = 0;
+    for (const entry of list) {
+      running = roundMoney(running + balanceDelta(acc.type, entry));
+      balanceAfter.set(entry.id, running);
+    }
+    const stored = roundMoney(Number(acc.balance) || 0);
+    if (Math.abs(stored - running) > 0.01) {
+      drift.push({
+        accountId,
+        name: acc.name,
+        type: acc.type,
+        ledgerBalance: running,
+        storedBalance: stored,
+        difference: roundMoney(stored - running),
+      });
+    }
+  }
+
+  return {
+    entries: entries.map((e) => ({ ...e, balanceAfter: balanceAfter.get(e.id) ?? null })),
+    drift,
+  };
+}
+
 router.get("/", authenticate, async (req, res) => {
   try {
     const {
@@ -287,6 +363,7 @@ router.get("/", authenticate, async (req, res) => {
       entryTypes,
       vendorId,
       customerId,
+      bankId,
       from,
       to,
       timezone, // IANA tz from the client, e.g. "Asia/Karachi" — falls back to UTC if omitted/invalid
@@ -320,6 +397,8 @@ router.get("/", authenticate, async (req, res) => {
     let referenceId;
     if (vendorId)   referenceId = vendorId;
     if (customerId) referenceId = customerId;
+    // A bank's ledger account has referenceId = the bank's id (like vendors/customers)
+    if (bankId)     referenceId = bankId;
     let transactionDateFilter;
     if (from || to) {
       transactionDateFilter = {};
@@ -361,16 +440,21 @@ router.get("/", authenticate, async (req, res) => {
             },
           },
         },
-        orderBy: { transactionDate: "desc" },
+        // createdAt breaks ties between same-day entries so the order (and the
+        // running balance that follows it) is deterministic
+        orderBy: [{ transactionDate: "desc" }, { createdAt: "desc" }],
       }),
       includeSummary !== "false" ? computeAccountTotals(where) : null,
     ]);
 
+    /* ---------- Running balance (remaining balance after each entry) ---------- */
+    const { entries: entriesWithBalance, drift } = await attachRunningBalances(rawEntries);
+
     /* ---------- Attach related details (one extra round-trip, batched) ---------- */
     const shouldIncludeDetails = includeDetails !== "false";
     const entries = shouldIncludeDetails
-      ? await attachRelatedDetails(rawEntries)
-      : rawEntries;
+      ? await attachRelatedDetails(entriesWithBalance)
+      : entriesWithBalance;
 
     /* ---------- Response ---------- */
     res.json({
@@ -378,6 +462,7 @@ router.get("/", authenticate, async (req, res) => {
       data: entries,
       meta: {
         total: entries.length,
+        balanceDrift: drift, // accounts whose stored balance != sum of their entries
       },
       ...(summary && { summary }), // omitted entirely when includeSummary=false
     });
