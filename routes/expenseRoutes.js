@@ -26,6 +26,22 @@ async function authenticate(req, res, next) {
   }
 }
 
+// Returnable VAT: the page works out the VAT (the entered amount already
+// includes 15% VAT) and sends it as `vatAmount`; the API does not calculate it,
+// it only checks and stores it. Only RETURNABLE_VAT expenses carry one — for any
+// other category the field is stored as null. `fallback` is the already-saved
+// value an edit may keep when the request doesn't resend it.
+const resolveExpenseVat = ({ category, amount, vatAmount, fallback }) => {
+  if (category !== "RETURNABLE_VAT") return { vat: null };
+  const raw = vatAmount !== undefined ? vatAmount : fallback;
+  if (raw === undefined || raw === null || raw === "")
+    return { error: "vatAmount is required when category is RETURNABLE_VAT" };
+  const v = Number(raw);
+  if (isNaN(v) || v < 0 || v > Number(amount))
+    return { error: "vatAmount must be a number between 0 and the amount" };
+  return { vat: Math.round(v * 100) / 100 };
+};
+
 const EXPENSE_CATEGORIES = [
   "OFFICE_SUPPLIES",
   "SALARY",
@@ -33,6 +49,12 @@ const EXPENSE_CATEGORIES = [
   "MARKETING",
   "MEALS",
   "TRAINING",
+  "RETURNABLE_VAT",
+  "UTILITIES",
+  "RENT",
+  "INSURANCE",
+  "MAINTENANCE",
+  "OTHER",
 ];
 
 // Display labels used by the UI, so a text search for "office" or "rent" also
@@ -44,6 +66,7 @@ const CATEGORY_LABELS = {
   MARKETING: "Marketing",
   MEALS: "Meals",
   TRAINING: "Training",
+  RETURNABLE_VAT: "Returnable VAT",
   UTILITIES: "Utilities",
   RENT: "Rent",
   INSURANCE: "Insurance",
@@ -93,6 +116,10 @@ router.post("/", authenticate, async (req, res) => {
         success: false,
         error: `paymentMode must be one of: ${PAYMENT_MODES.join(", ")}`,
       });
+
+    const vatCheck = resolveExpenseVat({ category, amount, vatAmount: req.body.vatAmount });
+    if (vatCheck.error)
+      return res.status(400).json({ success: false, error: vatCheck.error });
 
     const newStatus = status ?? "APPROVED";
     if (!EXPENSE_STATUSES.includes(newStatus))
@@ -224,6 +251,7 @@ router.post("/", authenticate, async (req, res) => {
           category,
           branchId, // plain reference, no Account involved
           amount,
+          vatAmount: vatCheck.vat,
           status: newStatus,
           paymentMode,
           bankId: paymentMode === "BANK_TRANSFER" ? bankId : null,
@@ -396,7 +424,7 @@ router.get("/", authenticate, async (req, res) => {
         take,
       }),
       prisma.expense.count({ where }),
-      prisma.expense.aggregate({ where, _sum: { amount: true } }),
+      prisma.expense.aggregate({ where, _sum: { amount: true, vatAmount: true } }),
     ]);
 
     // Total expense for the branch currently being filtered on (or overall,
@@ -434,6 +462,8 @@ router.get("/", authenticate, async (req, res) => {
       summary: {
         count: total,
         totalAmount: amountAgg._sum.amount || 0,
+        // Returnable VAT across the filtered set (only RETURNABLE_VAT rows carry one)
+        totalVat: Math.round((amountAgg._sum.vatAmount || 0) * 100) / 100,
         byBranch: branchId ? null : branchTotal,
       },
     });
@@ -591,6 +621,19 @@ router.put("/:id", authenticate, async (req, res) => {
     const newDescription = description !== undefined ? description : existing.description;
     const newExpenseDate = expenseDate ? new Date(expenseDate) : existing.expenseDate;
     const newDate = date ? new Date(date) : existing.date;
+
+    // Keep the saved VAT only if the amount is unchanged; otherwise the page must resend it
+    const putVat = resolveExpenseVat({
+      category: newCategory,
+      amount: newAmount,
+      vatAmount: req.body.vatAmount,
+      fallback:
+        existing.category === "RETURNABLE_VAT" && newAmount === existing.amount
+          ? existing.vatAmount
+          : undefined,
+    });
+    if (putVat.error)
+      return res.status(400).json({ success: false, error: putVat.error });
 
     // ---- paymentMode / bankId consistency ----
     if (newPaymentMode === "BANK_TRANSFER" && !newBankId)
@@ -772,6 +815,7 @@ router.put("/:id", authenticate, async (req, res) => {
           category: newCategory,
           branchId: newBranchId,
           amount: newAmount,
+          vatAmount: putVat.vat,
           status: newStatus,
           paymentMode: newPaymentMode,
           bankId: newPaymentMode === "BANK_TRANSFER" ? newBankId : null,

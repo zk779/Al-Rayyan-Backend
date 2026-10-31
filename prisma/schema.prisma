@@ -88,6 +88,12 @@ enum ExpenseCategory {
   MARKETING
   MEALS
   TRAINING
+  RETURNABLE_VAT
+  UTILITIES
+  RENT
+  INSURANCE
+  MAINTENANCE
+  OTHER
 }
 
 enum ExpenseStatus {
@@ -621,8 +627,12 @@ model Expense {
   category      ExpenseCategory
   branchId      String          @db.ObjectId
   branch        Branch          @relation(fields: [branchId], references: [id])
-  amount        Float
-  status        ExpenseStatus   @default(APPROVED)
+  amount Float
+    // VAT included in `amount` (15% inclusive) — only set for RETURNABLE_VAT
+    // expenses, null for every other category. Calculated by the page and
+    // stored as received (the API only validates it).
+    vatAmount Float?
+    status ExpenseStatus @default(APPROVED)
   paymentMode   PaymentType
   bankId        String?         @db.ObjectId
   bank          Bank?           @relation(fields: [bankId], references: [id])
