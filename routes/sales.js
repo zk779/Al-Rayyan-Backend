@@ -817,16 +817,24 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					const sellVat = allocate("totalSell", sellingVat);
 					const netVat = allocate("totalNet", purchasingVat);
 					return Object.fromEntries(
-						KEYS.map((k) => [
-							k,
-							{
-								count: b[k].count,
-								totalSell: round2(b[k].totalSell),
-								sellVat: sellVat[k],
-								totalNet: round2(b[k].totalNet),
-								netVat: netVat[k],
-							},
-						]),
+						KEYS.map((k) => {
+							const totalProfit = round2(b[k].totalSell - b[k].totalNet);
+							return [
+								k,
+								{
+									count: b[k].count,
+									totalSell: round2(b[k].totalSell),
+									sellVat: sellVat[k],
+									totalNet: round2(b[k].totalNet),
+									netVat: netVat[k],
+									totalProfit,
+									// ZERO_VAT routes carry no sales/purchases VAT: their VAT is 15% of the
+									// profit alone. Every other route's profit VAT is simply
+									// sales VAT - purchases VAT (15% of sell - 15% of net = 15% of profit).
+									profitVat: k === "ZERO_VAT" ? round2(totalProfit * 0.15) : round2(sellVat[k] - netVat[k]),
+								},
+							];
+						}),
 					);
 				})(),
 				saleCount: saleAggregate._count._all,
