@@ -224,6 +224,7 @@ router.get("/", authenticate, async (req, res) => {
         agentId: s.invoice?.userId ?? null,
         paymentMethod: s.paymentType,
         saleType: s.saleType || "AIRLINE",
+        routeType: s.routeType || null,
         paymentStatus: s.paymentStatus,
         status: s.status,
         netPrice: s.netPrice,
@@ -424,6 +425,31 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
   const totalPosNetAmount = round2(posSales.reduce((s, r) => s + r.posNetAmount, 0));
   const totalPosCommission = round2(posSales.reduce((s, r) => s + r.posCommission, 0));
 
+  // Per-route-type stats (ZERO_VAT / DOMESTIC). Same rows as Total Sales — i.e.
+  // after every report filter, REFUNDED-status rows excluded and the negative
+  // refund-reversal rows kept so refunds net out — so the cards always add up to
+  // (a part of) the headline figures.
+  const routeStats = (routeType) => {
+    const KNOWN = ["ZERO_VAT", "DOMESTIC", "MIXED"];
+    // routeType === null -> sales with no (or an unrecognised) route type, e.g. older sales
+    const rows = statsSales.filter((r) =>
+      routeType === null ? !KNOWN.includes(r.routeType) : r.routeType === routeType,
+    );
+    const sum = (key) => round2(rows.reduce((s, r) => s + (Number(r[key]) || 0), 0));
+    return {
+      count: rows.length,
+      totalSell: sum("sellPrice"),
+      totalNet: sum("netPrice"),
+      totalProfit: sum("profit"),
+      totalPaxVat: sum("paxVat"),
+      totalVatAmount: sum("vatAmount"),
+    };
+  };
+  const zeroVat = routeStats("ZERO_VAT");
+  const domestic = routeStats("DOMESTIC");
+  const mixed = routeStats("MIXED");
+  const unclassified = routeStats(null);
+
   return {
     totalSellPrice,
     totalNetPrice,     // ✅ now COMPLETED-only, computed separately above
@@ -446,6 +472,11 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
     totalExpenses,
 
     netRevenue,                 // = totalProfit + totalCancellationCharges - totalExpenses
+
+    zeroVat,    // ZERO_VAT-route sales: { count, totalSell, totalNet, totalProfit, ... }
+    domestic,  // DOMESTIC-route sales (domestic flights + domestic hotels)
+    mixed,     // MIXED-route sales (KSA <-> international)
+    unclassified, // sales with no route type saved (zeroVat + domestic + mixed + this = all sales)
 
     posSalesCount: posSales.length,
     totalPosOrderAmount,    // what customers actually swiped on the machine
