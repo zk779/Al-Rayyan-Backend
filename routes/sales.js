@@ -660,6 +660,21 @@ router.get("/customerSales", authenticate, async (req, res) => {
 /* ======================= VAT REPORT ======================= */
 const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 
+// Tabby / Tamara take their fee (6.99% + 1.5 SAR) plus 15% VAT on that fee out of the order
+// amount, so a sale paid through them is saved at the NET amount that is left. The fee is
+// not stored, so it is worked out from that net amount (same reverse calculation as the
+// Sales Report's Tabby columns): order = (net + 1.5 x 1.15) / (1 - 6.99% x 1.15).
+const TABBY_FEE_RATE = 0.0699;
+const TABBY_FIXED_FEE = 1.5;
+const TABBY_VAT_RATE = 0.15;
+const tabbyFromNet = (netAmount) => {
+	const net = Math.abs(Number(netAmount) || 0);
+	const order = round2((net + TABBY_FIXED_FEE * (1 + TABBY_VAT_RATE)) / (1 - TABBY_FEE_RATE * (1 + TABBY_VAT_RATE)));
+	const fee = round2(order * TABBY_FEE_RATE + TABBY_FIXED_FEE);
+	const vat = round2((order * TABBY_FEE_RATE + TABBY_FIXED_FEE) * TABBY_VAT_RATE);
+	return { orderAmount: order, fee, vat, totalDeduction: round2(fee + vat) };
+};
+
 router.get("/vat-report", authenticate, async (req, res) => {
 	try {
 		const { dateFrom, dateTo, tz } = req.query;
@@ -722,6 +737,9 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					sellPrice: true,
 					vendor: { select: { vendorName: true } },
 					invoice: { select: { invoiceNo: true, saleDate: true } },
+					// Tabby/Tamara fee: needs the customer type (plain CREDIT sale) or the credit leg (PARTIAL)
+					customer: { select: { customerType: true } },
+					payments: { select: { method: true, amount: true, customer: { select: { customerType: true } } } },
 				},
 			}),
 			// Prisma can't _sum a field reached through a relation (refund ->
@@ -764,6 +782,28 @@ router.get("/vat-report", authenticate, async (req, res) => {
 		// What's actually owed: VAT collected on sales, minus VAT already
 		// paid on purchases, minus VAT that must be given back on refunds.
 		const payableVat = round2(sellingVat - purchasingVat - refundVat);
+
+		// Fee + VAT paid to Tabby/Tamara on the sales in this period (input VAT we can claim back).
+		// A whole sale paid to a Tabby/Tamara customer on credit, or the credit leg of a split sale.
+		const tabby = { count: 0, orderAmount: 0, fee: 0, vat: 0, totalDeduction: 0 };
+		for (const s of sales) {
+			const nets = [];
+			if (s.paymentType === "CREDIT" && s.customer?.customerType === "TABBY_OR_TAMARA") nets.push(s.sellPrice);
+			if (s.paymentType === "PARTIAL") {
+				for (const p of s.payments || []) {
+					if (p.method === "CREDIT" && p.customer?.customerType === "TABBY_OR_TAMARA") nets.push(p.amount);
+				}
+			}
+			if (nets.length) tabby.count += 1;
+			for (const net of nets) {
+				const t = tabbyFromNet(net);
+				tabby.orderAmount += t.orderAmount;
+				tabby.fee += t.fee;
+				tabby.vat += t.vat;
+				tabby.totalDeduction += t.totalDeduction;
+			}
+		}
+		for (const k of ["orderAmount", "fee", "vat", "totalDeduction"]) tabby[k] = round2(tabby[k]);
 
 		res.json({
 			success: true,
@@ -837,7 +877,8 @@ router.get("/vat-report", authenticate, async (req, res) => {
 						}),
 					);
 				})(),
-				saleCount: saleAggregate._count._all,
+				tabby,
+					saleCount: saleAggregate._count._all,
 				refundCount: refunds.length,
 				sales: sales.map((s) => ({
 					id: s.id,
