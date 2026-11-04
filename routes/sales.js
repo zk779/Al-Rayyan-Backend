@@ -71,6 +71,17 @@ function resolveStay(src, current = {}) {
 // work unchanged; they are only stored so the breakdown can be shown again when the sale is
 // edited. Nothing is read from `current` unless the payload doesn't mention them at all.
 function resolveVendorCharges(src, netPrice, current = null) {
+	// A hotel has no separate vendor charges: the net amount that is typed already includes the
+	// vendor's VAT, so it is worked out from it (683.79 -> 89.19), never added on top.
+	const saleType = String(src.saleType ?? current?.saleType ?? "AIRLINE").toUpperCase();
+	if (saleType === "HOTEL") {
+		const n = Number(netPrice) || 0;
+		const vendorVat = n > 0 ? Math.round((n - n / 1.15 + Number.EPSILON) * 100) / 100 : 0;
+		if (src.vendorVat != null && src.vendorVat !== "" && Math.abs(Number(src.vendorVat) - vendorVat) > 0.011)
+			throw new Error(`Vendor VAT must be 15% included in the net amount (${vendorVat.toFixed(2)})`);
+		return { vendorServiceCharge: 0, vendorVat };
+	}
+
 	if (src.vendorServiceCharge === undefined && current) {
 		return {
 			vendorServiceCharge: Number(current.vendorServiceCharge || 0),
