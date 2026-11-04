@@ -3,9 +3,11 @@ import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import { generateNextSalesInvoiceNo } from "../utils/invoiceNo.js";
 import { localDayRangeToUtc } from "../utils/dateRange.js";
+import { isVoidLine, makeVoidHandlers } from "../utils/voidSale.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
+const voidSales = makeVoidHandlers({ prisma, generateNextSalesInvoiceNo });
 
 /* --------------------------- 🔐 AUTH MIDDLEWARE --------------------------- */
 async function authenticate(req, res, next) {
@@ -81,6 +83,11 @@ router.get("/", authenticate, async (req, res) => {
 				]
 			});
 		}
+		// VOID sales (tickets cancelled with the vendor) are listed with the others.
+		// ?saleType=VOID shows only those; ?saleType=AIRLINE means airline sales, not voids.
+		if (String(saleType || "").toUpperCase() === "VOID") filters.push({ status: "VOID" });
+		else if (String(saleType || "").toUpperCase() === "AIRLINE") filters.push({ status: { not: "VOID" } });
+
 		// Optional ?saleType=AIRLINE|HOTEL. Legacy sales that predate the field have
 		// no saleType stored at all, so AIRLINE must also match "field not set"
 		// (Mongo's `not: "HOTEL"` would skip those documents entirely).
@@ -122,7 +129,7 @@ router.get("/", authenticate, async (req, res) => {
 
 		// No skip/take — the whole filtered set is returned in one go and
 		// paginated client-side (by page size only, no re-request per page).
-		const [sales, summary] = await prisma.$transaction([
+		const [sales, summary, summarySales] = await prisma.$transaction([
 			prisma.sale.findMany({
 				where,
 				orderBy: { invoice: { saleDate: sortDirection } },
@@ -145,9 +152,15 @@ router.get("/", authenticate, async (req, res) => {
 					checkOutDate: true,
 					hotelName: true,
 					destinations: true,
-					routeType: true,
-					paxVat: true,
-					vatAmount: true,
+						routeType: true,
+						paxVat: true,
+						vatAmount: true,
+						vendorId: true,
+						airlineId: true,
+						vendorServiceCharge: true,
+						vendorVat: true,
+						voidCharges: true,
+						companyServiceCharge: true,
 					invoice: {
 						select: {
 							id: true,
@@ -249,7 +262,13 @@ router.get("/", authenticate, async (req, res) => {
 				}
 			}),
 			// Grand totals across the whole filtered set.
-			prisma.sale.aggregate({ where, _sum: { netPrice: true, sellPrice: true, profit: true } })
+			prisma.sale.aggregate({ where, _sum: { netPrice: true, sellPrice: true, profit: true } }),
+			// Net and sell leave voids out: a void's "sell" is only the amount the vendor gives
+			// back, not a sale. Its profit (our own service charge) stays in the profit total.
+			prisma.sale.aggregate({
+				where: { AND: [where, { status: { not: "VOID" } }] },
+				_sum: { netPrice: true, sellPrice: true },
+			})
 		]);
 
 		const data = sales.map(s => {
@@ -288,6 +307,12 @@ router.get("/", authenticate, async (req, res) => {
 				routeType: s.routeType || null,
 				paxVat: s.paxVat ?? 0,
 				vatAmount: s.vatAmount ?? 0,
+				vendorId: s.vendorId || null,
+				airlineId: s.airlineId || null,
+				vendorServiceCharge: s.vendorServiceCharge ?? 0,
+				vendorVat: s.vendorVat ?? 0,
+				voidCharges: s.voidCharges ?? 0,
+				companyServiceCharge: s.companyServiceCharge ?? 0,
 				vendorName: s.vendor?.vendorName || null,
 				vendorCategory: s.vendor?.category || null,
 				vendorBalance: s.vendor?.account?.balance ?? null,
@@ -346,8 +371,8 @@ router.get("/", authenticate, async (req, res) => {
 			success: true,
 			data,
 			summary: {
-				totalNet: summary._sum.netPrice || 0,
-				totalSell: summary._sum.sellPrice || 0,
+				totalNet: summarySales._sum.netPrice || 0,
+				totalSell: summarySales._sum.sellPrice || 0,
 				totalProfit: summary._sum.profit || 0
 			}
 		});
@@ -426,7 +451,8 @@ router.get("/search", authenticate, async (req, res) => {
 
 		const sales = await prisma.sale.findMany({
 			where: {
-				documentNo: { contains: documentNo, mode: "insensitive" }
+				documentNo: { contains: documentNo, mode: "insensitive" },
+				status: { not: "VOID" },
 			},
 			orderBy: { createdAt: "desc" },
 			include: {
@@ -705,7 +731,7 @@ router.get("/vat-report", authenticate, async (req, res) => {
 		// is simply absent (as opposed to explicitly stored null), so it
 		// matched nothing at all; every negative mirror is always status
 		// REFUNDED, which is a reliable substitute.
-		const saleFilters = [{ status: { not: "REFUNDED" } }];
+		const saleFilters = [{ status: { notIn: ["REFUNDED", "VOID"] } }];
 		if (scopeFilter) saleFilters.push(scopeFilter);
 		if (dateRangeFilter) saleFilters.push({ invoice: { saleDate: dateRangeFilter } });
 		const saleWhere = { AND: saleFilters };
@@ -763,6 +789,26 @@ router.get("/vat-report", authenticate, async (req, res) => {
 				},
 			}),
 		]);
+
+		// VOID sales (tickets cancelled with the vendor) are not sales, but they carry real VAT:
+		// the 15% on the vendor's service charges (input VAT) and on our own service
+		// charges (output VAT). Reported on their own, with the same scope + date filters.
+		const voidFilters = [{ status: "VOID" }];
+		if (scopeFilter) voidFilters.push(scopeFilter);
+		if (dateRangeFilter) voidFilters.push({ invoice: { saleDate: dateRangeFilter } });
+		const voidRows = await prisma.sale.findMany({
+			where: { AND: voidFilters },
+			select: { vendorServiceCharge: true, vendorVat: true, voidCharges: true, companyServiceCharge: true, vatAmount: true },
+		});
+		const sumVoid = (key) => round2(voidRows.reduce((a, v) => a + Number(v[key] || 0), 0));
+		const voids = {
+			count: voidRows.length,
+			vendorServiceCharge: sumVoid("vendorServiceCharge"),
+			vendorVat: sumVoid("vendorVat"),
+			voidCharges: sumVoid("voidCharges"),
+			companyServiceCharge: sumVoid("companyServiceCharge"),
+			companyVat: sumVoid("vatAmount"),
+		};
 
 		const totalNet = Number(saleAggregate._sum.netPrice || 0);
 		const totalSell = Number(saleAggregate._sum.sellPrice || 0);
@@ -878,6 +924,7 @@ router.get("/vat-report", authenticate, async (req, res) => {
 					);
 				})(),
 				tabby,
+					voids,
 					saleCount: saleAggregate._count._all,
 				refundCount: refunds.length,
 				sales: sales.map((s) => ({
@@ -1245,6 +1292,9 @@ router.get("/invoice-no", authenticate, async (req, res) => {
 
 router.post("/", authenticate, async (req, res) => {
 	const { saleDate, sales = [] } = req.body;
+
+	// A void (status "VOID") is a ticket cancelled with the vendor — own validation + ledger
+	if (Array.isArray(sales) && sales.some(isVoidLine)) return voidSales.create(req, res);
 
 	if (!Array.isArray(sales) || sales.length === 0) {
 		return res.status(400).json({ success: false, error: "At least one sale is required" });
@@ -1809,6 +1859,8 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 		if (!existingInvoice) {
 			return res.status(404).json({ success: false, error: "Invoice not found" });
 		}
+		if (existingInvoice.sales.some((s) => s.status === "VOID"))
+			throw new Error("Void sales are edited from the Void tab");
 		const editableSales = existingInvoice.sales.filter(
 			(s) => !s.refundRecordId && (!s.refunds || s.refunds.length === 0)
 		);
@@ -2609,6 +2661,8 @@ router.delete("/:invoiceId", authenticate, async (req, res) => {
 			});
 
 			if (!invoice) throw new Error("Invoice not found");
+				if (invoice.sales.some((s) => s.status === "VOID"))
+					throw new Error("Void sales are deleted from the Void tab");
 
 			/* 2️⃣ Reverse each sale */
 			for (const sale of invoice.sales) {
@@ -2877,6 +2931,7 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 			});
 
 			if (!sale) throw new Error("Sale record not found");
+			if (sale.status === "VOID") throw new Error("Void sales are deleted from the Void tab");
 
 			const net = Number(sale.netPrice || 0);
 			const sell = Number(sale.sellPrice || 0);
@@ -3243,4 +3298,8 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 		});
 	}
 });
+// Void sales (status VOID) have their own edit + delete; create is POST / above
+router.put("/void/:saleId", authenticate, voidSales.update);
+router.delete("/void/:saleId", authenticate, voidSales.remove);
+
 export default router;

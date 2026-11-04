@@ -30,6 +30,9 @@ enum SaleStatus {
   COMPLETED
   CANCELLED
   REFUNDED
+  // A ticket issued and cancelled with the vendor within its void window. It is
+  // only between us and the vendor (no customer), and never counts as a sale.
+  VOID
 }
 
 enum RefundStatus {
@@ -61,6 +64,7 @@ enum LedgerEntryType {
   REFUND
   EXPENSE
   ADJUSTMENT
+  VOID // the vendor-side debit that gives a voided ticket's amount back
 }
 
 // How a refund's customer-side amount was actually paid out.
@@ -444,6 +448,16 @@ model Sale {
   paxVat      Float? @default(0)
   vatAmount   Float? @default(0)
   miscCharges Float? @default(0)
+
+  // VOID sales only (status = VOID; all 0 on ordinary sales).
+  //   vendor ledger credit = netPrice + vendorServiceCharge + vendorVat
+  //   vendor ledger debit  = sellPrice = that credit - voidCharges
+  // companyServiceCharge is our own charge: it is the sale's profit, and its 15%
+  // VAT is stored in vatAmount.
+  vendorServiceCharge  Float? @default(0)
+  vendorVat            Float? @default(0)
+  voidCharges          Float? @default(0)
+  companyServiceCharge Float? @default(0)
 
   // Payment & status
   paymentType   PaymentType

@@ -162,7 +162,9 @@ router.get("/", authenticate, async (req, res) => {
       ...(customerId ? { customerId } : {}),
       ...(airlineId ? { airlineId } : {}),
       ...(paymentStatus ? { paymentStatus } : {}),
-      ...(saleStatus ? { status: saleStatus } : {}),
+      // VOID sales (tickets cancelled with the vendor) are not sales — they only show up when
+      // asked for; their profit (our own service charge) is added to the totals separately.
+      ...(saleStatus ? { status: saleStatus } : { status: { not: "VOID" } }),
       ...saleTypeWhere,
       ...(paymentMethod === "POS"
         ? { OR: [{ paymentType: "POS" }, { payments: { some: { method: "POS" } } }] }
@@ -249,6 +251,24 @@ router.get("/", authenticate, async (req, res) => {
     // ── Build Refund where clause ──────────────────────────────────────
     // Refunds don't carry vendor/customer/branch directly — filter via
     // their related sale, and via processedById for the agent filter.
+    // Profit + VAT of the VOID sales in the same period: our own service charge is profit
+    // and its 15% is VAT. Skipped under customer / payment filters (a void has neither).
+    const voidRows =
+      saleStatus === "VOID"
+        ? flatSales.filter((r) => r.status === "VOID")
+        : !customerId && !paymentStatus && !paymentMethod && !saleStatus
+          ? await prisma.sale.findMany({
+              where: {
+                status: "VOID",
+                invoice: saleWhere.invoice,
+                ...(vendorId ? { vendorId } : {}),
+                ...(airlineId ? { airlineId } : {}),
+                ...saleTypeWhere,
+              },
+              select: { profit: true, vatAmount: true },
+            })
+          : [];
+
     const refundWhere = {
       ...(dateFilter ? { refundDate: dateFilter } : {}),
       ...(agentId ? { processedById: agentId } : {}),
@@ -333,7 +353,7 @@ router.get("/", authenticate, async (req, res) => {
     }));
 
     // ── Compute report-wide totals using the corrected business rules ───
-    const totals = computeTotals(flatSales, flatRefunds, flatExpenses);
+    const totals = computeTotals(flatSales, flatRefunds, flatExpenses, voidRows);
 
     return res.json({
       success: true,
@@ -362,8 +382,11 @@ router.get("/", authenticate, async (req, res) => {
 // Shared totals calculator — used by both the row-level "/" endpoint
 // and can be reused anywhere else totals need to be derived consistently.
 // ─────────────────────────────────────────────────────────────
-function computeTotals(flatSales, flatRefunds, flatExpenses) {
-  const statsSales = flatSales.filter((r) => r.status !== "REFUNDED");
+function computeTotals(flatSales, flatRefunds, flatExpenses, voidRows = []) {
+  const statsSales = flatSales.filter((r) => r.status !== "REFUNDED" && r.status !== "VOID");
+  // Our own service charge on voided tickets: profit, with its 15% as VAT
+  const voidProfit = voidRows.reduce((s, r) => s + Number(r.profit || 0), 0);
+  const voidVat = voidRows.reduce((s, r) => s + Number(r.vatAmount || 0), 0);
 
   const totalSellPrice = statsSales.reduce((s, r) => s + (r.sellPrice || 0), 0);
   const totalPaid = statsSales.reduce((s, r) => s + (r.paidAmount || 0), 0);
@@ -371,12 +394,12 @@ function computeTotals(flatSales, flatRefunds, flatExpenses) {
   // VAT — displayed as its own figure. Informational only; NOT deducted
   // from profit anywhere below.
   const totalPaxVat = statsSales.reduce((s, r) => s + (r.paxVat || 0), 0);
-  const totalVatAmount = statsSales.reduce((s, r) => s + (r.vatAmount || 0), 0);
+  const totalVatAmount = statsSales.reduce((s, r) => s + (r.vatAmount || 0), 0) + voidVat;
   const totalVat = totalPaxVat + totalVatAmount;
   const totalNetPrice = flatSales
     .filter((r) => r.status === "COMPLETED")
     .reduce((s, r) => s + (r.netPrice || 0), 0);
-  const totalProfit = statsSales.reduce((s, r) => s + (r.profit || 0), 0);
+  const totalProfit = statsSales.reduce((s, r) => s + (r.profit || 0), 0) + voidProfit;
 
   // Cancellation charges are profit kept by the business — add on top.
   const totalCancellationCharges = flatRefunds.reduce(
@@ -532,13 +555,13 @@ router.get("/summary", authenticate, async (req, res) => {
       ...(customerId ? { customerId } : {}),
     };
 
-    const [statsAgg, netPriceAgg, refundsAgg, expensesAgg] = await Promise.all([
+    const [statsAgg, netPriceAgg, refundsAgg, expensesAgg, voidAgg] = await Promise.all([
       // ✅ One aggregate for everything that should exclude REFUNDED-status
       // sales (sellPrice, paidAmount, VAT, profit, count). The reversal
       // (negative) Sale row created by a refund is NOT REFUNDED-status, so
       // it stays in and correctly pulls these sums down.
       prisma.sale.aggregate({
-        where: { ...saleWhere, status: { not: "REFUNDED" } },
+        where: { ...saleWhere, status: { notIn: ["REFUNDED", "VOID"] } },
         _sum: {
           sellPrice: true,
           paidAmount: true,
@@ -570,14 +593,19 @@ router.get("/summary", authenticate, async (req, res) => {
         _sum: { amount: true },
         _count: true,
       }),
+      // our own service charge on voided tickets: profit + its VAT
+      prisma.sale.aggregate({
+        where: { ...saleWhere, status: "VOID" },
+        _sum: { profit: true, vatAmount: true },
+      }),
     ]);
 
     const totalSellPrice = statsAgg._sum.sellPrice || 0;
     const totalNetPrice = netPriceAgg._sum.netPrice || 0; // ✅ COMPLETED-only
     // ✅ Profit as stored, REFUNDED sales excluded — no VAT subtraction.
-    const totalProfit = statsAgg._sum.profit || 0;
+    const totalProfit = (statsAgg._sum.profit || 0) + (voidAgg._sum.profit || 0);
     const totalPaxVat = statsAgg._sum.paxVat || 0;
-    const totalVatAmount = statsAgg._sum.vatAmount || 0;
+    const totalVatAmount = (statsAgg._sum.vatAmount || 0) + (voidAgg._sum.vatAmount || 0);
     const totalVat = totalPaxVat + totalVatAmount; // informational only
 
     const totalPaid = statsAgg._sum.paidAmount || 0;

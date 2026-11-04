@@ -332,6 +332,7 @@ router.post("/", authenticate, async (req, res) => {
             });
 
             if (!originalSale) throw new Error("Original sale not found");
+            if (originalSale.status === "VOID") throw new Error("A void sale cannot be refunded");
 
             // Only check refund record — original sale status stays untouched
             const existingRefund = await tx.refund.findFirst({ where: { saleId } });
