@@ -3,12 +3,16 @@
 // whole thing is two entries on the vendor's ledger:
 //
 //   credit  = net + vendor service charges + vendor VAT   (what the vendor bills us)
-//   debit   = credit - additional/void charges            (what the vendor gives back)
+//   debit   = net - additional/cancellation/void charges   (what the vendor gives back)
 //
-// The debit is stored as the sale's sellPrice. The vendor keeps `voidCharges`.
+// The vendor's own service charges and the VAT on them never come back, and the
+// additional/void charges are kept too — so e.g. 500 net + 5 + 0.75 VAT = 505.75
+// credit, and with 10 of void charges the debit is 500 - 10 = 490 (505.75 - 5.75 - 10).
+// The debit is stored as the sale's sellPrice.
 //
 // Optionally we add our own service charge: it is the sale's profit and its 15% VAT
-// goes in vatAmount (no ledger entry — nobody is paying it through this sale).
+// goes in vatAmount. The profit is also credited to the CASH account (one more ledger
+// entry), so the books show it as money we hold.
 //
 // Create is reached through the ordinary POST /api/sales (a line with status "VOID");
 // edit and delete have their own routes so the normal-sale code is never touched.
@@ -37,12 +41,23 @@ export function resolveVoidAmounts(line) {
     throw new Error(`Vendor VAT must be 15% of the vendor service charges (${vendorVat.toFixed(2)})`);
 
   const credit = round2(net + vendorServiceCharge + vendorVat);
-  if (voidCharges > credit) throw new Error("Additional / void charges cannot be more than the vendor credit amount");
-  const debit = round2(credit - voidCharges);
+  // the vendor's charges + their VAT never return, so only the net can be given back
+  if (voidCharges > net) throw new Error("Additional / void charges cannot be more than the net amount");
+  const debit = round2(net - voidCharges);
 
   const companyVat = round2(companyServiceCharge * VAT_RATE);
 
-  return { net, vendorServiceCharge, vendorVat, voidCharges, credit, debit, companyServiceCharge, companyVat };
+  return {
+    net,
+    vendorServiceCharge,
+    vendorVat,
+    voidCharges,
+    credit,
+    debit,
+    retained: round2(credit - debit), // what the vendor keeps: its charges + VAT + the void charges
+    companyServiceCharge,
+    companyVat,
+  };
 }
 
 // The fields a void sale row stores for these amounts.
@@ -65,7 +80,7 @@ const saleFields = (a) => ({
 });
 
 // Balance change of the vendor's account for a void: the same direction as an ordinary
-// sale for the credit, then the opposite for the debit — so only the retained charge is left.
+// sale for the credit, then the opposite for the debit — so only what the vendor keeps is left.
 //   DEBIT vendor  (we owe them):  +credit, -debit
 //   CREDIT vendor (prepaid):      -credit, +debit
 const balanceChange = (vendor, credit, debit) =>
@@ -94,7 +109,7 @@ async function postVendorLedger(tx, { vendor, saleId, invoiceId, invoiceNo, date
       transactionDate: date,
       saleId,
       invoiceId,
-      remarks: `Void amount returned by vendor (less void charges ${amounts.voidCharges.toFixed(2)}) - Invoice ${invoiceNo}`,
+      remarks: `Void amount returned by vendor (net ${amounts.net.toFixed(2)} less void charges ${amounts.voidCharges.toFixed(2)}) - Invoice ${invoiceNo}`,
     },
   });
   await tx.account.update({
@@ -103,7 +118,44 @@ async function postVendorLedger(tx, { vendor, saleId, invoiceId, invoiceNo, date
   });
 }
 
+// Our own service charge is profit: credit it to the cash account.
+async function postCashProfit(tx, { saleId, invoiceId, invoiceNo, date, amount }) {
+  if (!(amount > 0)) return;
+  let cash = await tx.account.findFirst({ where: { type: "CASH" } });
+  if (!cash) cash = await tx.account.create({ data: { name: "Cash Account", type: "CASH", balance: 0 } });
+  await tx.ledgerEntry.create({
+    data: {
+      accountId: cash.id,
+      entryType: "VOID",
+      debit: 0,
+      credit: amount,
+      transactionDate: date,
+      saleId,
+      invoiceId,
+      remarks: `Void company service charges (profit) - Invoice ${invoiceNo}`,
+    },
+  });
+  await tx.account.update({ where: { id: cash.id }, data: { balance: { increment: amount } } });
+}
+
+// Takes back whatever this sale credited to the cash account (read from the entries
+// themselves, so it is exact however the sale was posted).
+async function reverseCashProfit(tx, saleId) {
+  const entries = await tx.ledgerEntry.findMany({
+    where: { saleId, account: { is: { type: "CASH" } } },
+    select: { id: true, accountId: true, credit: true, debit: true },
+  });
+  for (const e of entries) {
+    await tx.ledgerEntry.delete({ where: { id: e.id } });
+    await tx.account.update({
+      where: { id: e.accountId },
+      data: { balance: { increment: -round2(num(e.credit) - num(e.debit)) } },
+    });
+  }
+}
+
 async function reverseVendorLedger(tx, sale, vendor) {
+  await reverseCashProfit(tx, sale.id);
   const credit = round2(num(sale.netPrice) + num(sale.vendorServiceCharge) + num(sale.vendorVat));
   const debit = round2(num(sale.sellPrice));
   await tx.ledgerEntry.deleteMany({
@@ -119,9 +171,9 @@ async function reverseVendorLedger(tx, sale, vendor) {
 const assertVendorCanCover = (vendor, amounts) => {
   if (vendor.category === "CREDIT") {
     const balance = num(vendor.account?.balance);
-    if (amounts.voidCharges > balance)
+    if (amounts.retained > balance)
       throw new Error(
-        `Insufficient balance for vendor "${vendor.vendorName}". Available: ${balance}, Required: ${amounts.voidCharges}`,
+        `Insufficient balance for vendor "${vendor.vendorName}". Available: ${balance}, Required: ${amounts.retained}`,
       );
   }
 };
@@ -202,6 +254,13 @@ export function makeVoidHandlers({ prisma, generateNextSalesInvoiceNo }) {
               date: businessDate,
               amounts,
             });
+            await postCashProfit(tx, {
+              saleId: sale.id,
+              invoiceId: inv.id,
+              invoiceNo,
+              date: businessDate,
+              amount: amounts.companyServiceCharge,
+            });
           }
 
           await refreshInvoiceTotals(tx, inv.id);
@@ -268,6 +327,13 @@ export function makeVoidHandlers({ prisma, generateNextSalesInvoiceNo }) {
             invoiceNo: sale.invoice.invoiceNo,
             date: businessDate,
             amounts,
+          });
+          await postCashProfit(tx, {
+            saleId,
+            invoiceId: sale.invoiceId,
+            invoiceNo: sale.invoice.invoiceNo,
+            date: businessDate,
+            amount: amounts.companyServiceCharge,
           });
           await refreshInvoiceTotals(tx, sale.invoiceId);
         },
