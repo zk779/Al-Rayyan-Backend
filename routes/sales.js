@@ -66,6 +66,28 @@ function resolveStay(src, current = {}) {
 	return { saleType, checkInDate, checkOutDate, hotelName };
 }
 
+// The vendor's own service charges (and the 15% VAT on them). They are already INSIDE netPrice —
+// the forms send netPrice as net amount + charges + VAT — so the ledger, profit and every report
+// work unchanged; they are only stored so the breakdown can be shown again when the sale is
+// edited. Nothing is read from `current` unless the payload doesn't mention them at all.
+function resolveVendorCharges(src, netPrice, current = null) {
+	if (src.vendorServiceCharge === undefined && current) {
+		return {
+			vendorServiceCharge: Number(current.vendorServiceCharge || 0),
+			vendorVat: Number(current.vendorVat || 0),
+		};
+	}
+	const vendorServiceCharge = Number(src.vendorServiceCharge || 0);
+	if (isNaN(vendorServiceCharge) || vendorServiceCharge < 0)
+		throw new Error("Vendor service charges cannot be negative");
+	const vendorVat = Math.round((vendorServiceCharge * 0.15 + Number.EPSILON) * 100) / 100;
+	if (src.vendorVat != null && src.vendorVat !== "" && Math.abs(Number(src.vendorVat) - vendorVat) > 0.011)
+		throw new Error(`Vendor VAT must be 15% of the vendor service charges (${vendorVat.toFixed(2)})`);
+	if (vendorServiceCharge + vendorVat > Number(netPrice) + 0.005)
+		throw new Error("Net price cannot be less than the vendor service charges plus their VAT");
+	return { vendorServiceCharge, vendorVat };
+}
+
 router.get("/", authenticate, async (req, res) => {
 	try {
 		const { search, dateFrom, dateTo, order, createdById, branchId, tz, saleType } = req.query;
@@ -1318,6 +1340,7 @@ router.post("/", authenticate, async (req, res) => {
 			if (vat < 0 || paxVat < 0 || misc < 0) throw new Error("Taxes/charges cannot be negative");
 
 			resolveStay(s); // validates saleType + hotel dates
+			resolveVendorCharges(s, net);
 
 			const pt = String(s.paymentType).toUpperCase();
 
@@ -1699,6 +1722,7 @@ router.post("/", authenticate, async (req, res) => {
 						vatAmount: Number(s.vatAmount || 0),
 						paxVat: Number(s.paxVat || 0),
 						miscCharges: Number(s.miscCharges || 0),
+						...resolveVendorCharges(s, net),
 						paidAmount: paid,
 						paymentType: pt,
 						paymentStatus: paid >= sell ? "PAID" : paid > 0 ? "PARTIAL" : "DUE",
@@ -2581,6 +2605,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						vatAmount: Number(payload.vatAmount || 0),
 						paxVat: Number(payload.paxVat || 0),
 						miscCharges: Number(payload.miscCharges || 0),
+						...resolveVendorCharges(payload, newNet, current),
 						paidAmount: newPaid,
 						paymentType: newPt,
 						paymentStatus: newPaid >= newSell ? "PAID" : newPaid > 0 ? "PARTIAL" : "DUE",
