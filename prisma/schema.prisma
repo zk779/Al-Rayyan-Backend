@@ -175,6 +175,7 @@ model User {
   branch Branch? @relation(fields: [branchId], references: [id])
 
   salesInvoices             SalesInvoice[]
+  otherServiceInvoices      OtherServiceInvoice[]
   refunds                   Refund[]
   expenses                  Expense[]               @relation("ExpenseEmployee")
   expensesCreated           Expense[]               @relation("ExpenseCreator")
@@ -724,4 +725,79 @@ model BalanceAdjustment {
   @@index([bankId])
   @@index([accountId])
   @@index([createdById])
+}
+
+/* ======================= OTHER SERVICES =======================
+   Invoices for services that are not ticket sales or hotel bookings (transportation,
+   Umrah visa, NADRA …). Their own tables and their own number series — not linked to
+   customers, vendors or ledgers: customer details are typed on the invoice. */
+
+// One line of the invoice: description | detail (vehicle / passenger …) | qty | unit | rate | amount
+type OtherServiceItem {
+  description String
+  detail      String?
+  qty         Float
+  unit        String?
+  rate        Float
+  amount      Float
+}
+
+// A labelled note printed under the table ("Rental Period", "Route / Site" …)
+type OtherServiceNote {
+  label String
+  value String
+}
+
+model OtherServiceCounter {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  key           String   @unique
+  currentNumber Int      @default(0)
+  updatedAt     DateTime @updatedAt
+}
+
+model OtherServiceInvoice {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  invoiceNo   String   @unique
+  invoiceDate DateTime @default(now())
+
+  // Free text, so a new kind of service needs no migration: TRANSPORTATION | UMRAH_VISA | NADRA | OTHER …
+  serviceType String
+  // The column heading of each line's `detail` ("Vehicle / Plate", "Passenger / Passport No." …)
+  detailLabel String?
+
+  referenceNo     String?
+  projectLocation String?
+  paymentTerms    String?
+
+  // Customer — typed on the invoice, never linked to the Customers list
+  customerName    String
+  customerCrNo    String?
+  customerVatNo   String?
+  contactPerson   String?
+  customerPhone   String?
+  customerEmail   String?
+  customerAddress String?
+
+  items OtherServiceItem[]
+  notes OtherServiceNote[]
+
+  // Money. `subtotal` is the sum of the lines as typed; whether those include the 15% VAT is
+  // pricesIncludeVat. netAmount is always the amount EXCLUDING VAT.
+  pricesIncludeVat Boolean @default(true)
+  subtotal         Float
+  discount         Float   @default(0)
+  netAmount        Float
+  vatAmount        Float
+  total            Float
+
+  userId   String   @db.ObjectId
+  user     User     @relation(fields: [userId], references: [id])
+  branchId String?  @db.ObjectId
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([invoiceDate])
+  @@index([serviceType])
+  @@index([customerName])
 }
