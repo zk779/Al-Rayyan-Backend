@@ -57,6 +57,12 @@ enum AccountType {
   INCOME
 }
 
+// An "Other Services" invoice is a DRAFT until it is confirmed with a payment (cash / bank).
+enum OtherServiceStatus {
+  DRAFT
+  CONFIRMED
+}
+
 enum LedgerEntryType {
   OPENING_BALANCE
   SALE
@@ -241,6 +247,7 @@ model LedgerEntry {
   refundId                String?            @db.ObjectId
   vendorCustomerPaymentId String?            @db.ObjectId // links to VendorCustomerPayment.id
   balanceAdjustmentId     String?            @db.ObjectId // links to BalanceAdjustment.id
+  otherServiceInvoiceId   String?            @db.ObjectId // links to OtherServiceInvoice.id (payment received)
   balanceAdjustment       BalanceAdjustment? @relation(fields: [balanceAdjustmentId], references: [id])
 
   vendorCustomerPayment VendorCustomerPayment? @relation(fields: [vendorCustomerPaymentId], references: [id])
@@ -261,6 +268,7 @@ model LedgerEntry {
   @@index([vendorCustomerPaymentId])
   @@index([balanceAdjustmentId])
   @@index([expenseId])
+  @@index([otherServiceInvoiceId])
   @@index([transactionDate])
   @@index([createdAt])
 }
@@ -340,6 +348,7 @@ model Bank {
   expenses               Expense[]
   refunds                Refund[]
   balanceAdjustments     BalanceAdjustment[]
+  otherServiceInvoices   OtherServiceInvoice[]
 
   @@index([bankDate])
   @@index([createdAt])
@@ -790,6 +799,14 @@ model OtherServiceInvoice {
   vatAmount        Float
   total            Float
 
+  // DRAFT: saved only, nothing posted. CONFIRMED: the payment was received (CASH or BANK) and
+  // posted to that account's ledger (LedgerEntry.otherServiceInvoiceId = this invoice).
+  status        OtherServiceStatus @default(CONFIRMED)
+  paymentMethod String? // CASH | BANK — only when CONFIRMED
+  bankId        String?            @db.ObjectId
+  bank          Bank?              @relation(fields: [bankId], references: [id])
+  confirmedAt   DateTime?
+
   userId   String   @db.ObjectId
   user     User     @relation(fields: [userId], references: [id])
   branchId String?  @db.ObjectId
@@ -799,5 +816,6 @@ model OtherServiceInvoice {
 
   @@index([invoiceDate])
   @@index([serviceType])
+  @@index([status])
   @@index([customerName])
 }

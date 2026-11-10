@@ -6,7 +6,11 @@ import { localDayRangeToUtc } from "../utils/dateRange.js";
 
 // Invoices for services that are not ticket sales or hotel bookings — transportation, Umrah visa,
 // NADRA … Their own table and number series. Customer details are typed on the invoice; nothing
-// here touches a ledger, a customer or a vendor.
+// here touches a customer or a vendor.
+//
+// Status: DRAFT (saved only, nothing posted) or CONFIRMED (the payment was received in CASH or into a
+// BANK account — one PAYMENT entry credits that account's ledger for the invoice total and its balance
+// goes up). Editing / un-confirming / deleting a confirmed invoice reverses that entry first.
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -134,6 +138,68 @@ function normalize(body) {
 }
 
 const withUser = { user: { select: { id: true, fullName: true, email: true } } };
+const withBank = { bank: { select: { id: true, bankName: true, accountNumber: true } } };
+
+/* ----------------------- status + payment ----------------------- */
+
+// DRAFT / CONFIRMED + how it was paid. A draft never carries a payment.
+async function resolveStatusAndPayment(tx, body) {
+	const status = String(body.status || "DRAFT").toUpperCase();
+	if (!["DRAFT", "CONFIRMED"].includes(status)) throw new Error("Status must be DRAFT or CONFIRMED");
+	if (status === "DRAFT") return { status, paymentMethod: null, bankId: null, bank: null };
+
+	const paymentMethod = String(body.paymentMethod || "").toUpperCase();
+	if (!["CASH", "BANK"].includes(paymentMethod)) throw new Error("Choose how the payment was received: Cash or Bank");
+	if (paymentMethod === "CASH") return { status, paymentMethod, bankId: null, bank: null };
+
+	if (!body.bankId) throw new Error("Choose the bank account the payment was received in");
+	const bank = await tx.bank.findUnique({ where: { id: String(body.bankId) }, include: { account: true } }).catch(() => null);
+	if (!bank || !bank.isActive) throw new Error("That bank account was not found or is not active");
+	return { status, paymentMethod, bankId: bank.id, bank };
+}
+
+async function getCashAccount(tx) {
+	return (
+		(await tx.account.findFirst({ where: { type: "CASH" } })) ||
+		(await tx.account.create({ data: { name: "Cash Account", type: "CASH", balance: 0 } }))
+	);
+}
+
+// the money received: one ledger entry on the cash / bank account, and its balance goes up
+async function postPayment(tx, invoice, pay) {
+	const account = pay.paymentMethod === "CASH" ? await getCashAccount(tx) : pay.bank.account;
+	const via = pay.paymentMethod === "CASH" ? "Cash" : `Bank - ${pay.bank.bankName}`;
+	await tx.ledgerEntry.create({
+		data: {
+			accountId: account.id,
+			entryType: "PAYMENT",
+			debit: 0,
+			credit: invoice.total,
+			transactionDate: invoice.invoiceDate,
+			otherServiceInvoiceId: invoice.id,
+			remarks: `Other service payment (${via}) - Invoice ${invoice.invoiceNo}`,
+		},
+	});
+	await tx.account.update({ where: { id: account.id }, data: { balance: { increment: invoice.total } } });
+}
+
+// takes back whatever this invoice posted: balances go down by what the entries added, entries removed
+async function reversePayment(tx, invoiceId) {
+	const entries = await tx.ledgerEntry.findMany({ where: { otherServiceInvoiceId: invoiceId } });
+	for (const e of entries) {
+		if (e.accountId) {
+			await tx.account.update({ where: { id: e.accountId }, data: { balance: { increment: round2((e.debit || 0) - (e.credit || 0)) } } });
+		}
+	}
+	if (entries.length) await tx.ledgerEntry.deleteMany({ where: { otherServiceInvoiceId: invoiceId } });
+}
+
+const paymentFields = (pay, previous) => ({
+	status: pay.status,
+	paymentMethod: pay.paymentMethod,
+	bankId: pay.bankId,
+	confirmedAt: pay.status === "CONFIRMED" ? previous?.confirmedAt || new Date() : null,
+});
 
 /* ----------------------- NEXT NUMBER (read-only preview) ----------------------- */
 // GET /api/other-services/next-number?invoiceDate=2026-11-06 — what the next invoice will be called
@@ -153,7 +219,7 @@ router.get("/next-number", authenticate, async (req, res) => {
 // GET /api/other-services?search=&serviceType=&dateFrom=&dateTo=&tz=&order=asc|desc
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search, serviceType, dateFrom, dateTo, tz, order } = req.query;
+		const { search, serviceType, dateFrom, dateTo, tz, order, status } = req.query;
 		const filters = [];
 		const scope = scopeFilter(req);
 		if (scope) filters.push(scope);
@@ -170,6 +236,7 @@ router.get("/", authenticate, async (req, res) => {
 			});
 		}
 		if (serviceType && serviceType !== "all") filters.push({ serviceType: String(serviceType).toUpperCase() });
+			if (status && ["DRAFT", "CONFIRMED"].includes(String(status).toUpperCase())) filters.push({ status: String(status).toUpperCase() });
 
 		// a text search looks across every date, like the sales report
 		if ((dateFrom || dateTo) && !search) {
@@ -185,14 +252,22 @@ router.get("/", authenticate, async (req, res) => {
 		const data = await prisma.otherServiceInvoice.findMany({
 			where,
 			orderBy: [{ invoiceDate: String(order).toLowerCase() === "asc" ? "asc" : "desc" }, { createdAt: "desc" }],
-			include: withUser,
+			include: { ...withUser, ...withBank },
 		});
 
-		const sum = (key) => round2(data.reduce((a, d) => a + Number(d[key] || 0), 0));
+		// drafts are not income yet: the money figures count confirmed invoices only
+		const confirmed = data.filter((d) => d.status === "CONFIRMED");
+		const sum = (key) => round2(confirmed.reduce((a, d) => a + Number(d[key] || 0), 0));
 		res.json({
 			success: true,
 			data,
-			summary: { count: data.length, netAmount: sum("netAmount"), vatAmount: sum("vatAmount"), total: sum("total") },
+			summary: {
+				count: data.length,
+				drafts: data.length - confirmed.length,
+				netAmount: sum("netAmount"),
+				vatAmount: sum("vatAmount"),
+				total: sum("total"),
+			},
 		});
 	} catch (err) {
 		console.error(err);
@@ -206,7 +281,7 @@ router.get("/:id", authenticate, async (req, res) => {
 		const scope = scopeFilter(req);
 		const invoice = await prisma.otherServiceInvoice.findFirst({
 			where: { AND: [{ id: req.params.id }, ...(scope ? [scope] : [])] },
-			include: withUser,
+			include: { ...withUser, ...withBank },
 		});
 		if (!invoice) return res.status(404).json({ success: false, error: "Invoice not found" });
 		res.json({ success: true, data: invoice });
@@ -221,12 +296,19 @@ router.post("/", authenticate, async (req, res) => {
 	try {
 		const data = normalize(req.body || {});
 		const invoice = await prisma.$transaction(async (tx) => {
+			const pay = await resolveStatusAndPayment(tx, req.body || {});
 			const invoiceNo = await generateNextOtherServiceNo(tx, data.invoiceDate);
-			return tx.otherServiceInvoice.create({
-				data: { ...data, invoiceNo, userId: req.user.id, branchId: req.user.branchId || null },
+			const created = await tx.otherServiceInvoice.create({
+				data: { ...data, ...paymentFields(pay), invoiceNo, userId: req.user.id, branchId: req.user.branchId || null },
 			});
+			if (pay.status === "CONFIRMED") await postPayment(tx, created, pay);
+			return created;
 		});
-		res.status(201).json({ success: true, message: "Invoice created", data: invoice });
+		res.status(201).json({
+			success: true,
+			message: invoice.status === "DRAFT" ? "Invoice saved as a draft" : "Invoice created",
+			data: invoice,
+		});
 	} catch (err) {
 		console.error(err);
 		res.status(400).json({ success: false, error: err.message });
@@ -239,13 +321,45 @@ router.put("/:id", authenticate, async (req, res) => {
 		const scope = scopeFilter(req);
 		const existing = await prisma.otherServiceInvoice.findFirst({
 			where: { AND: [{ id: req.params.id }, ...(scope ? [scope] : [])] },
-			select: { id: true },
+			select: { id: true, confirmedAt: true },
 		});
 		if (!existing) return res.status(404).json({ success: false, error: "Invoice not found" });
 
 		const data = normalize(req.body || {});
-		const invoice = await prisma.otherServiceInvoice.update({ where: { id: existing.id }, data });
+		const invoice = await prisma.$transaction(async (tx) => {
+			const pay = await resolveStatusAndPayment(tx, req.body || {});
+			// whatever it posted before is taken back, then posted again if it is still confirmed
+			await reversePayment(tx, existing.id);
+			const updated = await tx.otherServiceInvoice.update({ where: { id: existing.id }, data: { ...data, ...paymentFields(pay, existing) } });
+			if (pay.status === "CONFIRMED") await postPayment(tx, updated, pay);
+			return updated;
+		});
 		res.json({ success: true, message: "Invoice updated", data: invoice });
+	} catch (err) {
+		console.error(err);
+		res.status(400).json({ success: false, error: err.message });
+	}
+});
+
+/* ----------------------- CONFIRM A DRAFT (receive the payment) ----------------------- */
+// POST /api/other-services/:id/confirm { paymentMethod: "CASH" | "BANK", bankId? }
+router.post("/:id/confirm", authenticate, async (req, res) => {
+	try {
+		const scope = scopeFilter(req);
+		const existing = await prisma.otherServiceInvoice.findFirst({
+			where: { AND: [{ id: req.params.id }, ...(scope ? [scope] : [])] },
+			select: { id: true, status: true },
+		});
+		if (!existing) return res.status(404).json({ success: false, error: "Invoice not found" });
+		if (existing.status === "CONFIRMED") return res.status(409).json({ success: false, error: "This invoice is already confirmed" });
+
+		const invoice = await prisma.$transaction(async (tx) => {
+			const pay = await resolveStatusAndPayment(tx, { ...(req.body || {}), status: "CONFIRMED" });
+			const updated = await tx.otherServiceInvoice.update({ where: { id: existing.id }, data: paymentFields(pay) });
+			await postPayment(tx, updated, pay);
+			return updated;
+		});
+		res.json({ success: true, message: `Invoice ${invoice.invoiceNo} confirmed`, data: invoice });
 	} catch (err) {
 		console.error(err);
 		res.status(400).json({ success: false, error: err.message });
@@ -262,7 +376,11 @@ router.delete("/:id", authenticate, async (req, res) => {
 		});
 		if (!existing) return res.status(404).json({ success: false, error: "Invoice not found" });
 
-		await prisma.otherServiceInvoice.delete({ where: { id: existing.id } });
+		// a confirmed invoice gives its payment back (ledger entry + account balance) before it goes
+		await prisma.$transaction(async (tx) => {
+			await reversePayment(tx, existing.id);
+			await tx.otherServiceInvoice.delete({ where: { id: existing.id } });
+		});
 		res.json({ success: true, message: "Invoice deleted" });
 	} catch (err) {
 		console.error(err);
