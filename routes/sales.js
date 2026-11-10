@@ -32,6 +32,7 @@ async function authenticate(req, res, next) {
 		req.user = {
 			...decoded,
 			permissions: user.role?.permissionLinks.map((link) => link.permission.name) || [],
+				roleName: user.role?.name || null,
 		};
 		next();
 	} catch (err) {
@@ -99,9 +100,42 @@ function resolveVendorCharges(src, netPrice, current = null) {
 	return { vendorServiceCharge, vendorVat };
 }
 
+// Which branch an invoice (and so its sales) belongs to. Normally the creator's own; only an admin
+// can put one in another branch — when creating, editing, or moving it from the Sales Report.
+const isAdminUser = (req) => String(req.user?.roleName || req.user?.role || "").toUpperCase() === "ADMIN";
+async function resolveInvoiceBranch(req, requested, fallback = null) {
+	const wanted = requested ? String(requested) : null;
+	if (!wanted) return fallback;
+	if (!isAdminUser(req)) {
+		if (wanted === (req.user.branchId || null)) return fallback;
+		throw new Error("Only an admin can assign a sale to another branch");
+	}
+	const branch = await prisma.branch.findUnique({ where: { id: wanted }, select: { id: true } });
+	if (!branch) throw new Error("Branch not found");
+	return branch.id;
+}
+
+// A ticket (document number) that has a VOID is finished: it can't be sold again, refunded or voided
+// twice. Returns [{ documentNo, invoiceNo }] for every one of `documentNos` that has a void.
+async function findVoidedDocuments(documentNos, excludeSaleId = null) {
+	const docs = [...new Set((documentNos || []).map((d) => String(d ?? "").trim()).filter(Boolean))];
+	if (!docs.length) return [];
+	const voids = await prisma.sale.findMany({
+		where: {
+			status: "VOID",
+			OR: docs.map((d) => ({ documentNo: { equals: d, mode: "insensitive" } })),
+			...(excludeSaleId ? { id: { not: excludeSaleId } } : {}),
+		},
+		select: { documentNo: true, invoice: { select: { invoiceNo: true } } },
+	});
+	return voids.map((v) => ({ documentNo: v.documentNo, invoiceNo: v.invoice?.invoiceNo || null }));
+}
+const voidedMessage = (v) =>
+	`Document No "${v.documentNo}" is VOID${v.invoiceNo ? ` (invoice ${v.invoiceNo})` : ""} — a new sale is not allowed for a voided ticket`;
+
 router.get("/", authenticate, async (req, res) => {
 	try {
-		const { search, dateFrom, dateTo, order, createdById, branchId, tz, saleType } = req.query;
+		const { search, dateFrom, dateTo, order, sortBy, createdById, branchId, tz, saleType } = req.query;
 
 		const filters = [];
 
@@ -165,7 +199,12 @@ router.get("/", authenticate, async (req, res) => {
 		const [sales, summary, summarySales] = await prisma.$transaction([
 			prisma.sale.findMany({
 				where,
-				orderBy: { invoice: { saleDate: sortDirection } },
+				// ?sortBy=invoiceNo lists by invoice number (the numbers are fixed-width, so text order is numeric
+				// order); a sale's own order inside one invoice stays the order it was entered
+				orderBy:
+					String(sortBy || "") === "invoiceNo"
+						? [{ invoice: { invoiceNo: sortDirection } }, { createdAt: "asc" }]
+						: { invoice: { saleDate: sortDirection } },
 				select: {
 					id: true,
 					netPrice: true,
@@ -485,10 +524,10 @@ router.get("/search", authenticate, async (req, res) => {
 		const sales = await prisma.sale.findMany({
 			where: {
 				documentNo: { contains: documentNo, mode: "insensitive" },
-				status: { not: "VOID" },
 			},
 			orderBy: { createdAt: "desc" },
 			include: {
+				invoice: { select: { invoiceNo: true } },
 				airline: { select: { airlineCode: true, airlineName: true } },
 				vendor: {
 					select: {
@@ -513,6 +552,12 @@ router.get("/search", authenticate, async (req, res) => {
 			return res.json({ success: true, data: [] });
 		}
 
+		/* A ticket with a VOID can never be refunded: remember which document numbers are void */
+		const voidedBy = new Map(); // lower-case document no -> the void's invoice no
+		for (const s of sales) {
+			if (s.status === "VOID" && s.documentNo) voidedBy.set(s.documentNo.toLowerCase(), s.invoice?.invoiceNo || null);
+		}
+
 		/* Keep only latest sale per documentNo */
 		const latestSaleByDoc = new Map();
 		for (const sale of sales) {
@@ -529,7 +574,10 @@ router.get("/search", authenticate, async (req, res) => {
 			netPrice: s.netPrice,
 			sellPrice: s.sellPrice,
 			profit: s.profit,
-			status: s.status,
+			// a ticket that has been voided shows as VOID whichever of its records was found
+			status: voidedBy.has(String(s.documentNo || "").toLowerCase()) ? "VOID" : s.status,
+			voided: voidedBy.has(String(s.documentNo || "").toLowerCase()),
+			voidInvoiceNo: voidedBy.get(String(s.documentNo || "").toLowerCase()) ?? null,
 			paymentType: s.paymentType,
 			paymentStatus: s.paymentStatus,
 			paidAmount: s.paidAmount,
@@ -574,11 +622,15 @@ router.get("/check-document", authenticate, async (req, res) => {
 		});
 
 		const exists = !!existing;
+		const [voided] = await findVoidedDocuments([documentNo], excludeSaleId || null);
 
 		res.json({
 			success: true,
 			exists,
-			message: exists ? "Document already exists" : "Document does not exist",
+			// the ticket has a VOID: it can't be sold again, refunded, or voided a second time
+			voided: !!voided,
+			voidInvoiceNo: voided?.invoiceNo || null,
+			message: voided ? "Document is already void" : exists ? "Document already exists" : "Document does not exist",
 		});
 	} catch (err) {
 		console.error(err);
@@ -1384,7 +1436,14 @@ router.post("/", authenticate, async (req, res) => {
 			}
 		}
 
-		/* ── Bulk-load related records ── */
+		/* ── The invoice's branch: the creator's own unless an admin picked another ── */
+			const invoiceBranchId = await resolveInvoiceBranch(req, req.body.branchId, req.user.branchId || null);
+
+			/* ── A voided ticket (by document number) can't be sold again ── */
+			const voidedDocs = await findVoidedDocuments(sales.map((s) => s.documentNo));
+			if (voidedDocs.length) throw new Error(voidedMessage(voidedDocs[0]));
+
+			/* ── Bulk-load related records ── */
 		const vendorIds = [...new Set(sales.map(s => s.vendorId).filter(Boolean))];
 		const vendors = vendorIds.length
 			? await prisma.vendor.findMany({
@@ -1476,7 +1535,7 @@ router.post("/", authenticate, async (req, res) => {
 					invoiceNo,
 					saleDate: businessDate,
 					userId: req.user.id,
-					branchId: req.user.branchId || null,
+					branchId: invoiceBranchId,
 				},
 			});
 
@@ -1857,7 +1916,7 @@ router.post("/", authenticate, async (req, res) => {
 
 router.put("/:invoiceId", authenticate, async (req, res) => {
 	const { invoiceId } = req.params;
-	const { invoiceNo, saleDate, sales = [] } = req.body;
+	const { invoiceNo, saleDate, branchId: requestedBranchId, sales = [] } = req.body;
 
 	if (!Array.isArray(sales)) {
 		return res.status(400).json({ success: false, error: "sales must be an array" });
@@ -1911,6 +1970,20 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			}
 			resolveStay(s, saleMap.get(s.id)); // validates saleType + hotel dates
 		}
+		// An admin can also change the invoice's branch here (nobody else can)
+		const newBranchId = requestedBranchId ? await resolveInvoiceBranch(req, requestedBranchId, null) : null;
+
+		// ... and so is changing a sale's document number to one that is voided
+		const changedDocs = sales
+			.filter((s) => {
+				const before = String(saleMap.get(s.id)?.documentNo ?? "").trim().toLowerCase();
+				const after = String(s.documentNo ?? "").trim().toLowerCase();
+				return after && after !== before;
+			})
+			.map((s) => s.documentNo);
+		const voidedDocs = await findVoidedDocuments(changedDocs);
+		if (voidedDocs.length) throw new Error(voidedMessage(voidedDocs[0]));
+
 		const payloadSaleIds = new Set(sales.map(s => s.id));
 		const deletedSales = editableSales.filter(s => !payloadSaleIds.has(s.id));
 
@@ -1981,7 +2054,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 			/* ── Update invoice header ── */
 			await tx.salesInvoice.update({
 				where: { id: invoiceId },
-				data: { invoiceNo, saleDate: businessDate },
+				data: { invoiceNo, saleDate: businessDate, ...(newBranchId ? { branchId: newBranchId } : {}) },
 			});
 
 			/* ── In-memory balance tracking ── */
@@ -3334,6 +3407,65 @@ router.delete("/sale/:saleId", authenticate, async (req, res) => {
 		});
 	}
 });
+// PATCH /api/sales/:invoiceId/branch — admin only: move an invoice, with all its sales, to another branch
+router.patch("/:invoiceId/branch", authenticate, async (req, res) => {
+	try {
+		if (!isAdminUser(req)) {
+			return res.status(403).json({ success: false, error: "Only an admin can move a sale to another branch" });
+		}
+		const { branchId } = req.body || {};
+		if (!branchId) return res.status(400).json({ success: false, error: "branchId is required" });
+
+		const target = await prisma.branch.findUnique({
+			where: { id: String(branchId) },
+			select: { id: true, name: true, code: true },
+		});
+		if (!target) return res.status(404).json({ success: false, error: "Branch not found" });
+
+		const invoice = await prisma.salesInvoice.findUnique({
+			where: { id: req.params.invoiceId },
+			include: {
+				branch: { select: { id: true, name: true, code: true } },
+				sales: { select: { id: true, updatedBy: true } },
+			},
+		});
+		if (!invoice) return res.status(404).json({ success: false, error: "Invoice not found" });
+
+		const result = { invoiceId: invoice.id, branchId: target.id, branchName: target.name, branchCode: target.code };
+		if (invoice.branchId === target.id) {
+			return res.json({ success: true, message: "The sale is already in this branch", data: result });
+		}
+
+		const note = `Moved to branch ${target.name} (${target.code})${invoice.branch ? ` from ${invoice.branch.name}` : ""}`;
+		await prisma.$transaction(async (tx) => {
+			await tx.salesInvoice.update({ where: { id: invoice.id }, data: { branchId: target.id } });
+			// shows in each sale's history, like any other edit
+			for (const s of invoice.sales) {
+				await tx.sale.update({
+					where: { id: s.id },
+					data: {
+						updatedBy: [
+							...(Array.isArray(s.updatedBy) ? s.updatedBy : []),
+							{
+								userId: req.user.id,
+								userName: req.user.fullName || null,
+								userEmail: req.user.email || null,
+								updatedAt: new Date().toISOString(),
+								note,
+							},
+						],
+					},
+				});
+			}
+		});
+
+		res.json({ success: true, message: note, data: result });
+	} catch (err) {
+		console.error(err);
+		res.status(400).json({ success: false, error: err.message || "Failed to move the sale" });
+	}
+});
+
 // Void sales (status VOID) have their own edit + delete; create is POST / above
 router.put("/void/:saleId", authenticate, voidSales.update);
 router.delete("/void/:saleId", authenticate, voidSales.remove);

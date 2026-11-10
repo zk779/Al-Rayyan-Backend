@@ -333,6 +333,16 @@ router.post("/", authenticate, async (req, res) => {
 
             if (!originalSale) throw new Error("Original sale not found");
             if (originalSale.status === "VOID") throw new Error("A void sale cannot be refunded");
+            // A ticket that has been voided (found by its document number) can never be refunded
+            if (originalSale.documentNo) {
+                const voidedTicket = await tx.sale.findFirst({
+                    where: { status: "VOID", documentNo: { equals: originalSale.documentNo.trim(), mode: "insensitive" } },
+                    select: { invoice: { select: { invoiceNo: true } } },
+                });
+                if (voidedTicket) {
+                    throw new Error(`Ticket ${originalSale.documentNo} is VOID${voidedTicket.invoice?.invoiceNo ? ` (invoice ${voidedTicket.invoice.invoiceNo})` : ""} — a voided ticket cannot be refunded`);
+                }
+            }
 
             // Only check refund record — original sale status stays untouched
             const existingRefund = await tx.refund.findFirst({ where: { saleId } });

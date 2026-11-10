@@ -96,6 +96,16 @@ function buildPosLegs(s) {
   return [];
 }
 
+// A sale belongs to the branch of its INVOICE (an admin can move it), not to the branch of whoever
+// created it. Invoices that never got a branch fall back to their creator's.
+const invoiceInBranch = (branchId) => ({
+  OR: [
+    { branchId },
+    { branchId: { isSet: false }, user: { branchId } },
+    { branchId: null, user: { branchId } },
+  ],
+});
+
 router.get("/", authenticate, async (req, res) => {
   try {
     const {
@@ -156,7 +166,7 @@ router.get("/", authenticate, async (req, res) => {
       invoice: {
         ...(dateFilter ? { saleDate: dateFilter } : {}),
         ...(agentId ? { userId: agentId } : {}),
-        ...(branchId ? { user: { branchId } } : {}),
+        ...(branchId ? invoiceInBranch(branchId) : {}),
       },
       ...(vendorId ? { vendorId } : {}),
       ...(customerId ? { customerId } : {}),
@@ -221,7 +231,7 @@ router.get("/", authenticate, async (req, res) => {
         vendorId: s.vendorId,
         customer: s.customer?.customerName ?? "",
         customerId: s.customerId,
-        branchId: s.invoice?.user?.branchId ?? null,
+        branchId: s.invoice?.branchId ?? s.invoice?.user?.branchId ?? null,
         agent: s.invoice?.user?.fullName ?? "-",
         agentId: s.invoice?.userId ?? null,
         paymentMethod: s.paymentType,
@@ -278,7 +288,7 @@ router.get("/", authenticate, async (req, res) => {
               ...(vendorId ? { vendorId } : {}),
               ...(customerId ? { customerId } : {}),
               ...(airlineId ? { airlineId } : {}),
-              ...(branchId ? { invoice: { user: { branchId } } } : {}),
+              ...(branchId ? { invoice: invoiceInBranch(branchId) } : {}),
               ...saleTypeWhere,
             },
           }
@@ -549,7 +559,7 @@ router.get("/summary", authenticate, async (req, res) => {
       invoice: {
         ...(dateFilter ? { saleDate: dateFilter } : {}),
         ...(agentId ? { userId: agentId } : {}),
-        ...(branchId ? { user: { branchId } } : {}),
+        ...(branchId ? invoiceInBranch(branchId) : {}),
       },
       ...(vendorId ? { vendorId } : {}),
       ...(customerId ? { customerId } : {}),

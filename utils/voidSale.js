@@ -23,6 +23,22 @@ const num = (v) => Number(v) || 0;
 
 export const isVoidLine = (line) => String(line?.status || "").toUpperCase() === "VOID";
 
+// The route(s) of the ticket, as picked from the airport search (same shape the sale form stores)
+const DEST_AIRPORT_KEYS = ["iata", "icao", "name", "city", "country", "region", "lat", "lng", "timezone"];
+export function cleanDestinations(list) {
+  if (!Array.isArray(list)) return null;
+  const out = list
+    .slice(0, 10)
+    .map((d) => {
+      const value = String(d?.value ?? "").trim().slice(0, 40);
+      if (!value) return null;
+      const airport = d?.airport && typeof d.airport === "object" ? Object.fromEntries(DEST_AIRPORT_KEYS.filter((k) => d.airport[k] != null).map((k) => [k, d.airport[k]])) : null;
+      return { value, label: String(d?.label ?? value).slice(0, 200), airport };
+    })
+    .filter(Boolean);
+  return out.length ? out : null;
+}
+
 /** Validates one void line and works out every amount from it (the server is the single source). */
 export function resolveVoidAmounts(line) {
   const net = num(line.netPrice);
@@ -194,6 +210,27 @@ async function refreshInvoiceTotals(tx, invoiceId) {
 }
 
 export function makeVoidHandlers({ prisma, generateNextSalesInvoiceNo }) {
+  // A ticket (document number) can only be voided once
+  const assertNotAlreadyVoid = async (documentNos, excludeSaleId = null) => {
+    const docs = documentNos.map((d) => String(d ?? "").trim()).filter(Boolean);
+    const lower = docs.map((d) => d.toLowerCase());
+    if (new Set(lower).size !== lower.length) throw new Error("The same document number appears twice on this invoice");
+    if (!docs.length) return;
+    const existing = await prisma.sale.findFirst({
+      where: {
+        status: "VOID",
+        OR: docs.map((d) => ({ documentNo: { equals: d, mode: "insensitive" } })),
+        ...(excludeSaleId ? { id: { not: excludeSaleId } } : {}),
+      },
+      select: { documentNo: true, invoice: { select: { invoiceNo: true } } },
+    });
+    if (existing) {
+      throw new Error(
+        `Ticket ${existing.documentNo} is already VOID${existing.invoice?.invoiceNo ? ` (invoice ${existing.invoice.invoiceNo})` : ""} — it cannot be voided again`,
+      );
+    }
+  };
+
   const requireIds = (line) => {
     if (!line.vendorId) throw new Error("Vendor is required");
     if (!line.airlineId) throw new Error("Airline is required");
@@ -209,6 +246,7 @@ export function makeVoidHandlers({ prisma, generateNextSalesInvoiceNo }) {
         requireIds(s);
         return resolveVoidAmounts(s);
       });
+      await assertNotAlreadyVoid(sales.map((s) => s.documentNo));
 
       const vendorIds = [...new Set(sales.map((s) => s.vendorId))];
       const vendors = await prisma.vendor.findMany({ where: { id: { in: vendorIds } }, include: { account: true } });
@@ -242,6 +280,7 @@ export function makeVoidHandlers({ prisma, generateNextSalesInvoiceNo }) {
                 paxName: s.paxName || null,
                 saleType: "AIRLINE",
                 tripType: s.tripType || "Oneway",
+                destinations: cleanDestinations(s.destinations) ?? undefined,
                 remarks: s.remarks || null,
                 ...saleFields(amounts),
               },
@@ -283,6 +322,7 @@ export function makeVoidHandlers({ prisma, generateNextSalesInvoiceNo }) {
       const line = req.body || {};
       requireIds(line);
       const amounts = resolveVoidAmounts(line);
+      await assertNotAlreadyVoid([line.documentNo], saleId);
 
       await prisma.$transaction(
         async (tx) => {
@@ -315,6 +355,8 @@ export function makeVoidHandlers({ prisma, generateNextSalesInvoiceNo }) {
               documentNo: line.documentNo || null,
               pnr: line.pnr || null,
               paxName: line.paxName || null,
+              // undefined leaves it as it was; an empty list clears it
+              destinations: Array.isArray(line.destinations) ? cleanDestinations(line.destinations) ?? [] : undefined,
               remarks: line.remarks || null,
               ...saleFields(amounts),
             },
