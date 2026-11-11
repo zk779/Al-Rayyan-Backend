@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@prisma/client": "^6.17.1",
+    "@pusher/push-notifications-server": "^1.2.7",
     "bcryptjs": "^3.0.2",
     "cloudinary": "^1.41.3",
     "cors": "^2.8.5",

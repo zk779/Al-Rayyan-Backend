@@ -18,6 +18,16 @@ import customerRoutes from "./routes/customers.js";
 import destinationsRouter from "./routes/destinations.js";
 import invoiceCounterRoutes from "./routes/invoiceCounter.js";
 import otherServiceRoutes from "./routes/otherServices.js";
+import notificationRoutes from "./routes/notifications.js";
+import {
+	salesWatch,
+	otherServicesWatch,
+	refundsWatch,
+	vendorCustomerPaymentsWatch,
+	salePaymentsWatch,
+	expensesWatch,
+	balanceAdjustmentsWatch,
+} from "./utils/notifications.js";
 import invoiceRenumberRoutes from "./routes/invoiceRenumber.js";
 import refundsRoutes from "./routes/refunds.js";
 import bankRoutes from "./routes/bankRoutes.js";
@@ -59,7 +69,7 @@ app.use(
 			return cb(new Error(`CORS blocked for origin: ${origin}`));
 		},
 		credentials: true,
-		methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+		methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 		allowedHeaders: ["Content-Type", "Authorization"],
 	})
 );
@@ -82,19 +92,20 @@ app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/airlines", airlineRoutes);
 app.use("/api/vendors", vendorsRoutes);
-app.use("/api/sales", saleRouets);
+app.use("/api/sales", salesWatch, saleRouets);
 app.use("/api/ledger", LedgerRoutes);
 app.use("/api/customers", customerRoutes);
 app.use("/api/destinations", destinationsRouter);
 app.use("/api/invoice", invoiceCounterRoutes);
-app.use("/api/other-services", otherServiceRoutes);
+app.use("/api/other-services", otherServicesWatch, otherServiceRoutes);
 app.use("/api/invoice-renumber", invoiceRenumberRoutes);
-app.use("/api/refunds",refundsRoutes);
+app.use("/api/refunds", refundsWatch, refundsRoutes);
 app.use("/api/banks", bankRoutes);
-app.use("/api/payments/vendor-customer", vendorCustomerPaymentRoutes);
-app.use("/api/salePayment", salePaymentRoutes);
-app.use("/api/expenses", expenseRoutes);
-app.use("/api/balance-adjustments", balanceAdjustmentRoutes);
+app.use("/api/payments/vendor-customer", vendorCustomerPaymentsWatch, vendorCustomerPaymentRoutes);
+app.use("/api/salePayment", salePaymentsWatch, salePaymentRoutes);
+app.use("/api/expenses", expensesWatch, expenseRoutes);
+app.use("/api/balance-adjustments", balanceAdjustmentsWatch, balanceAdjustmentRoutes);
+app.use("/api/notifications", notificationRoutes);
 app.use("/api/reports", ReportRoutes);
 // Root Route
 app.get("/", (req, res) => {

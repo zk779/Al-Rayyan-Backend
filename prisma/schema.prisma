@@ -819,3 +819,46 @@ model OtherServiceInvoice {
   @@index([status])
   @@index([customerName])
 }
+
+/* ======================= NOTIFICATIONS =======================
+   What happened in the system (a sale, an expense, a payment …), for the ADMINS. Stored here so
+   the header bell can list them; each admin has their own read / dismissed state. The same text
+   is also sent as a push notification (Pusher Beams) when that is configured. */
+
+// One thing that changed on an update: "Sale price: 600 → 650"
+type NotificationChange {
+  field String
+  from  String?
+  to    String?
+}
+
+model Notification {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  // SALE_CREATED | SALE_UPDATED | HOTEL_CREATED | VOID_CREATED | REFUND_CREATED | REFUND_UPDATED |
+  // EXPENSE_CREATED | EXPENSE_UPDATED | PAYMENT_CREATED | PAYMENT_UPDATED | BALANCE_ADJUSTMENT_CREATED | …
+  type    String
+  title   String
+  message String
+  // extra facts, one per line ("Customer: Ali", "Payment: CASH" …)
+  details String[]
+  changes NotificationChange[]
+
+  entityType String?
+  entityId   String?
+  // the page in the app that shows it
+  link       String?
+
+  actorId   String? @db.ObjectId
+  actorName String?
+  branchId  String? @db.ObjectId
+
+  // admin user ids
+  readBy      String[]
+  dismissedBy String[]
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([type])
+}
