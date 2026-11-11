@@ -192,6 +192,12 @@ const airlineOf = (s) => s.airline?.iataName || s.airline?.airlineCode || s.airl
 const lineSpec = [
 	["Sale price", (s) => s.sellPrice, "money"],
 	["Net price", (s) => s.netPrice, "money"],
+	// void tickets
+	["Vendor service charges", (s) => (s.status === "VOID" ? s.vendorServiceCharge : null), "money"],
+	["Vendor VAT", (s) => (s.status === "VOID" ? s.vendorVat : null), "money"],
+	["Void charges", (s) => (s.status === "VOID" ? s.voidCharges : null), "money"],
+	["Company service charges", (s) => (s.status === "VOID" ? s.companyServiceCharge : null), "money"],
+	["Destinations", (s) => (Array.isArray(s.destinations) ? s.destinations.map((d) => (typeof d === "string" ? d : d?.value || d?.label || d?.airport?.iata || "")).join(" → ") : null)],
 	["Payment type", (s) => s.paymentType, "enum"],
 	["Paid amount", (s) => s.paidAmount, "money"],
 	["Customer", (s) => s.customer?.customerName],
@@ -270,7 +276,7 @@ export const describeInvoice = ({ action, before, after }) => {
 	return {
 		type: k.updated,
 		title: `${k.word} updated`,
-		message: `${k.word} ${after.invoiceNo} (${money(after.sales.reduce((a, s) => a + (Number(s.sellPrice) || 0), 0))}) was updated — ${changes.length} change${changes.length > 1 ? "s" : ""}`,
+		message: `${k.word} ${after.invoiceNo}${k === KIND.VOID ? (first.documentNo ? ` (ticket ${first.documentNo})` : "") : ` (${money(after.sales.reduce((a, s) => a + (Number(s.sellPrice) || 0), 0))})`} was updated — ${changes.length} change${changes.length > 1 ? "s" : ""}`,
 		details: lines(line("Customer", first.customer?.customerName), line("Branch", where)),
 		changes,
 		entityType: "SalesInvoice",
