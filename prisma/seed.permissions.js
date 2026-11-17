@@ -38,6 +38,24 @@ const PERMISSIONS = [
   { name: "SALE_EDIT", description: "Can edit sales" },
   { name: "SALE_DELETE", description: "Can delete sales" },
 
+  // --- Hotel Bookings ---
+  { name: "HOTEL_CREATE", description: "Can create hotel bookings" },
+  { name: "HOTEL_READ", description: "Can view hotel bookings" },
+  { name: "HOTEL_EDIT", description: "Can edit hotel bookings" },
+  { name: "HOTEL_DELETE", description: "Can delete hotel bookings" },
+
+  // --- Void Sales ---
+  { name: "VOID_CREATE", description: "Can create void sales" },
+  { name: "VOID_READ", description: "Can view void sales" },
+  { name: "VOID_EDIT", description: "Can edit void sales" },
+  { name: "VOID_DELETE", description: "Can delete void sales" },
+
+  // --- Other Services (transportation, Umrah visa …) ---
+  { name: "OTHER_SERVICE_CREATE", description: "Can create other-service invoices" },
+  { name: "OTHER_SERVICE_READ", description: "Can view other-service invoices" },
+  { name: "OTHER_SERVICE_EDIT", description: "Can edit other-service invoices" },
+  { name: "OTHER_SERVICE_DELETE", description: "Can delete other-service invoices" },
+
   // --- Expenses ---
   { name: "EXPENSE_CREATE", description: "Can create expenses" },
   { name: "EXPENSE_READ", description: "Can view expenses" },
