@@ -103,7 +103,14 @@ enum ExpenseCategory {
   RENT
   INSURANCE
   MAINTENANCE
+  COMPANY_EXPENSE
   OTHER
+}
+
+// One labelled line on an expense ("Service Name: Visa renewal") — like the service notes on an invoice
+type ExpenseDetail {
+  label String
+  value String
 }
 
 enum ExpenseStatus {
@@ -656,6 +663,9 @@ model Expense {
     // expenses, null for every other category. Calculated by the page and
     // stored as received (the API only validates it).
     vatAmount Float?
+    // INCLUSIVE: the amount entered already contains the 15% VAT. EXCLUSIVE: 15% is added on top of it
+    // (the saved `amount` is always what is actually paid, VAT included). null: no VAT on this expense.
+    vatMode   String?
     status ExpenseStatus @default(APPROVED)
   paymentMode   PaymentType
   bankId        String?         @db.ObjectId
@@ -663,6 +673,9 @@ model Expense {
   userId        String?         @db.ObjectId
   user          User?           @relation("ExpenseEmployee", fields: [userId], references: [id])
   description   String?
+  // Cloudinary link of the receipt / invoice (same upload as the payments)
+  attachmentUrl String?
+  details       ExpenseDetail[]
   ledgerEntries LedgerEntry[]
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt

@@ -397,6 +397,7 @@ const loadExpense = (id) =>
 const expenseSpec = [
 	["Amount", (e) => e.amount, "money"],
 	["VAT", (e) => e.vatAmount, "money"],
+	["VAT type", (e) => e.vatMode, "enum"],
 	["Category", (e) => e.category, "enum"],
 	["Payment mode", (e) => e.paymentMode, "enum"],
 	["Bank", (e) => e.bank?.bankName],
@@ -405,6 +406,8 @@ const expenseSpec = [
 	["Expense date", (e) => e.expenseDate, "date"],
 	["Employee", (e) => e.user?.fullName],
 	["Description", (e) => e.description],
+	["Service details", (e) => (e.details || []).map((d) => `${d.label}: ${d.value}`).join("; ")],
+	["Attachment", (e) => (e.attachmentUrl ? "Attached" : null)],
 ];
 export const expensesWatch = watch({
 	load: loadExpense,
@@ -414,7 +417,7 @@ export const expensesWatch = watch({
 	],
 	describe: ({ action, before, after }) => {
 		const base = { entityType: "Expense", entityId: after.id, link: "/expenses", branchId: after.branchId };
-		const facts = lines(line("Category", nice(after.category)), line("Branch", after.branch?.name), line("Paid by", after.paymentMode === "BANK_TRANSFER" ? `Bank${after.bank?.bankName ? ` — ${after.bank.bankName}` : ""}` : nice(after.paymentMode)), line("Employee", after.user?.fullName), line("Description", after.description), line("Created by", after.createdBy?.fullName));
+		const facts = lines(line("Category", nice(after.category)), line("Branch", after.branch?.name), line("Paid by", after.paymentMode === "BANK_TRANSFER" ? `Bank${after.bank?.bankName ? ` — ${after.bank.bankName}` : ""}` : nice(after.paymentMode)), line("Employee", after.user?.fullName), line("Description", after.description), ...(after.details || []).map((d) => line(d.label, d.value)), line("VAT", after.vatAmount ? `${money(after.vatAmount)} (${nice(after.vatMode || "INCLUSIVE")})` : null), line("Attachment", after.attachmentUrl ? "Yes" : null), line("Created by", after.createdBy?.fullName));
 		if (action === "create") return { ...base, type: "EXPENSE_CREATED", title: "Expense created", message: `Expense of ${money(after.amount)} created — ${nice(after.category)}`, details: facts };
 		const changes = before ? diff(before, after, expenseSpec) : [];
 		if (!changes.length) return null;

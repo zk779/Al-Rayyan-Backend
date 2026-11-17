@@ -2,6 +2,7 @@ import express from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import { localDayRangeToUtc } from "../utils/dateRange.js";
+import { upload } from "../middleware/cloudinary.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -26,21 +27,59 @@ async function authenticate(req, res, next) {
   }
 }
 
-// Returnable VAT: the page works out the VAT (the entered amount already
-// includes 15% VAT) and sends it as `vatAmount`; the API does not calculate it,
-// it only checks and stores it. Only RETURNABLE_VAT expenses carry one — for any
-// other category the field is stored as null. `fallback` is the already-saved
-// value an edit may keep when the request doesn't resend it.
-const resolveExpenseVat = ({ category, amount, vatAmount, fallback }) => {
-  if (category !== "RETURNABLE_VAT") return { vat: null };
-  const raw = vatAmount !== undefined ? vatAmount : fallback;
-  if (raw === undefined || raw === null || raw === "")
-    return { error: "vatAmount is required when category is RETURNABLE_VAT" };
-  const v = Number(raw);
-  if (isNaN(v) || v < 0 || v > Number(amount))
-    return { error: "vatAmount must be a number between 0 and the amount" };
-  return { vat: Math.round(v * 100) / 100 };
+// VAT on an expense. `amount` here is the amount ENTERED on the form:
+//   INCLUSIVE — it already contains the 15% VAT (VAT = amount x 15/115); the amount paid is the amount
+//   EXCLUSIVE — it is before VAT; 15% is added on top (VAT = amount x 15%); the amount paid is amount + VAT
+//   none      — no VAT on this expense
+// Works in whole halalas. Returns { vat, mode, gross } — `gross` is what is actually paid and what the
+// ledger / balances use. The "Returnable VAT" category is VAT-inclusive by definition. The VAT is always
+// worked out here; whatever a client sends as vatAmount is ignored.
+const VAT_MODES = ["INCLUSIVE", "EXCLUSIVE"];
+const resolveExpenseVat = ({ category, amount, vatMode, fallbackMode }) => {
+  let mode = vatMode === undefined ? fallbackMode : vatMode; // undefined = keep what was saved (edit)
+  if (mode === "") mode = null;
+  if (category === "RETURNABLE_VAT" && !mode) mode = "INCLUSIVE";
+  const cents = Math.round(Number(amount) * 100);
+  if (!mode) return { vat: null, mode: null, gross: cents / 100 };
+  if (!VAT_MODES.includes(mode)) return { error: "vatMode must be INCLUSIVE or EXCLUSIVE" };
+  const vatCents = mode === "INCLUSIVE" ? Math.round((cents * 15) / 115) : Math.round((cents * 15) / 100);
+  return { vat: vatCents / 100, mode, gross: (mode === "INCLUSIVE" ? cents : cents + vatCents) / 100 };
 };
+
+// A request can be JSON or multipart (when a file is attached). In multipart everything is text, so
+// "" / "null" mean "empty", and the list of service details arrives as a JSON string.
+const EMPTY_TEXT = ["", "null", "undefined"];
+const normalizeBody = (req, res, next) => {
+  const b = { ...(req.body || {}) };
+  for (const k of ["bankId", "userId", "vatMode", "description"]) {
+    if (typeof b[k] === "string" && EMPTY_TEXT.includes(b[k])) b[k] = null;
+  }
+  for (const k of ["date"]) {
+    if (typeof b[k] === "string" && EMPTY_TEXT.includes(b[k])) delete b[k];
+  }
+  if (typeof b.details === "string") {
+    try {
+      b.details = JSON.parse(b.details);
+    } catch {
+      b.details = [];
+    }
+  }
+  req.body = b;
+  next();
+};
+
+// The receipt / invoice, uploaded to Cloudinary exactly like the payments' attachment (field "attachment")
+const uploadAttachment = (req, res, next) =>
+  upload.single("attachment")(req, res, (err) =>
+    err ? res.status(400).json({ success: false, error: err.message || "Upload failed" }) : next(),
+  );
+
+// "Service Name: …" style lines — only complete label + detail pairs are kept
+const cleanDetails = (list) =>
+  (Array.isArray(list) ? list : [])
+    .map((d) => ({ label: String(d?.label ?? "").trim().slice(0, 80), value: String(d?.value ?? "").trim().slice(0, 500) }))
+    .filter((d) => d.label && d.value)
+    .slice(0, 20);
 
 const EXPENSE_CATEGORIES = [
   "OFFICE_SUPPLIES",
@@ -54,6 +93,7 @@ const EXPENSE_CATEGORIES = [
   "RENT",
   "INSURANCE",
   "MAINTENANCE",
+  "COMPANY_EXPENSE",
   "OTHER",
 ];
 
@@ -71,6 +111,7 @@ const CATEGORY_LABELS = {
   RENT: "Rent",
   INSURANCE: "Insurance",
   MAINTENANCE: "Maintenance",
+  COMPANY_EXPENSE: "Company Expense",
   OTHER: "Other",
 };
 
@@ -78,7 +119,7 @@ const EXPENSE_STATUSES = ["APPROVED", "REJECTED"];
 const PAYMENT_MODES = ["CASH", "BANK_TRANSFER"];
 
 // ---- POST (CREATE) ----
-router.post("/", authenticate, async (req, res) => {
+router.post("/", authenticate, uploadAttachment, normalizeBody, async (req, res) => {
   try {
     let {
       date,
@@ -117,9 +158,12 @@ router.post("/", authenticate, async (req, res) => {
         error: `paymentMode must be one of: ${PAYMENT_MODES.join(", ")}`,
       });
 
-    const vatCheck = resolveExpenseVat({ category, amount, vatAmount: req.body.vatAmount });
+    const vatCheck = resolveExpenseVat({ category, amount, vatMode: req.body.vatMode });
     if (vatCheck.error)
       return res.status(400).json({ success: false, error: vatCheck.error });
+    // from here on `amount` is what is actually paid (VAT included): the ledger, balances and the
+    // sufficiency checks below all use it
+    amount = vatCheck.gross;
 
     const newStatus = status ?? "APPROVED";
     if (!EXPENSE_STATUSES.includes(newStatus))
@@ -252,12 +296,15 @@ router.post("/", authenticate, async (req, res) => {
           branchId, // plain reference, no Account involved
           amount,
           vatAmount: vatCheck.vat,
+          vatMode: vatCheck.mode,
           status: newStatus,
           paymentMode,
           bankId: paymentMode === "BANK_TRANSFER" ? bankId : null,
           accountId: paymentMode === "CASH" ? cash.id : null,
           userId: category === "SALARY" ? userId : null,
           description: description ?? null,
+          attachmentUrl: req.file ? req.file.path : null,
+          details: cleanDetails(req.body.details),
           createdById: req.user?.id ?? null,
         },
       });
@@ -364,6 +411,7 @@ router.get("/", authenticate, async (req, res) => {
       dateTo,
       timeZone,
       search,
+      hasVat,
       page = 1,
       limit = 20,
     } = req.query;
@@ -376,6 +424,10 @@ router.get("/", authenticate, async (req, res) => {
     if (bankId) where.bankId = bankId;
     if (userId) where.userId = userId;
     if (createdById) where.createdById = createdById;
+    // ?hasVat=true  → every expense that carries VAT (this is what counts as Returnable VAT: the
+    // "Returnable VAT" category plus any expense marked "VAT included"); ?hasVat=false → the rest
+    if (hasVat === "true") where.AND = [{ OR: [{ category: "RETURNABLE_VAT" }, { vatAmount: { gt: 0 } }] }];
+    else if (hasVat === "false") where.AND = [{ NOT: { OR: [{ category: "RETURNABLE_VAT" }, { vatAmount: { gt: 0 } }] } }];
 
     // Local-calendar-day aware, same helper the reports use.
     const dateFilter = {};
@@ -462,7 +514,7 @@ router.get("/", authenticate, async (req, res) => {
       summary: {
         count: total,
         totalAmount: amountAgg._sum.amount || 0,
-        // Returnable VAT across the filtered set (only RETURNABLE_VAT rows carry one)
+        // Returnable VAT across the filtered set (every expense that carries VAT)
         totalVat: Math.round((amountAgg._sum.vatAmount || 0) * 100) / 100,
         byBranch: branchId ? null : branchTotal,
       },
@@ -546,7 +598,7 @@ router.get("/reports/by-branch", authenticate, async (req, res) => {
 // should post. Ledger entries get recreated for both CASH and BANK_TRANSFER;
 // account BALANCE and accountId are only ever touched for BANK_TRANSFER —
 // CASH's ledger entry always has accountId: null.
-router.put("/:id", authenticate, async (req, res) => {
+router.put("/:id", authenticate, uploadAttachment, normalizeBody, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -611,7 +663,16 @@ router.put("/:id", authenticate, async (req, res) => {
         return res.status(400).json({ success: false, error: "date must be a valid date" });
     }
 
-    const newAmount = amount !== undefined ? Number(amount) : existing.amount;
+    // The amount entered on the form: for an EXCLUSIVE-VAT expense that is the saved amount minus its VAT
+    // (the saved amount is what was paid). `newAmount` becomes what is paid once the VAT is worked out below.
+    const existingMode = existing.vatMode || (existing.category === "RETURNABLE_VAT" ? "INCLUSIVE" : null);
+    const enteredAmount =
+      amount !== undefined
+        ? Number(amount)
+        : existingMode === "EXCLUSIVE" && existing.vatAmount != null
+          ? Math.round((existing.amount - existing.vatAmount) * 100) / 100
+          : existing.amount;
+    let newAmount = enteredAmount;
     const newCategory = category ?? existing.category;
     const newBranchId = branchId ?? existing.branchId;
     const newStatus = status ?? existing.status;
@@ -622,18 +683,21 @@ router.put("/:id", authenticate, async (req, res) => {
     const newExpenseDate = expenseDate ? new Date(expenseDate) : existing.expenseDate;
     const newDate = date ? new Date(date) : existing.date;
 
-    // Keep the saved VAT only if the amount is unchanged; otherwise the page must resend it
+    // VAT: worked out from the entered amount (not resent = keep the saved mode)
     const putVat = resolveExpenseVat({
       category: newCategory,
-      amount: newAmount,
-      vatAmount: req.body.vatAmount,
-      fallback:
-        existing.category === "RETURNABLE_VAT" && newAmount === existing.amount
-          ? existing.vatAmount
-          : undefined,
+      amount: enteredAmount,
+      vatMode: req.body.vatMode,
+      fallbackMode: existingMode,
     });
     if (putVat.error)
       return res.status(400).json({ success: false, error: putVat.error });
+    newAmount = putVat.gross;
+
+    // receipt: a new file replaces it; removeAttachment clears it; otherwise it stays
+    const removeAttachment = req.body.removeAttachment === true || req.body.removeAttachment === "true";
+    const newAttachmentUrl = req.file ? req.file.path : removeAttachment ? null : existing.attachmentUrl;
+    const newDetails = req.body.details !== undefined ? cleanDetails(req.body.details) : existing.details;
 
     // ---- paymentMode / bankId consistency ----
     if (newPaymentMode === "BANK_TRANSFER" && !newBankId)
@@ -816,6 +880,9 @@ router.put("/:id", authenticate, async (req, res) => {
           branchId: newBranchId,
           amount: newAmount,
           vatAmount: putVat.vat,
+          vatMode: putVat.mode,
+          attachmentUrl: newAttachmentUrl,
+          details: { set: newDetails },
           status: newStatus,
           paymentMode: newPaymentMode,
           bankId: newPaymentMode === "BANK_TRANSFER" ? newBankId : null,
