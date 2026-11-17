@@ -19,6 +19,7 @@ import destinationsRouter from "./routes/destinations.js";
 import invoiceCounterRoutes from "./routes/invoiceCounter.js";
 import otherServiceRoutes from "./routes/otherServices.js";
 import notificationRoutes from "./routes/notifications.js";
+import searchRoutes from "./routes/search.js";
 import {
 	salesWatch,
 	otherServicesWatch,
@@ -106,6 +107,7 @@ app.use("/api/salePayment", salePaymentsWatch, salePaymentRoutes);
 app.use("/api/expenses", expensesWatch, expenseRoutes);
 app.use("/api/balance-adjustments", balanceAdjustmentsWatch, balanceAdjustmentRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/search", searchRoutes);
 app.use("/api/reports", ReportRoutes);
 // Root Route
 app.get("/", (req, res) => {
