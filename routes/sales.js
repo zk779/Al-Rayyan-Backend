@@ -226,6 +226,7 @@ router.get("/", authenticate, async (req, res) => {
 					destinations: true,
 						routeType: true,
 						paxVat: true,
+						discount: true,
 						vatAmount: true,
 						vendorId: true,
 						airlineId: true,
@@ -378,6 +379,7 @@ router.get("/", authenticate, async (req, res) => {
 				// VAT: paxVat only applies to DOMESTIC routes; vatAmount is our 15% on profit
 				routeType: s.routeType || null,
 				paxVat: s.paxVat ?? 0,
+				discount: s.discount ?? 0,
 				vatAmount: s.vatAmount ?? 0,
 				vendorId: s.vendorId || null,
 				airlineId: s.airlineId || null,
@@ -1396,11 +1398,12 @@ router.post("/", authenticate, async (req, res) => {
 			const vat = Number(s.vatAmount || 0);
 			const paxVat = Number(s.paxVat || 0);
 			const misc = Number(s.miscCharges || 0);
+			const discount = Number(s.discount || 0);
 
 			if (isNaN(net) || isNaN(sell)) throw new Error("netPrice and sellPrice must be numbers");
 			if (net < 0 || sell < 0) throw new Error("Prices cannot be negative");
 			if (paid < 0 || paid > sell) throw new Error("Invalid paidAmount");
-			if (vat < 0 || paxVat < 0 || misc < 0) throw new Error("Taxes/charges cannot be negative");
+			if (vat < 0 || paxVat < 0 || misc < 0 || discount < 0) throw new Error("Taxes/charges cannot be negative");
 
 			resolveStay(s); // validates saleType + hotel dates
 			resolveVendorCharges(s, net);
@@ -1792,6 +1795,7 @@ router.post("/", authenticate, async (req, res) => {
 						vatAmount: Number(s.vatAmount || 0),
 						paxVat: Number(s.paxVat || 0),
 						miscCharges: Number(s.miscCharges || 0),
+						discount: Number(s.discount || 0),
 						...resolveVendorCharges(s, net),
 						paidAmount: paid,
 						paymentType: pt,
@@ -2689,6 +2693,7 @@ router.put("/:invoiceId", authenticate, async (req, res) => {
 						vatAmount: Number(payload.vatAmount || 0),
 						paxVat: Number(payload.paxVat || 0),
 						miscCharges: Number(payload.miscCharges || 0),
+						discount: payload.discount !== undefined ? Number(payload.discount || 0) : Number(current.discount || 0),
 						...resolveVendorCharges(payload, newNet, current),
 						paidAmount: newPaid,
 						paymentType: newPt,

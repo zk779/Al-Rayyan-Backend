@@ -465,6 +465,8 @@ model Sale {
   paxVat      Float? @default(0)
   vatAmount   Float? @default(0)
   miscCharges Float? @default(0)
+  // what the vendor takes off its invoice (already out of netPrice; the VATs are worked out before it)
+  discount    Float? @default(0)
 
   // VOID sales only (status = VOID; all 0 on ordinary sales).
   //   vendor ledger credit = netPrice + vendorServiceCharge + vendorVat
