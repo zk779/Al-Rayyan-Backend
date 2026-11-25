@@ -40,16 +40,16 @@ async function authenticate(req, res, next) {
 	}
 }
 // Resolves the sale-type specific "stay" fields for one sale payload.
-// AIRLINE (the default) carries none of them; HOTEL requires valid check-in and
-// check-out dates (check-out may not be before check-in) and takes an optional
-// hotel name. `current` is the existing DB row when editing, so fields that
+// AIRLINE (the default) carries none of them; HOTEL and INSURANCE require valid check-in and
+// check-out dates (INSURANCE: the policy's start and end; the end may not be before the start) and take an optional
+// hotel name / insurance company. `current` is the existing DB row when editing, so fields that
 // aren't resent keep their stored value.
 function resolveStay(src, current = {}) {
 	const saleType = String(src.saleType ?? current.saleType ?? "AIRLINE").toUpperCase();
-	if (!["AIRLINE", "HOTEL"].includes(saleType))
-		throw new Error("saleType must be AIRLINE or HOTEL");
+	if (!["AIRLINE", "HOTEL", "INSURANCE"].includes(saleType))
+		throw new Error("saleType must be AIRLINE, HOTEL or INSURANCE");
 
-	if (saleType !== "HOTEL")
+	if (saleType !== "HOTEL" && saleType !== "INSURANCE")
 		return { saleType, checkInDate: null, checkOutDate: null, hotelName: null };
 
 	const pick = (key) => (src[key] !== undefined ? src[key] : current[key]);
@@ -57,9 +57,9 @@ function resolveStay(src, current = {}) {
 	const checkOutDate = pick("checkOutDate") ? new Date(pick("checkOutDate")) : null;
 
 	if (!checkInDate || isNaN(checkInDate.getTime()))
-		throw new Error("checkInDate is required for HOTEL sales");
+		throw new Error(`checkInDate is required for ${saleType} sales`);
 	if (!checkOutDate || isNaN(checkOutDate.getTime()))
-		throw new Error("checkOutDate is required for HOTEL sales");
+		throw new Error(`checkOutDate is required for ${saleType} sales`);
 	if (checkOutDate < checkInDate)
 		throw new Error("checkOutDate cannot be before checkInDate");
 
@@ -158,8 +158,8 @@ router.get("/", authenticate, async (req, res) => {
 		// Optional ?saleType=AIRLINE|HOTEL. Legacy sales that predate the field have
 		// no saleType stored at all, so AIRLINE must also match "field not set"
 		// (Mongo's `not: "HOTEL"` would skip those documents entirely).
-		if (String(saleType || "").toUpperCase() === "HOTEL") {
-			filters.push({ saleType: "HOTEL" });
+		if (["HOTEL", "INSURANCE"].includes(String(saleType || "").toUpperCase())) {
+			filters.push({ saleType: String(saleType).toUpperCase() });
 		} else if (String(saleType || "").toUpperCase() === "AIRLINE") {
 			filters.push({ OR: [{ saleType: "AIRLINE" }, { saleType: null }, { saleType: { isSet: false } }] });
 		}
@@ -1783,7 +1783,7 @@ router.post("/", authenticate, async (req, res) => {
 						documentNo: s.documentNo || null,
 						pnr: s.pnr || null,
 						routeType: s.routeType || null,
-						tripType: String(s.saleType || "").toUpperCase() === "HOTEL" ? null : (s.tripType || "Oneway"),
+						tripType: ["HOTEL", "INSURANCE"].includes(String(s.saleType || "").toUpperCase()) ? null : (s.tripType || "Oneway"),
 						departureDate: s.departureDate ? new Date(s.departureDate) : null,
 						returnDate: s.returnDate ? new Date(s.returnDate) : null,
 						...resolveStay(s),

@@ -9,7 +9,7 @@ import jwt from "jsonwebtoken";
 // A group is only searched when the caller may read it (SALE_READ, CUSTOMER_READ, VENDOR_READ,
 // EXPENSE_READ, PAYMENT_READ, OTHER_SERVICE_READ). Sales / other services follow the same visibility
 // rule as their lists (everything / own branch / own); hotel bookings and void sales are only included
-// with HOTEL_READ / VOID_READ. A number also matches amounts.
+// with HOTEL_READ / VOID_READ (insurance policies with INSURANCE_READ). A number also matches amounts.
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -96,7 +96,8 @@ router.get("/", authenticate, async (req, res) => {
 				if (near && !field) or.push({ sellPrice: near });
 				const AND = [{ OR: or }];
 				if (invoiceScope) AND.push(invoiceScope);
-				if (!has("HOTEL_READ")) AND.push({ OR: [{ saleType: "AIRLINE" }, { saleType: null }, { saleType: { isSet: false } }] });
+				if (!has("HOTEL_READ")) AND.push({ OR: [{ saleType: { not: "HOTEL" } }, { saleType: null }, { saleType: { isSet: false } }] });
+				if (!has("INSURANCE_READ")) AND.push({ OR: [{ saleType: { not: "INSURANCE" } }, { saleType: null }, { saleType: { isSet: false } }] });
 				if (!has("VOID_READ")) AND.push({ status: { not: "VOID" } });
 				const rows = await prisma.sale.findMany({
 					where: { AND },

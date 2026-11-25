@@ -155,8 +155,8 @@ router.get("/", authenticate, async (req, res) => {
     // Sale-type filter, shared by the sales rows and the refunds below.
     // Legacy sales have no saleType stored, so AIRLINE also matches "not set".
     const saleTypeWhere =
-      String(saleType || "").toUpperCase() === "HOTEL"
-        ? { saleType: "HOTEL" }
+      ["HOTEL", "INSURANCE"].includes(String(saleType || "").toUpperCase())
+        ? { saleType: String(saleType).toUpperCase() }
         : String(saleType || "").toUpperCase() === "AIRLINE"
           ? { OR: [{ saleType: "AIRLINE" }, { saleType: null }, { saleType: { isSet: false } }] }
           : {};

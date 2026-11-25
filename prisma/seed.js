@@ -53,6 +53,12 @@ const PERMISSIONS = [
   { name: "HOTEL_EDIT", description: "Can edit hotel bookings" },
   { name: "HOTEL_DELETE", description: "Can delete hotel bookings" },
 
+  // --- Insurance Policies ---
+  { name: "INSURANCE_CREATE", description: "Can create insurance policies" },
+  { name: "INSURANCE_READ", description: "Can view insurance policies" },
+  { name: "INSURANCE_EDIT", description: "Can edit insurance policies" },
+  { name: "INSURANCE_DELETE", description: "Can delete insurance policies" },
+
   // --- Void Sales ---
   { name: "VOID_CREATE", description: "Can create void sales" },
   { name: "VOID_READ", description: "Can view void sales" },

@@ -180,11 +180,13 @@ const saleToInvoiceId = async (saleId) => (await prisma.sale.findUnique({ where:
 const kindOf = (inv) => {
 	if (inv.sales.some((s) => s.status === "VOID")) return "VOID";
 	if (inv.sales.some((s) => s.saleType === "HOTEL")) return "HOTEL";
+	if (inv.sales.some((s) => s.saleType === "INSURANCE")) return "INSURANCE";
 	return "SALE";
 };
 const KIND = {
 	SALE: { word: "Sale", created: "SALE_CREATED", updated: "SALE_UPDATED" },
 	HOTEL: { word: "Hotel booking", created: "HOTEL_CREATED", updated: "HOTEL_UPDATED" },
+	INSURANCE: { word: "Insurance policy", created: "INSURANCE_CREATED", updated: "INSURANCE_UPDATED" },
 	VOID: { word: "Void sale", created: "VOID_CREATED", updated: "VOID_UPDATED" },
 };
 const airlineOf = (s) => s.airline?.iataName || s.airline?.airlineCode || s.airline?.airlineName;

@@ -23,6 +23,9 @@ enum PaymentType {
 enum SaleType {
   AIRLINE
   HOTEL
+  // An insurance policy. Same sale as a hotel booking, no destinations: checkInDate / checkOutDate are
+  // the policy's start / end dates and hotelName is the insurance company / plan.
+  INSURANCE
 }
 
 enum SaleStatus {
